@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The webhook lab's admin secret, which `cove-host check` resolves.
+  WEBHOOKS_ADMIN_TOKEN: ci
 
 jobs:
   test:

@@ -8,8 +8,9 @@ that runs them on one machine.
   own Cove isolate on a shared worker pool (issue #1).
 - **`apps/`** — the sample apps: `hello` (pure), `crunch` (CPU-heavy),
   `slow` (waits on a timer that parks the run), `notes` (the persistent
-  key-value store) and `proxy` (allowlisted outbound HTTP). The real apps — a webhook lab
-  (#2), a benchmark ledger (#3) and an algorithm playground (#4) — come next.
+  key-value store) and `proxy` (allowlisted outbound HTTP); and the real
+  apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2). A
+  benchmark ledger (#3) and an algorithm playground (#4) come next.
 
 The host is Rust; the apps are Cove. Cove is a git dependency pinned to one
 commit (`rev` in the workspace `Cargo.toml`), and a change the compiler or
@@ -333,6 +334,13 @@ do, and an app may use only what `app.toml` grants:
 | `timer` | `timer` | `sleep(millis: Int)`: parks the run for that long (at most 60 s; `0` parks and comes straight back) |
 | `kv` | `kv` | `get(key) -> Option<String>`, `put(key, value) -> Result<Unit, Error>`, `delete(key) -> Bool`, `list(prefix, after, limit) -> Array<kv.Entry>`, `listDesc(prefix, before, limit) -> Array<kv.Entry>` |
 | `fetch` | `fetch` | `get(url)` and `request(method, url, headers: Map<String, String>, body)`, each `-> Result<fetch.Response, Error>` |
+| `time` | `time` | `nowMillis() -> Int`: the wall clock, milliseconds since the Unix epoch; `nowMicros() -> Int`: microseconds, strictly increasing across the process |
+| `random` | `random` | `hex(bytes: Int) -> String`: 1–64 random bytes from the operating system, as hex |
+| `auth` | `auth` | `check(secret: String, authorization: String) -> Bool`: whether an `Authorization` header (`Bearer <s>`, or `Basic` with `<s>` as the password) presents the app's secret `secret`. Constant-time; the secret itself never reaches the app |
+
+Every request also carries `x-forwarded-prefix`: where the host mounted the
+app (`/webhooks`), so it can write links to itself. The host sets it,
+replacing whatever the client sent.
 
 ### `kv`: the app's persistent store
 
@@ -426,7 +434,15 @@ allow = []                      # e.g. ["https://api.github.com", "http://127.0.
 timeout = "10s"                 # one fetch, connect to last byte
 max_request_bytes = 1048576
 max_response_bytes = 4194304
+
+[secrets]                       # what `auth.check` compares against; one of:
+admin = { env = "APP_ADMIN_TOKEN" }   # an environment variable of the host
+# admin = { file = "admin.secret" }   # a file, relative to the app's directory
+# admin = { value = "..." }           # literal, for tests
 ```
+
+A secret that cannot be resolved (the variable unset, the file missing)
+refuses the app, saying which; its value is never printed.
 
 An unknown key is refused, so a misspelt limit is never silently not
 applied. A config that does not read, an app that does not check (warnings
