@@ -5,6 +5,7 @@
 //! | `kv.get(key)` | `Option<String>` |
 //! | `kv.put(key, value)` | `Result<Unit, Error>`: an `Err` past a quota |
 //! | `kv.delete(key)` | `Bool`, whether the key was there |
+//! | `kv.increment(key, by)` | `Result<Int, Error>`: adds `by` to the decimal integer stored at `key` (0 when there is none) and answers the new value, **atomically** — two runs incrementing at once both count, which a `get` then a `put` would not promise. An `Err` when the stored value is not an integer, the sum overflows, or a quota is reached |
 //! | `kv.list(prefix, after, limit)` | `Array<kv.Entry>`: keys starting with `prefix` and greater than `after` (`""` for the first page), ascending, at most `limit` (1–1000) |
 //! | `kv.listDesc(prefix, before, limit)` | the same, descending, keys less than `before` (`""` for the last page) |
 //!
@@ -91,6 +92,12 @@ pub const KV: ModuleSchema = ModuleSchema {
             Effect::ReversibleWrite,
         ),
         op("delete", &[STR], HostType::Bool, Effect::ReversibleWrite),
+        op(
+            "increment",
+            &[STR, HostType::Int],
+            HostType::Result(&HostType::Int, &HostType::Error),
+            Effect::ReversibleWrite,
+        ),
         op("list", &[STR, STR, HostType::Int], ENTRIES, Effect::Read),
         op(
             "listDesc",
@@ -267,6 +274,23 @@ impl Store {
         Ok(())
     }
 
+    /// Adds `by` to the integer at `key`; the new value.
+    pub fn increment(&mut self, key: &str, by: i64) -> Result<i64, PutError> {
+        let current = match self.get(key).map_err(PutError::Storage)? {
+            None => 0,
+            Some(text) => text.trim().parse::<i64>().map_err(|_| {
+                PutError::Quota(format!(
+                    "kv.increment: the value at `{key}` is not an integer"
+                ))
+            })?,
+        };
+        let next = current
+            .checked_add(by)
+            .ok_or_else(|| PutError::Quota(format!("kv.increment: `{key}` would overflow")))?;
+        self.put(key, &next.to_string())?;
+        Ok(next)
+    }
+
     pub fn delete(&mut self, key: &str) -> Result<bool, String> {
         let old: Option<i64> = self
             .conn
@@ -412,6 +436,14 @@ impl HostApi for KvHost {
                 Err(PutError::Storage(why)) => Err(storage(why)),
             },
             "delete" => Ok(Value::bool(store.delete(text(0)).map_err(storage)?)),
+            "increment" => {
+                let by = args[1].as_int().unwrap_or_default();
+                match store.increment(text(0), by) {
+                    Ok(value) => Ok(Value::ok(Value::int(value))),
+                    Err(PutError::Quota(why)) => Ok(Value::err(Value::error(why))),
+                    Err(PutError::Storage(why)) => Err(storage(why)),
+                }
+            }
             "list" | "listDesc" => {
                 let limit = args[2].as_int().unwrap_or_default();
                 if !(1..=MAX_LIST).contains(&limit) {
@@ -455,6 +487,18 @@ mod tests {
         assert!(kv.delete("a").unwrap());
         assert!(!kv.delete("a").unwrap());
         assert_eq!(kv.usage(), (0, 0));
+    }
+
+    #[test]
+    fn increments_count_from_nothing_and_refuse_text() {
+        let mut kv = store(KvLimits::default());
+        assert_eq!(kv.increment("n", 1).unwrap(), 1);
+        assert_eq!(kv.increment("n", 2).unwrap(), 3);
+        assert_eq!(kv.get("n").unwrap().as_deref(), Some("3"));
+        kv.put("t", "text").unwrap();
+        assert!(matches!(kv.increment("t", 1), Err(PutError::Quota(_))));
+        kv.put("big", &i64::MAX.to_string()).unwrap();
+        assert!(matches!(kv.increment("big", 1), Err(PutError::Quota(_))));
     }
 
     #[test]
