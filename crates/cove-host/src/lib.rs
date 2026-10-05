@@ -33,6 +33,7 @@ pub mod router;
 pub mod sched;
 pub mod server;
 pub mod stats;
+pub mod sys;
 pub mod toolchain;
 
 pub use apps::{App, AppState, Backend, LoadOptions};

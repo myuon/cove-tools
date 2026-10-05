@@ -13,6 +13,9 @@
 //! | `timer` | `timer` | `sleep(millis)`, answered **pending**: the run parks and holds no worker while it waits |
 //! | `kv` | `kv` | the app's persistent key-value store ([`crate::kv`]) |
 //! | `fetch` | `fetch` | outbound HTTP to the app's allowlist, answered **pending** ([`crate::fetch`]) |
+//! | `time` | `time` | the wall clock ([`crate::sys`]) |
+//! | `random` | `random` | random bytes from the operating system, as hex ([`crate::sys`]) |
+//! | `auth` | `auth` | checks a presented credential against one of the app's secrets ([`crate::sys`]) |
 //!
 //! A module that answers pending hands the scheduler a [`PendingWork`]: a
 //! future that produces the answer. The scheduler runs it on the I/O runtime,
@@ -33,7 +36,7 @@ use cove_runtime::{
     OperationSchema, Reentry, RuntimeError, Transfer, TypeSchema, Value,
 };
 
-use crate::config::{FetchPolicy, KvLimits};
+use crate::config::{FetchPolicy, KvLimits, Secrets};
 use crate::logs::LogRing;
 use crate::stats::AppCounters;
 
@@ -59,6 +62,7 @@ pub struct AppContext {
     pub data: Option<std::path::PathBuf>,
     pub kv: KvLimits,
     pub fetch: FetchPolicy,
+    pub secrets: Secrets,
     /// The I/O runtime, for a module that has to wait on it from a worker.
     pub io: tokio::runtime::Handle,
 }
@@ -83,7 +87,7 @@ pub struct HostModules {
 }
 
 impl HostModules {
-    /// `web`, `log`, `timer`, `kv` and `fetch`.
+    /// `web`, `log`, `timer`, `kv`, `fetch`, `time`, `random` and `auth`.
     pub fn standard() -> HostModules {
         HostModules {
             modules: vec![
@@ -92,6 +96,9 @@ impl HostModules {
                 Arc::new(TimerModule),
                 Arc::new(crate::kv::KvModule),
                 Arc::new(crate::fetch::FetchModule),
+                Arc::new(crate::sys::TimeModule),
+                Arc::new(crate::sys::RandomModule),
+                Arc::new(crate::sys::AuthModule),
             ],
         }
     }

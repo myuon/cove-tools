@@ -486,6 +486,15 @@ impl Front {
                 })
                 .or_insert(value);
         }
+        // Where the app is mounted, so that it can write links to itself: the
+        // host's, whatever the client sent. (Behind a proxy that mounts the
+        // host under a prefix of its own, prepend it there.)
+        let mount = path
+            .strip_suffix(route.path.as_str())
+            .unwrap_or(&path)
+            .trim_end_matches('/')
+            .to_string();
+        headers.insert("x-forwarded-prefix".to_string(), mount);
         let body = match Limited::new(request.into_body(), limit).collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => return too_large(),

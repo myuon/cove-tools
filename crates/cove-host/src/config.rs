@@ -20,7 +20,7 @@
 //! otherwise be a limit silently not applied. A refusal is the app's alone —
 //! the host starts every other app.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -52,6 +52,69 @@ pub struct AppFile {
     pub kv: KvFile,
     #[serde(default)]
     pub fetch: FetchFile,
+    /// Named secrets the app may check a presented credential against
+    /// (`auth.check`), never read.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretFile>,
+}
+
+/// One `[secrets]` entry: where its value comes from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretFile {
+    /// An environment variable of the host process.
+    pub env: Option<String>,
+    /// A file, relative to the app's directory unless absolute; trailing
+    /// whitespace is trimmed.
+    pub file: Option<String>,
+    /// The value itself, for tests and demos; prefer `env` or `file`.
+    pub value: Option<String>,
+}
+
+/// An app's secrets, by name, resolved. `Debug` prints the names only.
+#[derive(Clone, Default)]
+pub struct Secrets(pub BTreeMap<String, String>);
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// Resolves every secret, or says which could not be.
+fn resolve_secrets(
+    entries: BTreeMap<String, SecretFile>,
+    dir: Option<&Path>,
+) -> Result<Secrets, String> {
+    let mut secrets = BTreeMap::new();
+    for (name, entry) in entries {
+        let value = match (entry.env, entry.file, entry.value) {
+            (Some(var), None, None) => std::env::var(&var).map_err(|_| {
+                format!("secret `{name}`: the environment variable `{var}` is not set")
+            })?,
+            (None, Some(file), None) => {
+                let path = match dir {
+                    Some(dir) if !Path::new(&file).is_absolute() => dir.join(&file),
+                    _ => std::path::PathBuf::from(&file),
+                };
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("secret `{name}`: cannot read `{}`: {e}", path.display()))?
+                    .trim_end()
+                    .to_string()
+            }
+            (None, None, Some(value)) => value,
+            _ => {
+                return Err(format!(
+                    "secret `{name}` must have exactly one of `env`, `file` or `value`"
+                ))
+            }
+        };
+        if value.is_empty() {
+            return Err(format!("secret `{name}` is empty"));
+        }
+        secrets.insert(name, value);
+    }
+    Ok(Secrets(secrets))
 }
 
 /// `[kv]` as written.
@@ -259,6 +322,7 @@ pub struct AppConfig {
     pub limits: AppLimits,
     pub kv: KvLimits,
     pub fetch: FetchPolicy,
+    pub secrets: Secrets,
 }
 
 /// Reads `dir/app.toml` for the app `name`.
@@ -266,11 +330,16 @@ pub fn read_app(dir: &Path, name: &str) -> Result<AppConfig, String> {
     let path = dir.join("app.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
-    parse_app(&text, name).map_err(|e| format!("`{}`: {e}", path.display()))
+    parse_app_in(&text, name, Some(dir)).map_err(|e| format!("`{}`: {e}", path.display()))
 }
 
 /// Parses an `app.toml` for the app `name`.
 pub fn parse_app(text: &str, name: &str) -> Result<AppConfig, String> {
+    parse_app_in(text, name, None)
+}
+
+/// [`parse_app`], with `file` secrets read relative to `dir`.
+pub fn parse_app_in(text: &str, name: &str, dir: Option<&Path>) -> Result<AppConfig, String> {
     let file: AppFile = toml::from_str(text).map_err(|e| e.message().to_string())?;
     let defaults = AppLimits::default();
     let l = file.limits;
@@ -340,12 +409,14 @@ pub fn parse_app(text: &str, name: &str) -> Result<AppConfig, String> {
             .max_response_bytes
             .unwrap_or(fetch_defaults.max_response_bytes),
     };
+    let secrets = resolve_secrets(file.secrets, dir)?;
     Ok(AppConfig {
         entry,
         granted: file.grant.into_iter().collect(),
         limits,
         kv,
         fetch,
+        secrets,
     })
 }
 
@@ -422,6 +493,25 @@ mod tests {
         assert!(AllowRule::parse("example.com").is_err());
         let config = parse_app("[fetch]\nallow = [\"http://localhost:8080\"]\n", "a").unwrap();
         assert!(config.fetch.admits("http", "localhost", 8080));
+    }
+
+    #[test]
+    fn secrets_resolve_and_never_print() {
+        std::env::set_var("COVE_HOST_TEST_SECRET", "from-env");
+        let config = parse_app(
+            "[secrets]\na = { value = \"literal\" }\nb = { env = \"COVE_HOST_TEST_SECRET\" }\n",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(config.secrets.0["a"], "literal");
+        assert_eq!(config.secrets.0["b"], "from-env");
+        assert_eq!(format!("{:?}", config.secrets), "{\"a\", \"b\"}");
+        let missing = parse_app(
+            "[secrets]\nc = { env = \"COVE_HOST_NOT_SET_ANYWHERE\" }\n",
+            "x",
+        );
+        assert!(missing.unwrap_err().contains("is not set"));
+        assert!(parse_app("[secrets]\nd = { value = \"v\", env = \"E\" }\n", "x").is_err());
     }
 
     #[test]

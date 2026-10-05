@@ -24,7 +24,7 @@ use cove_sema::package::{Module, Package, Unit};
 use cove_sema::resolve::Program;
 use cove_sema::{Compiler, Config, HostSchemas};
 
-use crate::config::{read_app, AppConfig, AppLimits, FetchPolicy, KvLimits};
+use crate::config::{read_app, AppConfig, AppLimits, FetchPolicy, KvLimits, Secrets};
 use crate::hosts::{AppContext, HostModules};
 use crate::logs::LogRing;
 use crate::stats::AppCounters;
@@ -91,6 +91,8 @@ pub struct App {
     pub limits: AppLimits,
     pub kv: KvLimits,
     pub fetch: FetchPolicy,
+    /// What `auth.check` compares against; never shown.
+    pub secrets: Secrets,
     pub counters: Arc<AppCounters>,
     /// The app's recent log lines: its `log.*` and the host's lines about it.
     pub logs: Arc<LogRing>,
@@ -158,6 +160,7 @@ impl App {
             data: data.map(|root| root.join(&self.name)),
             kv: self.kv.clone(),
             fetch: self.fetch.clone(),
+            secrets: self.secrets.clone(),
             io: io.clone(),
         }
     }
@@ -280,6 +283,7 @@ pub fn describe_as(name: &str, dir: &Path, lineage: Lineage) -> (App, Option<App
         limits: AppLimits::default(),
         kv: KvLimits::default(),
         fetch: FetchPolicy::default(),
+        secrets: Secrets::default(),
         counters: lineage.counters,
         logs: lineage.logs,
         state: AppState::Refused(String::new()),
@@ -295,6 +299,7 @@ pub fn describe_as(name: &str, dir: &Path, lineage: Lineage) -> (App, Option<App
             app.limits = config.limits.clone();
             app.kv = config.kv.clone();
             app.fetch = config.fetch.clone();
+            app.secrets = config.secrets.clone();
             (app, Some(config))
         }
         Err(why) => {
