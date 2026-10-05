@@ -98,6 +98,8 @@ pub struct App {
     pub fetch: FetchPolicy,
     /// What `auth.check` compares against; never shown.
     pub secrets: Secrets,
+    /// `[access]`: how `auth.identity` knows who is asking.
+    pub access: crate::access::Access,
     /// `[route] hosts`: the hostnames that reach this app, and the only
     /// way to it when there are any.
     pub hosts: Vec<String>,
@@ -185,6 +187,7 @@ impl App {
             kv: self.kv.clone(),
             fetch: self.fetch.clone(),
             secrets: self.secrets.clone(),
+            access: self.access.clone(),
             io: io.clone(),
             control: control.filter(|_| self.name == ADMIN_APP).cloned(),
         }
@@ -315,6 +318,7 @@ pub fn describe_as(
         kv: KvLimits::default(),
         fetch: FetchPolicy::default(),
         secrets: Secrets::default(),
+        access: crate::access::Access::default(),
         hosts: Vec::new(),
         fetch_allow: Vec::new(),
         overridden: over.filter(|over| over.changes_config()).cloned(),
@@ -336,6 +340,7 @@ pub fn describe_as(
             app.kv = config.kv.clone();
             app.fetch = config.fetch.clone();
             app.secrets = config.secrets.clone();
+            app.access = config.access.clone();
             (app, Some(config))
         }
         Err(why) => {

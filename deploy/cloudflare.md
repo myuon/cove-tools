@@ -67,9 +67,11 @@ Zero Trust → **Access → Applications** → **Add an application** →
 
 Everything under `https://covtools.ramda.io/` now needs that login first:
 the webhook lab's admin pages, the ledger's pages, the algorithm playground.
-The webhook lab's admin pages ask for their own secret on top
-(`WEBHOOKS_ADMIN_TOKEN` as the password of the browser's login prompt, any
-user name).
+The webhook lab's admin pages also have the host verify the login itself
+(section 6), so they ask for nothing more.
+
+(The deployment's application is named `covtools`; its AUD tag is what
+section 6 puts in `COVTOOLS_ACCESS_AUD`.)
 
 ## 3. The paths callers outside need
 
@@ -154,7 +156,8 @@ Zero Trust → **Access → Applications** → **Add an application** →
 **Self-hosted**:
 
 - Application name: `cove-tools admin` (a separate application from
-  `cove-tools`)
+  `cove-tools`; the deployment's is named `covtools-admin`, and its AUD tag
+  goes in `COVTOOLS_ADMIN_ACCESS_AUD`, section 6)
 - Session duration: short, `1 hour` or `2 hours`
 - Application domain: subdomain `covtools-admin`, domain `ramda.io`, path
   *empty* (the whole hostname)
@@ -186,13 +189,12 @@ header. Leave *HTTP Host Header* empty, so that cloudflared forwards
 
 ### The second lock
 
-The app itself demands `ADMIN_UI_TOKEN`: a browser login prompt (any user
-name, the token as the password), or `Authorization: Bearer <token>`. Without
-it every page is a 401. Read it on the machine:
-
-```console
-$ grep ADMIN_UI_TOKEN ~/cove-tools/env
-```
+The host verifies the Access login itself (section 6): every page needs the
+token Access adds to the request, for this application. Without it — a
+request that did not come through Access — every page is a 403, and
+`ADMIN_UI_TOKEN` does not help (`fallback = "none"`). The token is the way
+in only when Access is off for the app (`ACCESS_TEAM_DOMAIN` or
+`COVTOOLS_ADMIN_ACCESS_AUD` empty), as on a developer's machine.
 
 ### Check it
 
@@ -204,7 +206,7 @@ $ curl -sI https://covtools.ramda.io/admin/ | head -3   # 302 (Access); and 404 
 and on the machine:
 
 ```console
-$ curl -s -o /dev/null -w '%{http_code}' -H 'Host: covtools-admin.ramda.io' http://127.0.0.1:8790/   # 401
+$ curl -s -o /dev/null -w '%{http_code}' -H 'Host: covtools-admin.ramda.io' http://127.0.0.1:8790/   # 403: no Access token
 ```
 
 ### Emergency exits
@@ -236,15 +238,71 @@ and, logged in, a form on the webhook lab's admin pages (create or delete an
 endpoint) goes through: its `Origin: https://covtools.ramda.io` is the origin
 the host was told.
 
+## 6. The host verifies Access
+
+Cloudflare adds a signed `Cf-Access-Jwt-Assertion` header (and a
+`CF_Authorization` cookie) to every request an Access application lets
+through. The host verifies it for the apps that ask (`auth.identity`; main
+README, *Cloudflare Access*): the admin UI and the webhook lab's admin pages.
+So they know who you are from the Access login alone — no second password
+prompt — and a request that skipped Access (a misconfigured tunnel route, a
+process on the machine talking to `127.0.0.1:8790`) is refused. The receive
+URLs and every other app are unaffected.
+
+What the host needs, all in `~/cove-tools/env` (`deploy/env.example` has the
+deployment's values, and `install.sh` appends whichever an existing env
+lacks, leaving the others alone):
+
+| key | what | where to find it |
+| --- | --- | --- |
+| `ACCESS_TEAM_DOMAIN` | `ioijoi.cloudflareaccess.com`: the issuer (`https://ioijoi.cloudflareaccess.com`) and where the keys are (`https://ioijoi.cloudflareaccess.com/cdn-cgi/access/certs`) | Zero Trust → **Settings** → *Team name and domain*; also the host of the login page Access redirects to |
+| `COVTOOLS_ACCESS_AUD` | `a48226d2b0b956230ccb78ac4b9452d5d32dfb94b112d0a8e84712476d42568a`: the AUD tag of the application `covtools` (covtools.ramda.io, the whole host) — the webhook lab | Zero Trust → **Access → Applications** → `covtools` → **Configure** → **Overview** → *Application Audience (AUD) Tag* |
+| `COVTOOLS_ADMIN_ACCESS_AUD` | `12a48ba5cc9c31a4411138b999190250ba5dd6df203e7630c45a1a1ed5d9d2bc`: the AUD tag of `covtools-admin` (covtools-admin.ramda.io) — the admin UI | the same, for `covtools-admin` |
+| `ACCESS_ALLOWED_EMAILS` | `ioi.joi.koi.loi@gmail.com,ioijoikoiloi@gmail.com`: only these, even if a policy lets someone else through. Empty: whoever the policy allows | the Access policies' *Include → Emails* |
+
+The bypass application on `covtools.ramda.io/webhooks/in` (its AUD tag is
+`1d489de7e96253ea0c7edbffe84db8cc2906773c6c2c94fe8fd1f84ca0c24442`) needs no
+entry: a Bypass application adds no token, and the receive URLs do not ask
+for one. Each app accepts only its own application's AUD tag, so a token
+for `covtools` does not open the admin UI, and one for `covtools-admin` does
+not open the webhook lab.
+
+To take it into use on a running deployment:
+
+```console
+$ bash install.sh v0.2.1          # appends the four keys to ~/cove-tools/env
+$ grep '^ACCESS_\|^COVTOOLS_' ~/cove-tools/env
+$ sudo systemctl restart cove-tools
+```
+
+No unit change: `EnvironmentFile=` already reads the env. Then, in a browser,
+`https://covtools-admin.ramda.io/` and `https://covtools.ramda.io/webhooks/admin`
+open after the Access login with no other prompt, and the admin UI's
+history records your email. On the machine:
+
+```console
+$ curl -s -w '%{http_code}\n' -H 'Host: covtools-admin.ramda.io' http://127.0.0.1:8790/
+the admin pages are reached through Cloudflare Access: no Cloudflare Access token (`Cf-Access-Jwt-Assertion`): ...
+403
+$ journalctl -u cove-tools | grep -i 'access'   # a failed key fetch, or "Access is off" at startup, is logged here
+```
+
+**If the keys cannot be fetched** (the machine cannot reach
+`ioijoi.cloudflareaccess.com`), every login is refused — the host fails
+closed — and the failure is logged per app (`~/cove-tools/data/<app>/log.txt`,
+`/_host/apps/<app>/logs` on the admin listener). Keys already held are used
+for up to six hours. **To fall back to the tokens** (Cloudflare broken, say),
+empty `ACCESS_TEAM_DOMAIN=` in the env and restart: Access is then off for
+both apps, they log that it is, and they prompt for `ADMIN_UI_TOKEN` /
+`WEBHOOKS_ADMIN_TOKEN` again — still only through the tunnel, behind the
+Access login at the edge.
+
+A script cannot use these pages through Access without an Access service
+token, and a service token carries no email, so it is not an identity here:
+use the admin listener (`cove-host enable|disable|reset`) from the machine.
+
 ## Later, not now
 
-- **Verify Access in the host.** Cloudflare adds a signed
-  `Cf-Access-Jwt-Assertion` header to every request it lets through. The host
-  could verify that JWT (the team's public keys at
-  `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, the
-  application's AUD tag) and refuse a request without it, so that a
-  misconfigured tunnel or a local process on the machine could not skip
-  Access. Today the host trusts that only cloudflared reaches `127.0.0.1:8790`.
 - **Security statement.** Apps run in one process: each request is its own
   Cove isolate with its own heap and budget, and an app reaches only the host
   modules it is granted, but same-process isolation is a fault and resource

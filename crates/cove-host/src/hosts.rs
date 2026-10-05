@@ -15,7 +15,7 @@
 //! | `fetch` | `fetch` | outbound HTTP to the app's allowlist, answered **pending** ([`crate::fetch`]) |
 //! | `time` | `time` | the wall clock ([`crate::sys`]) |
 //! | `random` | `random` | random bytes from the operating system, as hex ([`crate::sys`]) |
-//! | `auth` | `auth` | checks a presented credential against one of the app's secrets ([`crate::sys`]) |
+//! | `auth` | `auth` | who is asking: a verified Cloudflare Access identity, or a presented token checked against one of the app's secrets ([`crate::access`], [`crate::sys`]) |
 //! | `host` | `admin` | lists the apps and changes their configuration; the app `admin` only ([`crate::admin_module`]) |
 //!
 //! A module that answers pending hands the scheduler a [`PendingWork`]: a
@@ -64,6 +64,8 @@ pub struct AppContext {
     pub kv: KvLimits,
     pub fetch: FetchPolicy,
     pub secrets: Secrets,
+    /// `[access]`, for `auth.identity`.
+    pub access: crate::access::Access,
     /// The I/O runtime, for a module that has to wait on it from a worker.
     pub io: tokio::runtime::Handle,
     /// The host, for the `host` module of the admin app; `None` for every

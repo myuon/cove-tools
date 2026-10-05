@@ -17,7 +17,19 @@
 //!
 //! [route]
 //! hosts = ["admin.example"]       # reached by these hostnames only, not /<name>/
+//!
+//! [access]                        # Cloudflare Access, for `auth.identity`
+//! team = { env = "ACCESS_TEAM_DOMAIN" }       # `<team>.cloudflareaccess.com`
+//! aud = { env = "COVTOOLS_ACCESS_AUD" }       # the Access application's AUD tag(s)
+//! emails = { env = "ACCESS_ALLOWED_EMAILS" }  # optional: only these
+//! token = "admin"                 # a `[secrets]` name: the token way in
+//! fallback = "none"               # or "token": the token too when Access is on
 //! ```
+//!
+//! `[access]` is read by [`crate::access`]; its values are deployment
+//! facts, so they come from the environment (or a file) like a secret's, and
+//! an unset `team` or `aud` turns Access off for the app rather than
+//! refusing it.
 //!
 //! What `app.toml` says can be changed at run time by the admin app
 //! ([`AppOverride`], kept in the data directory by [`crate::overrides`]): the
@@ -75,6 +87,28 @@ pub struct AppFile {
     pub secrets: BTreeMap<String, SecretFile>,
     #[serde(default)]
     pub route: RouteFile,
+    /// Cloudflare Access, for `auth.identity` ([`crate::access`]).
+    #[serde(default)]
+    pub access: AccessFile,
+}
+
+/// `[access]` as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessFile {
+    /// The Access team domain, `<team>.cloudflareaccess.com` (or a URL).
+    pub team: Option<SecretFile>,
+    /// The Access application's AUD tag; several, separated by commas or
+    /// spaces, for an app behind more than one Access application.
+    pub aud: Option<SecretFile>,
+    /// Only these emails, separated by commas or spaces; any Access let
+    /// through when unset.
+    pub emails: Option<SecretFile>,
+    /// The `[secrets]` entry `auth.identity` accepts as a token.
+    pub token: Option<String>,
+    /// `"none"` (the default): with Access on, only an Access token gets in.
+    /// `"token"`: the `token` secret as well.
+    pub fallback: Option<String>,
 }
 
 /// `[route]` as written.
@@ -145,6 +179,95 @@ fn resolve_secrets(
         secrets.insert(name, value);
     }
     Ok(Secrets(secrets))
+}
+
+/// A non-secret setting from the same three places as a secret: `None` when
+/// its environment variable is unset or empty, or it is empty.
+fn resolve_setting(
+    key: &str,
+    entry: Option<SecretFile>,
+    dir: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let value = match (entry.env, entry.file, entry.value) {
+        (Some(var), None, None) => std::env::var(&var).unwrap_or_default(),
+        (None, Some(file), None) => {
+            let path = match dir {
+                Some(dir) if !Path::new(&file).is_absolute() => dir.join(&file),
+                _ => std::path::PathBuf::from(&file),
+            };
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("`{key}`: cannot read `{}`: {e}", path.display()))?
+        }
+        (None, None, Some(value)) => value,
+        _ => {
+            return Err(format!(
+                "`{key}` must have exactly one of `env`, `file` or `value`"
+            ))
+        }
+    };
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+/// A list setting: split on commas and whitespace.
+fn words(text: Option<String>) -> Vec<String> {
+    text.unwrap_or_default()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Resolves `[access]` against the app's secrets.
+fn resolve_access(
+    file: AccessFile,
+    secrets: &Secrets,
+    dir: Option<&Path>,
+) -> Result<crate::access::Access, String> {
+    use crate::access::{Access, AccessPolicy};
+    if let Some(token) = &file.token {
+        if !secrets.0.contains_key(token) {
+            return Err(format!(
+                "`access.token = \"{token}\"` names no `[secrets]` entry"
+            ));
+        }
+    }
+    let fallback = match file.fallback.as_deref() {
+        None | Some("none") => false,
+        Some("token") => true,
+        Some(other) => {
+            return Err(format!(
+                "`access.fallback = \"{other}\"` is not \"none\" or \"token\""
+            ))
+        }
+    };
+    if fallback && file.token.is_none() {
+        return Err("`access.fallback = \"token\"` needs `access.token`".to_string());
+    }
+    let declared = file.team.is_some() || file.aud.is_some();
+    let team = resolve_setting("access.team", file.team, dir)?;
+    let audiences = words(resolve_setting("access.aud", file.aud, dir)?);
+    let emails = words(resolve_setting("access.emails", file.emails, dir)?)
+        .into_iter()
+        .map(|email| email.to_ascii_lowercase())
+        .collect();
+    let (jwt, off) = match (team, audiences.is_empty()) {
+        (Some(team), false) => (Some(AccessPolicy::new(&team, audiences, emails)?), None),
+        _ if declared => (
+            None,
+            Some("`[access]` has no team or no aud here (unset in the environment?)".to_string()),
+        ),
+        _ => (None, None),
+    };
+    Ok(Access {
+        jwt,
+        token: file.token,
+        fallback,
+        off,
+    })
 }
 
 /// `[kv]` as written.
@@ -533,6 +656,8 @@ pub struct AppConfig {
     /// `[fetch] allow` as written, after any override: the entries the
     /// admin app edits.
     pub file_allow: Vec<String>,
+    /// `[access]`, resolved.
+    pub access: crate::access::Access,
 }
 
 /// Reads `dir/app.toml` for the app `name`.
@@ -691,6 +816,7 @@ pub fn parse_app_with(
             .unwrap_or(fetch_defaults.max_response_bytes),
     };
     let secrets = resolve_secrets(file.secrets, dir)?;
+    let access = resolve_access(file.access, &secrets, dir)?;
     Ok(AppConfig {
         entry,
         granted: file.grant.into_iter().collect(),
@@ -700,6 +826,7 @@ pub fn parse_app_with(
         secrets,
         hosts,
         file_allow: file.fetch.allow,
+        access,
     })
 }
 
@@ -868,5 +995,64 @@ mod tests {
             let text = format!("[route]\nhosts = [\"{bad}\"]\n");
             assert!(parse_app(&text, "a").is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn access_is_on_with_a_team_and_an_aud_and_off_without() {
+        let secret = "[secrets]\nadmin = { value = \"s\" }\n";
+        let on = parse_app(
+            &format!(
+                "{secret}[access]\nteam = {{ value = \"t.cloudflareaccess.com\" }}\n\
+                 aud = {{ value = \"a1, a2\" }}\nemails = {{ value = \"A@x.com b@y.com\" }}\n\
+                 token = \"admin\"\n"
+            ),
+            "x",
+        )
+        .unwrap();
+        let policy = on.access.jwt.unwrap();
+        assert_eq!(policy.issuer, "https://t.cloudflareaccess.com");
+        assert_eq!(policy.audiences, ["a1", "a2"]);
+        assert_eq!(policy.emails, ["a@x.com", "b@y.com"]);
+        assert!(!on.access.fallback);
+        assert_eq!(on.access.token.as_deref(), Some("admin"));
+        // An unset environment variable turns it off, and says so.
+        let off = parse_app(
+            &format!(
+                "{secret}[access]\nteam = {{ env = \"COVE_HOST_NOT_SET_ANYWHERE\" }}\n\
+                 aud = {{ value = \"a\" }}\ntoken = \"admin\"\n"
+            ),
+            "x",
+        )
+        .unwrap();
+        assert!(off.access.jwt.is_none());
+        assert!(off.access.off.is_some());
+        // No `[access]` at all: off, and nothing to say.
+        let none = parse_app(secret, "x").unwrap();
+        assert!(none.access.jwt.is_none() && none.access.off.is_none());
+    }
+
+    #[test]
+    fn access_is_held_to_its_rules() {
+        let secret = "[secrets]\nadmin = { value = \"s\" }\n";
+        for (access, wanted) in [
+            ("token = \"nope\"\n", "names no `[secrets]` entry"),
+            ("fallback = \"maybe\"\n", "is not \"none\" or \"token\""),
+            ("fallback = \"token\"\n", "needs `access.token`"),
+            (
+                "team = { value = \"t.example/x\" }\naud = { value = \"a\" }\n",
+                "team domain",
+            ),
+            ("aud = { value = \"a\", env = \"B\" }\n", "exactly one of"),
+            ("audience = \"a\"\n", "audience"),
+        ] {
+            let error = parse_app(&format!("{secret}[access]\n{access}"), "x").unwrap_err();
+            assert!(error.contains(wanted), "{access}: {error}");
+        }
+        let fallback = parse_app(
+            &format!("{secret}[access]\ntoken = \"admin\"\nfallback = \"token\"\n"),
+            "x",
+        )
+        .unwrap();
+        assert!(fallback.access.fallback);
     }
 }

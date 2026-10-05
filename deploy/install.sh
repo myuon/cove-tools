@@ -12,9 +12,10 @@
 #   1. downloads (or takes) the tarball and verifies its sha256;
 #   2. unpacks it into <root>/releases/<version>/;
 #   3. creates <root>/env from deploy/env.example with fresh random secrets
-#      if there is none (mode 0600); if there is one, appends a fresh secret
-#      for each `KEY=change-me` of the release's env.example that it lacks,
-#      and changes nothing else in it;
+#      if there is none (mode 0600); if there is one, appends each key of the
+#      release's env.example that it lacks — a `KEY=change-me` as a fresh
+#      secret, any other `KEY=value` as written there — and changes nothing
+#      else in it;
 #   4. checks the release's apps (only those --apps names) against that env
 #      with the release's binary, and only then replaces <root>/apps with
 #      them and points <root>/current at the release. The apps come from the
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --apps) APPS="$2"; shift 2 ;;
     --root) ROOT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     -*) die "unknown option $1" ;;
     *) [ -z "$SOURCE" ] || die "one VERSION or TARBALL"; SOURCE="$1"; shift ;;
   esac
@@ -107,16 +108,22 @@ if [ ! -f "$ROOT/env" ]; then
   chmod 600 "$ROOT/env"
   echo "created $ROOT/env with fresh secrets (mode 0600); read them there"
 else
-  # A secret this release added: append it, leave every existing line alone.
+  # A key this release added: append it, leave every existing line alone.
+  # A secret is fresh; a setting is the example's value.
   while IFS= read -r line; do
     case "$line" in
-      [A-Za-z_]*=change-me)
-        key="${line%=change-me}"
+      [A-Za-z_]*=*)
+        key="${line%%=*}"
         if ! grep -q "^$key=" "$ROOT/env"; then
           # A file whose last line has no newline would swallow the key.
           [ -z "$(tail -c 1 "$ROOT/env")" ] || echo >> "$ROOT/env"
-          (umask 077; echo "$key=$(fresh_secret)" >> "$ROOT/env")
-          echo "added $key to $ROOT/env (fresh secret)"
+          if [ "$line" = "$key=change-me" ]; then
+            (umask 077; echo "$key=$(fresh_secret)" >> "$ROOT/env")
+            echo "added $key to $ROOT/env (fresh secret)"
+          else
+            (umask 077; echo "$line" >> "$ROOT/env")
+            echo "added $line to $ROOT/env"
+          fi
         fi ;;
     esac
   done < "$release/deploy/env.example"
@@ -173,6 +180,5 @@ fi
 echo
 echo "then: curl -s http://127.0.0.1:8790/ && curl -s http://127.0.0.1:8791/_host/stats | head"
 echo "logs: journalctl -u cove-tools -f   (per app: $ROOT/data/<app>/log.txt)"
-echo "admin UI: https://covtools-admin.ramda.io/ (Cloudflare Access + ADMIN_UI_TOKEN from $ROOT/env)"
-echo "  locally: curl -s -H 'Host: admin.localhost' -u admin:\$ADMIN_UI_TOKEN http://127.0.0.1:8790/"
+echo "admin UI: https://covtools-admin.ramda.io/ (the Cloudflare Access login; ACCESS_* in $ROOT/env)"
 echo "roll back: ln -sfn releases/<old> $ROOT/current && sudo systemctl restart cove-tools"

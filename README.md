@@ -420,7 +420,7 @@ Access in front:
 | file | what |
 | --- | --- |
 | [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code) |
-| [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`, `ADMIN_UI_TOKEN`), as `~/cove-tools/env`; `install.sh` appends a secret a release adds, fresh, and leaves the others |
+| [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`, `ADMIN_UI_TOKEN`) and the Cloudflare Access settings (`ACCESS_TEAM_DOMAIN`, `COVTOOLS_ACCESS_AUD`, `COVTOOLS_ADMIN_ACCESS_AUD`, `ACCESS_ALLOWED_EMAILS`), as `~/cove-tools/env`; `install.sh` appends a key a release adds — a secret fresh, a setting as written there — and leaves the others |
 | [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks its apps, replaces `~/cove-tools/apps`, points `~/cove-tools/current` at it, and prints the one `sudo` command |
 | [`deploy/backup.sh`](deploy/backup.sh) | SQLite online backups of every app's `kv.sqlite3`, kept 14 days; a user crontab line is in the file |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | the tunnel's public hostname and the Access applications, with the paths left open to outside callers |
@@ -461,6 +461,13 @@ What the deployment relies on from the host:
   reachable under `covtools.ramda.io` ([Routing by hostname](#routing-by-hostname)).
   Its changes live in `data/_host/`, which a release does not touch. No flag
   and no unit change was needed for it.
+- **Cloudflare Access, verified by the host** (`[access]` in the admin
+  app's and the webhook lab's `app.toml`, the values in `~/cove-tools/env`):
+  the admin UI and the webhook lab's admin pages know their user from the
+  Access token, and refuse a request that did not come through Access
+  ([Cloudflare Access](#cloudflare-access-who-is-asking),
+  [deploy/cloudflare.md](deploy/cloudflare.md) §6). No flag and no unit
+  change: `EnvironmentFile=` already reads the env.
 - **`--public-origin https://covtools.ramda.io`**: cloudflared reaches the
   host as plain HTTP on localhost, but the browser's `Origin` is the public
   one. The host tells every app `x-forwarded-proto: https` and
@@ -518,7 +525,7 @@ do, and an app may use only what `app.toml` grants:
 | `fetch` | `fetch` | `get(url)` and `request(method, url, headers: Map<String, String>, body)`, each `-> Result<fetch.Response, Error>` |
 | `time` | `time` | `nowMillis() -> Int`: the wall clock, milliseconds since the Unix epoch; `nowMicros() -> Int`: microseconds, strictly increasing across the process |
 | `random` | `random` | `hex(bytes: Int) -> String`: 1–64 random bytes from the operating system, as hex |
-| `auth` | `auth` | `check(secret: String, authorization: String) -> Bool`: whether an `Authorization` header (`Bearer <s>`, or `Basic` with `<s>` as the password) presents the app's secret `secret`. Constant-time; the secret itself never reaches the app |
+| `auth` | `auth` | `check(secret: String, authorization: String) -> Bool`: whether an `Authorization` header (`Bearer <s>`, or `Basic` with `<s>` as the password) presents the app's secret `secret`. Constant-time; the secret itself never reaches the app. `identity(headers: Map<String, String>) -> Result<auth.Identity, Error>`: who is asking — `{ email, via }`, a Cloudflare Access user the host verified (`via` `"access"`) or the `[access] token` secret (`via` `"token"`, `email` empty); see [Cloudflare Access](#cloudflare-access-who-is-asking). `usesAccess() -> Bool`: whether Access is on for the app, so whether a refusal should prompt for a token |
 | `host` | `admin` | the admin app's view of the host, and its changes: see [Administering apps at run time](#administering-apps-at-run-time). Only the app `admin` may be granted it |
 
 Every request also carries `x-forwarded-prefix`: where the host mounted the
@@ -625,10 +632,55 @@ hosts = []                      # e.g. ["admin.example"]: reached by these only
 admin = { env = "APP_ADMIN_TOKEN" }   # an environment variable of the host
 # admin = { file = "admin.secret" }   # a file, relative to the app's directory
 # admin = { value = "..." }           # literal, for tests
+
+[access]                        # `auth.identity`; see "Cloudflare Access"
+team = { env = "ACCESS_TEAM_DOMAIN" }       # `<team>.cloudflareaccess.com`
+aud = { env = "APP_ACCESS_AUD" }            # the Access application's AUD tag(s)
+emails = { env = "ACCESS_ALLOWED_EMAILS" }  # optional: only these users
+token = "admin"                 # a `[secrets]` name: the token way in
+fallback = "none"               # or "token": the token as well with Access on
 ```
 
 A secret that cannot be resolved (the variable unset, the file missing)
-refuses the app, saying which; its value is never printed.
+refuses the app, saying which; its value is never printed. An `[access]`
+value is a setting, not a secret: an unset (or empty) `team` or `aud` turns
+Access off for the app, which the host logs when it loads it.
+
+### Cloudflare Access: who is asking
+
+An app behind [Cloudflare Access](deploy/cloudflare.md) asks the host who
+its user is with `auth.identity(request.headers)`, instead of a login of its
+own (issue #23). Access adds the user's token — a JWT signed by the team's
+keys — to every request it lets through, as `Cf-Access-Jwt-Assertion` (and
+the `CF_Authorization` cookie, read when the header is missing). The host
+verifies it: the RS256 signature by a key of the team's JWKS
+(`https://<team>/cdn-cgi/access/certs`, chosen by `kid`), `iss` the team,
+`aud` one of the app's `[access] aud`, `exp` and `nbf` with a minute's
+leeway, an `email` claim (so an Access service token is not an identity),
+and `[access] emails` if set. The answer is `Ok(auth.Identity { email, via:
+"access" })`, or `Err` saying what was wrong.
+
+The keys are fetched with the first token and kept; a token naming a key not
+held fetches them again (Cloudflare rotates them), at most once a second, and
+keys an hour old are refreshed when next needed. If the keys cannot be
+fetched, every token they would verify is refused and the failure is logged:
+it fails closed. A fetch parks the run; a token whose key is held is answered
+at once.
+
+`[access] token` names a `[secrets]` entry presented as `Authorization:
+Bearer <secret>` or a Basic password (`via: "token"`, no email). With Access
+off for the app — a local run, where `team` or `aud` is unset — it is the way
+in, and `auth.usesAccess()` is `false`, so the app can answer 401 with a
+login prompt. With Access on it is accepted only under `fallback = "token"`;
+the shipped apps say `"none"`, so a request that did not come through Access
+— straight to `127.0.0.1:8790`, say — is refused whatever it presents, and
+no browser prompt is shown (403). A script that needs in goes through Access
+too, which takes an Access service token anyway, and a service token has no
+email: the admin listener is the way for a script on the machine.
+
+The apps only call `auth.identity`; nothing else of a request is affected,
+so a path an app does not guard — the webhook lab's receive URLs — needs no
+token and fetches no keys.
 
 An unknown key is refused, so a misspelt limit is never silently not
 applied. A config that does not read, an app that does not check (warnings
@@ -783,6 +835,10 @@ bug, overload or budget overrun ends that app's requests and nobody else's.
 apps share one process, one address space and one native code generator, and
 nothing here has been reviewed as a sandbox.
 
+An app behind Cloudflare Access need not trust that only the proxy reaches
+the host: with `[access]`, the host verifies the Access token itself
+(`auth.identity`), so a request straight to the host's port has no identity.
+
 There is no TLS. Put the host behind a reverse proxy (Caddy, nginx,
 cloudflared) that terminates TLS and forwards to `--addr`, which defaults to
 localhost, and tell the host where it is reached (`--public-origin`) so that
@@ -860,7 +916,7 @@ $ cargo t     # = cargo test --workspace --profile checked
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
 integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and
-`updates.rs`, `admin.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
+`updates.rs`, `admin.rs`, `access.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
 so, and what it asserts is counted.
@@ -911,7 +967,22 @@ so, and what it asserts is counted.
   records who, when and what; an app with a hostname is reached by it alone,
   as that hostname's origin, and a hostname reaches one app;
 - the operations page escapes markup an app logs, and shows errors and KV
-  usage against the quota; an app's log reaches `<data>/<app>/log.txt`.
+  usage against the quota; an app's log reaches `<data>/<app>/log.txt`;
+- Cloudflare Access (`access.rs`, against a JWKS the test serves with RSA
+  keys it generates): a valid token gets into the admin UI (header or
+  cookie) and the history records its verified email, not the unverified
+  `Cf-Access-Authenticated-User-Email`; no token, a malformed one, a forged
+  signature, another application's `aud`, another team's `iss`, an expired
+  one, one not valid yet, one with no `exp`, one with no email (a service
+  token) and an email not allowed are each refused with 403 and no prompt,
+  and change nothing; the admin secret alone is refused while Access is on;
+  a token signed by a rotated-in key fetches the keys again and gets in, the
+  keys are then held, and an unknown key is refused with its fetches rate
+  limited; with the JWKS down every token is refused and the failure logged,
+  and back up the next one gets in; `fallback = "token"` lets the secret in,
+  recorded as `token`; with Access off the secret and its Basic prompt are
+  as before; the webhook lab's pages need the lab's own application's token
+  while its receive URLs need nothing and fetch no keys.
 
 `COVE_HOST_TEST_BACKEND=vm cargo t` runs the same suite on the encoded VM,
 as CI does on its second pass.

@@ -38,9 +38,20 @@ not a whole number, below its least value, an allowlist line that is not
   is loopback).
 - **Cloudflare Access** in front of `covtools-admin.ramda.io`, owner only, no
   bypass ([deploy/cloudflare.md](../../deploy/cloudflare.md)).
-- **And its own secret**: `[secrets] admin = { env = "ADMIN_UI_TOKEN" }`,
-  checked with `auth.check` on every request — `Authorization: Bearer
-  <token>`, or the browser's login prompt with the token as the password.
+- **Verified by the host** (issue #23): every request needs an identity,
+  `auth.identity(request.headers)`. Deployed, that is the Access token the
+  request came with (`Cf-Access-Jwt-Assertion`, or the `CF_Authorization`
+  cookie), which the host verifies against the team's keys and the
+  `covtools-admin` Access application's AUD tag — `[access]` in `app.toml`,
+  its values from `ACCESS_TEAM_DOMAIN`, `COVTOOLS_ADMIN_ACCESS_AUD` and
+  `ACCESS_ALLOWED_EMAILS` in the environment. Without a valid one the answer
+  is 403, with no login prompt, so logging in to Access is all a browser
+  does. `fallback = "none"`: `ADMIN_UI_TOKEN` is not accepted while Access
+  is on, so a request straight to the host's port gets nowhere.
+- **Run without Access** (`team` or `aud` unset, as locally): the secret
+  `[secrets] admin = { env = "ADMIN_UI_TOKEN" }` is the way in —
+  `Authorization: Bearer <token>`, or the browser's login prompt (401 with
+  `WWW-Authenticate: Basic`) with the token as the password.
 - **A change from another site is refused** (403): a POST whose
   `Sec-Fetch-Site` is not `same-origin`, or whose `Origin` is not the app's
   own. The host tells the app its origin is the hostname it was routed by
@@ -50,8 +61,10 @@ not a whole number, below its least value, an allowlist line that is not
 - Every value shown is HTML-escaped; the pages carry a CSP of `default-src
   'none'` with inline styles only — **no script at all** — `form-action
   'self'`, `frame-ancestors 'none'`, and `no-store`.
-- Who made a change is what Cloudflare Access says
-  (`Cf-Access-Authenticated-User-Email`), recorded as told.
+- Who made a change is the verified email from the Access token (`admin
+  app: you@example.com` in the history), or `token` when the secret got in.
+  The unsigned `Cf-Access-Authenticated-User-Email` header is not read: any
+  client can send it.
 
 Isolation between apps in one process is a fault and resource boundary, not a
 security boundary against malicious code (main README, *Security*): `admin`
