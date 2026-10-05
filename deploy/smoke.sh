@@ -25,11 +25,18 @@ fail() { echo "smoke.sh: $*" >&2; exit 1; }
 bash "$here/install.sh" "$tarball"
 [ -L "$root/current" ] || fail "no current link"
 [ "$(stat -c %a "$root/env")" = 600 ] || fail "env is not mode 0600"
-for app in webhooks ledger algo; do
+for app in webhooks ledger algo admin; do
   [ -f "$root/apps/$app/app.toml" ] || fail "app $app not installed"
 done
-# Installing the same release again is allowed (a reinstall).
+# Installing the same release again is allowed (a reinstall). A secret the
+# env lacks is appended fresh, and the others are left as they were.
+webhooks_before="$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")"
+sed -i '/^ADMIN_UI_TOKEN=/d' "$root/env"
 bash "$here/install.sh" "$tarball" > /dev/null
+grep -q '^ADMIN_UI_TOKEN=.' "$root/env" || fail "the reinstall did not add ADMIN_UI_TOKEN back"
+[ "$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")" = "$webhooks_before" ] \
+  || fail "the reinstall changed WEBHOOKS_ADMIN_TOKEN"
+[ "$(stat -c %a "$root/env")" = 600 ] || fail "env is not mode 0600 after the reinstall"
 
 # The unit's command line, at the scratch home.
 command="$(sed -n '/^ExecStart=/,/[^\\]$/p' "$root/current/deploy/cove-tools.service" \
@@ -63,6 +70,15 @@ case "$made" in
   *'"https://covtools.ramda.io/webhooks/in/'*) ;;
   *) fail "the receive URL is not at the public origin: $made" ;;
 esac
+
+# The admin UI: reached by its hostname only, behind its own secret.
+admin_token="$(sed -n 's/^ADMIN_UI_TOKEN=//p' "$root/env")"
+admin_host='Host: covtools-admin.ramda.io'
+[ "$(status -H "$admin_host" http://127.0.0.1:8790/)" = 401 ] || fail "the admin UI answered without its token"
+[ "$(status -H "$admin_host" -u "admin:$admin_token" http://127.0.0.1:8790/)" = 200 ] || fail "the admin UI refused its token"
+[ "$(status http://127.0.0.1:8790/admin/)" = 404 ] || fail "the admin app is on the main hostname"
+[ "$(status -X POST -H "$admin_host" -u "admin:$admin_token" -H 'Origin: https://evil.example' \
+  http://127.0.0.1:8790/apps/hello/disable)" = 403 ] || fail "the admin UI took a cross-site POST"
 
 kill -TERM "$pid"
 wait "$pid" || fail "the host did not exit cleanly on SIGTERM"

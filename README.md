@@ -11,7 +11,9 @@ that runs them on one machine.
   key-value store) and `proxy` (allowlisted outbound HTTP); and the real
   apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2),
   [**`ledger`**](apps/ledger/README.md), the bench ledger (#3), and
-  [**`algo`**](apps/algo/README.md), the algorithm playground (#4).
+  [**`algo`**](apps/algo/README.md), the algorithm playground (#4); and
+  [**`admin`**](apps/admin/README.md), the admin UI (#17), the one app that
+  may change the others' configuration.
 
 The host is Rust; the apps are Cove. Cove is a git dependency pinned to one
 commit (`rev` in the workspace `Cargo.toml`), and a change the compiler or
@@ -418,7 +420,7 @@ Access in front:
 | file | what |
 | --- | --- |
 | [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code) |
-| [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`), as `~/cove-tools/env` |
+| [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`, `ADMIN_UI_TOKEN`), as `~/cove-tools/env`; `install.sh` appends a secret a release adds, fresh, and leaves the others |
 | [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks its apps, replaces `~/cove-tools/apps`, points `~/cove-tools/current` at it, and prints the one `sudo` command |
 | [`deploy/backup.sh`](deploy/backup.sh) | SQLite online backups of every app's `kv.sqlite3`, kept 14 days; a user crontab line is in the file |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | the tunnel's public hostname and the Access applications, with the paths left open to outside callers |
@@ -445,14 +447,20 @@ first time: install the unit and start the service (needs sudo, once):
 An upgrade is the same two lines with the new tag, then
 `sudo systemctl restart cove-tools` (the script says which). The service
 stops on SIGTERM by answering new requests 503 and waiting up to
-`--shutdown-grace` for those in flight. By default the webhook lab, the ledger
-and the algorithm playground are installed (`--apps "..."` to choose); the
-sample apps are not.
+`--shutdown-grace` for those in flight. By default the webhook lab, the ledger,
+the algorithm playground and the admin UI are installed (`--apps "..."` to
+choose); the sample apps are not.
 
 What the deployment relies on from the host:
 
 - **`--ops-listener admin`**: `/_host/` is 404 on the public listener; the
   operations views are on the admin listener, which is never in the tunnel.
+- **`[route] hosts` in the admin app's `app.toml`**: the admin UI is
+  `https://covtools-admin.ramda.io`, a second public hostname on the same
+  tunnel and port with an Access application of its own; it is not
+  reachable under `covtools.ramda.io` ([Routing by hostname](#routing-by-hostname)).
+  Its changes live in `data/_host/`, which a release does not touch. No flag
+  and no unit change was needed for it.
 - **`--public-origin https://covtools.ramda.io`**: cloudflared reaches the
   host as plain HTTP on localhost, but the browser's `Origin` is the public
   one. The host tells every app `x-forwarded-proto: https` and
@@ -820,6 +828,17 @@ $ sh bench/perf.sh 3 > bench/results/perf-$(date +%F).txt
 $ SLICE=0 ONLY=mix sh bench/perf.sh 3 > bench/results/perf-$(date +%F)-noslice.txt
 $ python3 bench/summarize.py bench/results/perf-*.txt
 ```
+
+## Issue #17's completion criteria
+
+| criterion | where it is shown |
+| --- | --- |
+| an app enabled and disabled from the browser; a disabled app does not answer; enabled again, its KV data is there | `admin.rs::the_pages_enable_disable_configure_and_reset`, `::a_disabled_app_answers_503_finishes_what_it_had_and_keeps_its_data` (a parked request finishes; the store survives) |
+| a change of grant or budget is applied only when it checks; a wrong one keeps the current config and says why | `admin.rs::a_change_that_is_wrong_is_refused_with_the_reason_and_changes_nothing` (eight kinds), `::the_pages_enable_disable_configure_and_reset` (the form's problems and the host's reason, on the page) |
+| an app whose needed capability is taken away is refused, and the others answer | `admin.rs::taking_away_a_needed_capability_refuses_that_app_and_no_other` |
+| `admin` cannot be granted to any app but the admin app | `admin.rs::only_the_admin_app_may_be_granted_admin` (at load, by `check`, and by a change); the admin app cannot disable itself or drop it: `::the_admin_app_cannot_disable_itself_or_drop_admin_but_the_listener_can` |
+| changes survive a restart; unauthenticated and cross-site operations are refused | `admin.rs::changes_survive_a_restart_and_a_release_that_replaces_the_apps`, `::the_admin_app_needs_its_secret`, `::a_cross_site_form_changes_nothing`; the history: `::the_history_says_who_when_and_what`; escaping: `::the_pages_escape_what_they_show`; the hostname: `::the_admin_app_is_reached_by_its_hostname_only`, `::an_app_with_a_hostname_is_reached_by_it_and_by_nothing_else` |
+| tests, and the Cloudflare Access steps | [Tests](#tests); [deploy/cloudflare.md](deploy/cloudflare.md) §4, [apps/admin/README.md](apps/admin/README.md) |
 
 ## Issue #1's completion criteria
 

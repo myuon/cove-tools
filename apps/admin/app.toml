@@ -1,0 +1,23 @@
+# The admin app (issue #17): what the host runs, and the forms that change
+# it — enable or disable an app, its grant, its fetch allowlist, its limits.
+# It is the one app that may be granted `admin`, and it reaches the host
+# only through the `host` module that capability opens.
+grant = ["admin", "auth"]
+
+# A change reloads the app it is about — check, prepare, compile — while
+# the request that asked for it is parked; a large app takes a while.
+[limits]
+deadline = "60s"
+
+# Reached only by these hostnames, never as /admin/ on another:
+# `covtools-admin.ramda.io` is the deployment's, behind its own Cloudflare
+# Access application (deploy/cloudflare.md); `admin.localhost` is for a
+# browser on the machine itself (`*.localhost` is loopback).
+[route]
+hosts = ["covtools-admin.ramda.io", "admin.localhost"]
+
+# Every page needs this secret too: `Authorization: Bearer <secret>`, or the
+# password of the browser's login prompt (any user name). The app is refused
+# at load without it.
+[secrets]
+admin = { env = "ADMIN_UI_TOKEN" }

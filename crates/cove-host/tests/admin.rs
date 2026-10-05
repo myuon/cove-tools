@@ -428,3 +428,295 @@ fn a_hostname_reaches_one_app() {
     );
     assert_eq!(get_at(host.addr, ADMIN_HOST, "/apps").status, 200);
 }
+
+// ------------------------------------------------------- the real admin app
+
+/// `apps/admin`'s app.toml, its secret a literal.
+fn admin_app_toml() -> String {
+    std::fs::read_to_string(samples().join("admin/app.toml"))
+        .unwrap()
+        .replace("{ env = \"ADMIN_UI_TOKEN\" }", "{ value = \"ui-secret\" }")
+}
+
+/// A host over `apps/admin` and two sample apps, told it is reached at
+/// `https://covtools.ramda.io`, as deployed.
+fn deployed(apps: &Apps) -> Host {
+    let mut options = options(apps, 2);
+    options.forwarding.public_origin = Some("https://covtools.ramda.io".parse().unwrap());
+    Host::start(options).unwrap()
+}
+
+const UI_HOST: &str = "covtools-admin.ramda.io";
+/// `Basic base64("owner:ui-secret")`.
+const UI_LOGIN: &str = "Basic b3duZXI6dWktc2VjcmV0";
+
+/// A request to the admin app, with `extra` header lines.
+fn ui(host: &Host, method: &str, path: &str, extra: &str, body: &str) -> Answer {
+    send_raw(
+        host.addr,
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: {UI_HOST}\r\nConnection: close\r\n{extra}\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+}
+
+fn authed() -> String {
+    format!("Authorization: {UI_LOGIN}\r\n")
+}
+
+/// What a browser on the admin app's own pages sends with a form.
+fn same_site() -> String {
+    format!(
+        "Authorization: {UI_LOGIN}\r\nOrigin: https://{UI_HOST}\r\nSec-Fetch-Site: same-origin\r\n\
+         Cf-Access-Authenticated-User-Email: owner@example.com\r\n"
+    )
+}
+
+/// The configure form for hello, every limit as given.
+fn hello_form(fuel: &str) -> String {
+    format!(
+        "allow=&fuel={fuel}&maxHostCalls=1000&deadlineMs=2000&maxHeapWords=0&maxInFlight=64\
+         &maxQueued=256&maxRequestBytes=1048576&maxResponseBytes=4194304"
+    )
+}
+
+fn ui_apps() -> Apps {
+    let config = admin_app_toml();
+    // Leaked: the spec borrows it for the test's length.
+    let config: &'static str = Box::leak(config.into_boxed_str());
+    apps(&[
+        sample_with("admin", config),
+        sample("hello"),
+        sample("notes"),
+    ])
+}
+
+#[test]
+fn the_admin_app_needs_its_secret() {
+    let apps = ui_apps();
+    let host = deployed(&apps);
+    for extra in [
+        String::new(),
+        "Authorization: Bearer wrong\r\n".to_string(),
+        "Authorization: Basic b3duZXI6d3Jvbmc=\r\n".to_string(),
+    ] {
+        let answer = ui(&host, "GET", "/", &extra, "");
+        assert_eq!(answer.status, 401, "{extra}");
+        assert!(answer
+            .header("www-authenticate")
+            .unwrap()
+            .starts_with("Basic"));
+        let change = ui(&host, "POST", "/apps/hello/disable", &extra, "");
+        assert_eq!(change.status, 401, "{extra}");
+    }
+    assert_eq!(get(host.addr, "/hello/").status, 200);
+    let page = ui(&host, "GET", "/", &authed(), "");
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("<b>hello</b>"), "{}", page.body);
+    let csp = page.header("content-security-policy").unwrap();
+    assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"));
+    assert!(!csp.contains("script-src"), "{csp}");
+    // Bearer works as well, for curl.
+    let bearer = ui(
+        &host,
+        "GET",
+        "/history",
+        "Authorization: Bearer ui-secret\r\n",
+        "",
+    );
+    assert_eq!(bearer.status, 200);
+}
+
+#[test]
+fn a_cross_site_form_changes_nothing() {
+    let apps = ui_apps();
+    let host = deployed(&apps);
+    for extra in [
+        "Origin: https://evil.example\r\n",
+        // The admin app's origin is its own hostname, not the main one.
+        "Origin: https://covtools.ramda.io\r\n",
+        "Origin: http://covtools-admin.ramda.io\r\n",
+        "Sec-Fetch-Site: cross-site\r\n",
+        "Sec-Fetch-Site: same-site\r\nOrigin: https://covtools-admin.ramda.io\r\n",
+    ] {
+        let answer = ui(
+            &host,
+            "POST",
+            "/apps/hello/disable",
+            &format!("{}{extra}", authed()),
+            "",
+        );
+        assert_eq!(answer.status, 403, "{extra}: {}", answer.body);
+    }
+    assert_eq!(get(host.addr, "/hello/").status, 200);
+    assert!(!overrides(&apps.data).contains("hello"));
+    // From its own pages, the same form goes through.
+    let answer = ui(&host, "POST", "/apps/hello/disable", &same_site(), "");
+    assert_eq!(answer.status, 303, "{}", answer.body);
+    assert_eq!(answer.header("location"), Some("/apps/hello?done=disable"));
+    assert_eq!(get(host.addr, "/hello/").status, 503);
+}
+
+#[test]
+fn the_admin_app_is_reached_by_its_hostname_only() {
+    let apps = ui_apps();
+    let host = deployed(&apps);
+    for host_header in ["covtools.ramda.io", "localhost", "127.0.0.1:8790"] {
+        for path in ["/admin/", "/admin/apps/hello", "/admin/history"] {
+            let answer = send_raw(
+                host.addr,
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\
+                     Authorization: {UI_LOGIN}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            assert_eq!(answer.status, 404, "{host_header}{path}: {}", answer.body);
+        }
+    }
+    // Locally, by `admin.localhost`.
+    let local = get_at(host.addr, "admin.localhost:8790", "/");
+    assert_eq!(local.status, 401);
+}
+
+#[test]
+fn the_pages_enable_disable_configure_and_reset() {
+    let apps = ui_apps();
+    let host = deployed(&apps);
+    let addr = host.addr;
+    // A wrong form: the problems, by field, and nothing done.
+    let wrong = ui(
+        &host,
+        "POST",
+        "/apps/hello/configure",
+        &same_site(),
+        &hello_form("lots"),
+    );
+    assert_eq!(wrong.status, 422);
+    assert!(
+        wrong
+            .body
+            .contains("fuel per request: `lots` is not a whole number"),
+        "{}",
+        wrong.body
+    );
+    assert!(
+        wrong.body.contains("value=\"lots\""),
+        "the form comes back as posted"
+    );
+    // A form the host refuses: its reason, and nothing done.
+    let refused = ui(
+        &host,
+        "POST",
+        "/apps/hello/configure",
+        &same_site(),
+        &hello_form("100").replace("maxHeapWords=0", "maxHeapWords=99999999"),
+    );
+    assert_eq!(refused.status, 422);
+    assert!(
+        refused.body.contains("Refused: nothing was changed"),
+        "{}",
+        refused.body
+    );
+    assert!(
+        refused.body.contains("fixed per-run heap"),
+        "{}",
+        refused.body
+    );
+    assert!(!overrides(&apps.data).contains("hello"));
+    // A good one.
+    let applied = ui(
+        &host,
+        "POST",
+        "/apps/hello/configure",
+        &same_site(),
+        &hello_form("3000000"),
+    );
+    assert_eq!(applied.status, 303, "{}", applied.body);
+    let page = ui(&host, "GET", "/apps/hello?done=configure", &authed(), "");
+    assert!(page.body.contains("Applied."), "{}", page.body);
+    assert!(
+        page.body.contains("3000000 <span class=added"),
+        "{}",
+        page.body
+    );
+    assert_eq!(app_stats(&host, "hello")["limits"]["fuel"], 3000000);
+    // Taking `kv` from notes refuses notes, and the page says why.
+    let form = "cap.log=on&".to_string()
+        + &hello_form("50000000").replace("deadlineMs=2000", "deadlineMs=10000");
+    let taken = ui(&host, "POST", "/apps/notes/configure", &same_site(), &form);
+    assert_eq!(taken.status, 303, "{}", taken.body);
+    assert_eq!(get(addr, "/notes/x").status, 503);
+    let overview = ui(&host, "GET", "/", &authed(), "").body;
+    assert!(overview.contains("state refused"), "{overview}");
+    // Reset brings it back.
+    assert_eq!(
+        ui(&host, "POST", "/apps/notes/reset", &same_site(), "").status,
+        303
+    );
+    assert_ne!(get(addr, "/notes/x").status, 503);
+    // Disable and enable.
+    assert_eq!(
+        ui(&host, "POST", "/apps/hello/disable", &same_site(), "").status,
+        303
+    );
+    assert_eq!(get(addr, "/hello/").status, 503);
+    assert_eq!(
+        ui(&host, "POST", "/apps/hello/enable", &same_site(), "").status,
+        303
+    );
+    assert_eq!(get(addr, "/hello/").status, 200);
+    // Not itself.
+    let itself = ui(&host, "POST", "/apps/admin/disable", &same_site(), "");
+    assert_eq!(itself.status, 422);
+    assert!(
+        itself.body.contains("cannot disable itself"),
+        "{}",
+        itself.body
+    );
+    let own = ui(&host, "GET", "/apps/admin", &authed(), "").body;
+    assert!(
+        !own.contains("action=\"/apps/admin/disable\""),
+        "no disable button for itself"
+    );
+    // The history says who.
+    let history = ui(&host, "GET", "/history", &authed(), "").body;
+    assert!(
+        history.contains("admin app: owner@example.com"),
+        "{history}"
+    );
+}
+
+#[test]
+fn the_pages_escape_what_they_show() {
+    let apps = ui_apps();
+    let host = deployed(&apps);
+    let sneaky = format!(
+        "Authorization: {UI_LOGIN}\r\nCf-Access-Authenticated-User-Email: <script>alert(1)</script>\r\n"
+    );
+    ui(&host, "POST", "/apps/hello/disable", &sneaky, "");
+    let history = ui(&host, "GET", "/history", &authed(), "").body;
+    assert!(!history.contains("<script>"), "{history}");
+    assert!(
+        history.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{history}"
+    );
+    // A form posted back is escaped too.
+    let echoed = ui(
+        &host,
+        "POST",
+        "/apps/hello/configure",
+        &same_site(),
+        &hello_form("%22%3E%3Cimg+src%3Dx%3E"),
+    );
+    assert_eq!(echoed.status, 422);
+    assert!(!echoed.body.contains("<img"), "{}", echoed.body);
+    assert!(
+        echoed.body.contains("&quot;&gt;&lt;img src=x&gt;"),
+        "{}",
+        echoed.body
+    );
+}
