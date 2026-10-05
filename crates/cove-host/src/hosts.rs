@@ -169,16 +169,6 @@ impl PendingWork {
     }
 }
 
-/// `value` as the [`Transfer`] a parked run is resumed with.
-///
-/// Built and converted in one synchronous step: a [`Value`] is `Rc`-based and
-/// must not be held across an `.await` of a future that has to be `Send`.
-pub fn transfer(value: &Value) -> Result<Transfer, RuntimeError> {
-    Transfer::of(value).map_err(|unsafe_value| {
-        RuntimeError::new(format!("{} is not task-safe", unsafe_value.type_name))
-    })
-}
-
 // ------------------------------------------------------------------- web
 
 const STRING_MAP: HostType = HostType::Map(&HostType::String, &HostType::String);
@@ -420,7 +410,7 @@ impl HostApi for TimerHost {
             if !wanted.is_zero() {
                 tokio::time::sleep(wanted).await;
             }
-            transfer(&Value::unit())
+            Ok(Transfer::Unit)
         })
         .answer()
     }

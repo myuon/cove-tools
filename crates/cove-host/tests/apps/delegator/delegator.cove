@@ -1,0 +1,8 @@
+use web
+use work
+
+/// Doubles a number through `work`, which spawns a task to do it.
+export async fn handle(request: web.Request) -> web.Response {
+  let answer = work.double(21)
+  web.Response(status: 200, headers: Map.of(), body: "{answer}\n")
+}

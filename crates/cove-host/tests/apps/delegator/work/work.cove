@@ -1,0 +1,7 @@
+/// Doubles `n` on a task of its own.
+export async fn double(n: Int) -> Int {
+  scope tasks {
+    let doubled = tasks.spawn { n * 2 }
+    doubled.await()
+  }
+}

@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cove_runtime::value::MapKey;
-use cove_runtime::Value;
+use cove_runtime::{Transfer, Value};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
@@ -136,13 +136,14 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// As the `auth.Identity` value.
-    pub fn value(&self) -> Value {
-        Value::structure(
+    /// As the `auth.Identity` value, in the form a parked run is resumed
+    /// with; [`Transfer::into_value`] for a run answered at once.
+    pub fn transfer(&self) -> Transfer {
+        Transfer::structure(
             "auth.Identity",
-            vec![
-                ("email", Value::string(self.email.clone())),
-                ("via", Value::string(self.via)),
+            [
+                ("email", Transfer::string(self.email.clone())),
+                ("via", Transfer::string(self.via)),
             ],
         )
     }

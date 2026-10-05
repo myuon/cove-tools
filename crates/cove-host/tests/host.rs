@@ -426,3 +426,61 @@ fn park_cost() {
         (sixteen - one) / 15
     );
 }
+
+#[test]
+fn a_run_that_outgrows_its_heap_fails_while_it_allocates() {
+    // `hoarder` has a heap of 65,536 words. A run that keeps a few numbers
+    // fits, parks once and answers.
+    let apps = apps(&[fixture("hoarder")]);
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let fits = get(addr, "/hoarder/?n=100&ms=0");
+    assert_eq!(fits.status, 200, "{}", fits.body);
+    assert_eq!(fits.body, "kept 100\n");
+    assert_eq!(count(&host, "hoarder", "parks"), 1);
+    let peak = count(&host, "hoarder", "heap_peak_words");
+    assert!(peak > 0 && peak <= 65536, "{peak}");
+
+    // One that keeps a million fails its allocation where it makes it: it
+    // never reaches the minute's wait after it (which its deadline would
+    // have ended), so it never parks.
+    let grows = get(addr, "/hoarder/?n=1000000&ms=60000");
+    assert_eq!(grows.status, 500, "{}", grows.body);
+    assert_eq!(grows.header("x-cove-stop"), Some("heap"));
+    assert!(
+        grows.body.contains("this run has no memory left"),
+        "{}",
+        grows.body
+    );
+    assert_eq!(count(&host, "hoarder", "errors.heap"), 1);
+    assert_eq!(
+        count(&host, "hoarder", "parks"),
+        1,
+        "the second run never parked"
+    );
+    assert!(count(&host, "hoarder", "heap_peak_words") <= 65536);
+}
+
+#[test]
+fn a_spawn_reached_through_a_module_is_refused_where_it_is() {
+    let apps = apps(&[fixture("delegator")]);
+    let host = start(&apps, 1);
+    let refused = get(host.addr, "/delegator/");
+    assert_eq!(refused.status, 503);
+    assert!(
+        refused
+            .body
+            .contains("`delegator.handle` can spawn a task — `work.double` spawns one"),
+        "{}",
+        refused.body
+    );
+    let report =
+        cove_host::toolchain::check(&apps.root, &[], &cove_host::HostModules::standard()).unwrap();
+    assert!(!report.ok);
+    assert!(report.err.contains("cove_host::spawn"), "{}", report.err);
+    assert!(
+        report.err.contains("delegator/work/work.cove:"),
+        "at the spawn, in the module: {}",
+        report.err
+    );
+}

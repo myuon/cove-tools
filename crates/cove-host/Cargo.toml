@@ -19,7 +19,6 @@ clap = { version = "4.5", features = ["derive"] }
 form_urlencoded = "1.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio-util = "0.7"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

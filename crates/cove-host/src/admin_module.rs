@@ -37,7 +37,7 @@ use cove_runtime::{
 };
 
 use crate::config::{LimitsFile, ADMIN_CAPABILITY};
-use crate::hosts::{transfer, AppContext, HostModule, PendingWork};
+use crate::hosts::{AppContext, HostModule, PendingWork};
 use crate::manage::{AppInfo, Settings, Via};
 use crate::overrides::{Change, Control};
 
@@ -448,11 +448,10 @@ impl AdminHost {
                 }
                 Asked::Reset => front.reset(&app, &via).await,
             };
-            let value = match outcome {
-                Ok(message) => Value::ok(Value::string(message)),
-                Err(error) => Value::err(Value::error(error.to_string())),
-            };
-            transfer(&value)
+            Ok(match outcome {
+                Ok(message) => Transfer::ok(Transfer::string(message)),
+                Err(error) => Transfer::err(Transfer::error(error.to_string())),
+            })
         })
     }
 }

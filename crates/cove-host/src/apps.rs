@@ -12,7 +12,7 @@
 //! does not read, it does not check (warnings included), its entry requires a
 //! capability `app.toml` does not grant, or its code can `spawn` a task.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use cove_diag::{render, Diagnostic, Severity, SourceMap};
 use cove_ir::Inst;
 use cove_runtime::{HostRegistry, OwnedVm, PreparedProgram, Runtime};
-use cove_sema::package::{Module, Package, Unit};
-use cove_sema::resolve::Program;
-use cove_sema::{Compiler, Config, HostSchemas};
+use cove_sema::package::{self, Module, Package, Unit};
+use cove_sema::resolve::{FnEntry, Program};
+use cove_sema::{Compiler, HostSchemas};
 
 use crate::config::{
     read_app_with, AppConfig, AppLimits, AppOverride, FetchPolicy, KvLimits, Secrets, ADMIN_APP,
@@ -147,13 +147,25 @@ pub struct LoadCost {
 
 impl Ready {
     /// A fresh isolate: its own heap, stack and budget, nothing of any other
-    /// run's.
-    pub fn isolate(&self) -> OwnedVm {
-        OwnedVm::new(
+    /// run's. With `max_heap_words` the heap may grow to that many words and
+    /// no further — a run that needs more fails its allocation with "this run
+    /// has no memory left" (ADR 0088) — and without it to the runtime's
+    /// default.
+    pub fn isolate(&self, max_heap_words: Option<u64>) -> OwnedVm {
+        let (runtime, hosts, program) = (
             Arc::clone(&self.runtime),
             Arc::clone(&self.hosts),
             self.program.clone(),
-        )
+        );
+        match max_heap_words {
+            Some(words) => OwnedVm::with_heap_words(
+                runtime,
+                hosts,
+                program,
+                usize::try_from(words).unwrap_or(usize::MAX),
+            ),
+            None => OwnedVm::new(runtime, hosts, program),
+        }
     }
 }
 
@@ -532,8 +544,16 @@ pub fn admit(app: &mut App, compiled: &Compiled) -> Result<(), String> {
 /// (ADR 0080 §2, ADR 0084 §3), and it has no native tier (ADR 0085). So an
 /// app that can spawn could hold a worker for its whole deadline and start
 /// threads the pool does not count. Rather than admit it with a limit that
-/// holds only in part, the host refuses it here, naming the `spawn`; the
-/// run's `max_tasks = 0` is the backstop.
+/// holds only in part, the host refuses it here; the run's `max_tasks = 0` is
+/// the backstop.
+///
+/// Whether the entry can spawn is the checker's [`FnEntry::can_spawn`] — it
+/// reaches a task `scope` (ADR 0088). That is a lower bound when the entry is
+/// capability-open, since a call the graph cannot follow may reach a scope it
+/// cannot see; so an open entry in a package where some function opens a
+/// scope is decided by the lowered program instead, which holds exactly what
+/// the entry reaches. The lowered program is also where the refusal finds the
+/// `spawn` to point at; without one, it points at the entry.
 pub fn lower(
     app: &App,
     compiled: &Compiled,
@@ -547,39 +567,97 @@ pub fn lower(
         &schemas,
         module,
         function,
-    )
-    .map_err(|items| format!("does not lower:\n{}", report(&compiled.sources, &items)))?;
-    refuse_spawn(&lowered, &compiled.sources)?;
+    );
+    let entry = compiled.program.lookup_fn(module, function);
+    if let Some(entry) = entry.filter(|entry| entry.can_spawn) {
+        return Err(refuse_spawn(
+            &app.entry,
+            entry,
+            lowered.as_ref().ok(),
+            &compiled.sources,
+        ));
+    }
+    let lowered = lowered.map_err(|items| unlowered(&compiled.sources, &items, entry))?;
+    if let Some(entry) =
+        entry.filter(|entry| entry.is_capability_open() && opens_a_scope(&compiled.program))
+    {
+        if spawn_site(&lowered).is_some() {
+            return Err(refuse_spawn(
+                &app.entry,
+                entry,
+                Some(&lowered),
+                &compiled.sources,
+            ));
+        }
+    }
     Ok(lowered)
 }
 
-/// The first `spawn` the lowered program can reach, as a refusal.
-fn refuse_spawn(program: &cove_ir::Program, sources: &SourceMap) -> Result<(), String> {
-    for function in &program.functions {
-        for (at, inst) in function.code.iter().enumerate() {
-            if matches!(inst, Inst::Spawn { .. }) {
-                let mut diagnostic = Diagnostic::error(
-                    "cove_host::spawn",
-                    format!(
-                        "`{}.{}` can spawn a task, which cove-host does not run",
-                        function.module, function.name
-                    ),
-                )
-                .rule(
-                    "A spawned task runs outside the host's worker pool and keeps its parent \
-                     from parking or yielding; cove-host refuses an app that can spawn.",
-                );
-                if let Some(span) = function.spans.get(at) {
-                    diagnostic = diagnostic.at(*span);
-                }
-                return Err(format!(
-                    "can spawn a task:\n{}",
-                    render(sources, &diagnostic)
-                ));
-            }
-        }
-    }
-    Ok(())
+/// Whether any function of the package opens a task `scope` itself.
+fn opens_a_scope(program: &Program) -> bool {
+    program.modules.values().any(|module| {
+        module.functions.values().any(|f| f.direct_spawns)
+            || module.methods.values().any(|f| f.direct_spawns)
+    })
+}
+
+/// The first `spawn` in a lowered program, with the function it is in.
+fn spawn_site(program: &cove_ir::Program) -> Option<(String, Option<cove_diag::Span>)> {
+    program.functions.iter().find_map(|function| {
+        let at = function
+            .code
+            .iter()
+            .position(|inst| matches!(inst, Inst::Spawn { .. }))?;
+        Some((
+            format!("{}.{}", function.module, function.name),
+            function.spans.get(at).copied(),
+        ))
+    })
+}
+
+/// The refusal of an entry that can spawn: at the `spawn` the lowered program
+/// reaches, if it lowered and holds one, and at the entry otherwise.
+fn refuse_spawn(
+    name: &str,
+    entry: &FnEntry,
+    lowered: Option<&cove_ir::Program>,
+    sources: &SourceMap,
+) -> String {
+    let site = lowered.and_then(spawn_site);
+    let message = match &site {
+        Some((function, _)) if function != name => format!(
+            "`{name}` can spawn a task — `{function}` spawns one — which cove-host does not run"
+        ),
+        _ => format!("`{name}` can spawn a task, which cove-host does not run"),
+    };
+    let diagnostic = Diagnostic::error("cove_host::spawn", message.clone())
+        .at(site
+            .and_then(|(_, span)| span)
+            .unwrap_or(entry.decl.name.span))
+        .rule(
+            "A spawned task runs outside the host's worker pool and keeps its parent \
+             from parking or yielding; cove-host refuses an app that can spawn.",
+        );
+    format!("{message}\n{}", render(sources, &diagnostic))
+}
+
+/// A lowering's refusal, rendered: its first message on the summary line, and
+/// every diagnostic with its location below — at the entry for one that came
+/// without a position of its own, so that none reads as an empty diagnostic
+/// (issue 26).
+fn unlowered(sources: &SourceMap, items: &[Diagnostic], entry: Option<&FnEntry>) -> String {
+    let located: Vec<Diagnostic> = items
+        .iter()
+        .map(|item| match (item.primary, entry) {
+            (None, Some(entry)) => item.clone().at(entry.decl.name.span),
+            _ => item.clone(),
+        })
+        .collect();
+    let first = items
+        .first()
+        .map(|item| item.message.as_str())
+        .unwrap_or("no reason was given");
+    format!("does not lower: {first}\n{}", report(sources, &located))
 }
 
 /// Compiles, checks the grant, lowers, prepares; or says why not.
@@ -654,13 +732,24 @@ fn note_fallback(why: &str) {
 /// The app's modules and the standard library, as a package of their own.
 ///
 /// The `.cove` files directly in the app's directory are the module named
-/// after the app; each subdirectory holding `.cove` files is a module named
-/// after the subdirectory, which the app's files may `use`. Nothing outside
-/// the directory is read.
+/// after the app, loaded with the standard library by Cove's own
+/// [`package::load_module`]; each subdirectory holding `.cove` files is a
+/// module named after the subdirectory, which the app's files may `use`.
+/// Nothing outside the directory is read, and every file is named relative to
+/// the app's parent directory, so that an error points at
+/// `hello/hello.cove:3`.
 pub fn load_package(dir: &Path, name: &str) -> Result<(SourceMap, Package), String> {
     let mut sources = SourceMap::new();
-    let mut modules = BTreeMap::new();
-    let mut main = None;
+    if dir.file_name().and_then(|n| n.to_str()) != Some(name) {
+        return Err(format!(
+            "`{}` is not a directory named `{name}`",
+            dir.display()
+        ));
+    }
+    let root = dir.parent().unwrap_or(dir);
+    let mut package = package::load_module(root, name, &mut sources)
+        .map_err(|items| unloaded(&sources, &items))?;
+    package.root = dir.to_path_buf();
     let mut subdirs = Vec::new();
     for entry in
         std::fs::read_dir(dir).map_err(|e| format!("cannot read `{}`: {e}", dir.display()))?
@@ -671,20 +760,23 @@ pub fn load_package(dir: &Path, name: &str) -> Result<(SourceMap, Package), Stri
         }
     }
     subdirs.sort();
-    for (module, module_dir) in std::iter::once((name.to_string(), dir.to_path_buf())).chain(
-        subdirs.into_iter().filter_map(|path| {
-            let module = path.file_name()?.to_str()?.to_string();
-            Some((module, path))
-        }),
-    ) {
-        let units = read_units(&module_dir, dir, &mut sources)?;
+    for module_dir in subdirs {
+        let Some(module) = module_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let module = module.to_string();
+        let units = read_units(&module_dir, root, &mut sources)?;
         if units.is_empty() {
             continue;
         }
-        if module == name {
-            main = Some(());
+        if package.modules.contains_key(&module) {
+            return Err(format!(
+                "`{}` is a module named `{module}`, which is already the app's or the \
+                 standard library's",
+                module_dir.display()
+            ));
         }
-        modules.insert(
+        package.modules.insert(
             module.clone(),
             Module {
                 name: module,
@@ -693,22 +785,25 @@ pub fn load_package(dir: &Path, name: &str) -> Result<(SourceMap, Package), Stri
             },
         );
     }
-    if main.is_none() {
-        return Err(format!("`{}` holds no `.cove` file", dir.display()));
-    }
-    cove_sema::stdlib::install(&mut sources, &mut modules)
-        .map_err(|items| report(&sources, &items))?;
-    let package = Package {
-        root: dir.to_path_buf(),
-        config: Config::default(),
-        modules,
-    };
     Ok((sources, package))
 }
 
-/// The `.cove` files directly in `dir`, parsed. Named relative to the app's
-/// parent directory, so that an error points at `hello/hello.cove:3`.
-fn read_units(dir: &Path, app_dir: &Path, sources: &mut SourceMap) -> Result<Vec<Unit>, String> {
+/// What [`package::load_module`] refused, rendered: a file that does not parse
+/// as a diagnostic, a directory it cannot read as its message.
+fn unloaded(sources: &SourceMap, items: &[Diagnostic]) -> String {
+    if items.iter().any(|item| item.primary.is_some()) {
+        format!("does not parse:\n{}", report(sources, items))
+    } else {
+        items
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// The `.cove` files directly in `dir`, parsed, named relative to `root`.
+fn read_units(dir: &Path, root: &Path, sources: &mut SourceMap) -> Result<Vec<Unit>, String> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read `{}`: {e}", dir.display()))?
         .filter_map(Result::ok)
@@ -716,12 +811,11 @@ fn read_units(dir: &Path, app_dir: &Path, sources: &mut SourceMap) -> Result<Vec
         .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("cove"))
         .collect();
     paths.sort();
-    let shown_root = app_dir.parent().unwrap_or(app_dir);
     let mut units = Vec::new();
     for path in paths {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
-        let shown = path.strip_prefix(shown_root).unwrap_or(&path).to_path_buf();
+        let shown = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
         let file = sources.add(shown, &text);
         let ast = cove_syntax::parse_file(sources, file)
             .map_err(|items| format!("does not parse:\n{}", report(sources, &items)))?;
@@ -733,4 +827,56 @@ fn read_units(dir: &Path, app_dir: &Path, sources: &mut SourceMap) -> Result<Vec
 /// Diagnostics, rendered the way `cove check` renders them.
 pub fn report(sources: &SourceMap, items: &[Diagnostic]) -> String {
     items.iter().map(|item| render(sources, item)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello() -> Compiled {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/hello");
+        compile(&dir, "hello", &HostModules::standard()).expect("hello compiles")
+    }
+
+    /// Issue 26: a lowering refusal names its first reason on the summary
+    /// line and is rendered with a location — its own, or the entry's for one
+    /// that came without — so that none reads as an empty diagnostic.
+    #[test]
+    fn a_lowering_refusal_is_printed_with_its_location() {
+        let compiled = hello();
+        let entry = compiled.program.lookup_fn("hello", "handle");
+        let items = [Diagnostic::error(
+            "cove::lower::gap",
+            "this construct has no lowering",
+        )];
+        let why = unlowered(&compiled.sources, &items, entry);
+        let (summary, rendered) = why.split_once('\n').unwrap();
+        assert_eq!(summary, "does not lower: this construct has no lowering");
+        assert!(
+            rendered.contains("this construct has no lowering"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("hello/hello.cove:"), "{rendered}");
+    }
+
+    /// The app's module and its subdirectories' modules are loaded, named
+    /// relative to the apps directory, beside the standard library.
+    #[test]
+    fn an_app_loads_with_its_modules_and_the_standard_library() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/ledger");
+        let (sources, package) = load_package(&dir, "ledger").unwrap();
+        for module in ["ledger", "json", "stats"] {
+            assert!(package.modules.contains_key(module), "{module}");
+        }
+        assert!(package.modules.keys().any(|name| name.starts_with("std")));
+        let json = &package.modules["json"];
+        assert_eq!(
+            sources.path(json.units[0].file),
+            Path::new("ledger/json/json.cove")
+        );
+        let Err(missing) = load_package(&dir.join("nope"), "nope") else {
+            panic!("a directory that is not there loads");
+        };
+        assert!(missing.contains("cannot read"), "{missing}");
+    }
 }

@@ -194,7 +194,7 @@ fn a_change_that_is_wrong_is_refused_with_the_reason_and_changes_nothing() {
         ("fuel=-5", "`fuel` cannot be negative"),
         ("fuel=0", "`fuel` must be at least 1"),
         ("deadline=0", "`deadlineMs` must be at least 1"),
-        ("heap=99999999", "fixed per-run heap"),
+        ("heap=9999999999", "largest heap a run can have"),
         ("allow=ftp://nope", "is not an allowlist entry"),
         (
             "grant=log,teleport",
@@ -612,7 +612,7 @@ fn the_pages_enable_disable_configure_and_reset() {
         "POST",
         "/apps/hello/configure",
         &same_site(),
-        &hello_form("100").replace("maxHeapWords=0", "maxHeapWords=99999999"),
+        &hello_form("100").replace("maxHeapWords=0", "maxHeapWords=9999999999"),
     );
     assert_eq!(refused.status, 422);
     assert!(
@@ -621,7 +621,7 @@ fn the_pages_enable_disable_configure_and_reset() {
         refused.body
     );
     assert!(
-        refused.body.contains("fixed per-run heap"),
+        refused.body.contains("largest heap a run can have"),
         "{}",
         refused.body
     );

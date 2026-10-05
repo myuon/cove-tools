@@ -56,15 +56,14 @@ pub const ADMIN_CAPABILITY: &str = "admin";
 /// other app — in its `app.toml` or through an override — refuses that app.
 pub const ADMIN_APP: &str = "admin";
 
-/// The runtime's fixed per-run heap, in words.
+/// The largest heap a run can have, in words.
 ///
-/// `OwnedVm::new` builds every run over `DEFAULT_HEAP_WORDS` (four mebiwords,
-/// 32 MiB) and offers no way to choose another (`cove-runtime`'s
-/// `vm/parked.rs`); `Vm::with_heap_words` exists but `OwnedVm` does not
-/// forward it. So this is the hard ceiling a run hits — "this run has no
-/// memory left" — whatever `max_heap_words` says, and `max_heap_words` is
-/// refused above it.
-pub const HEAP_CEILING_WORDS: u64 = 1 << 22;
+/// `max_heap_words` is the capacity a run's heap is built with
+/// (`OwnedVm::with_heap_words`, ADR 0088), and the runtime addresses at most
+/// `u32::MAX` heap words: a larger capacity would be clamped to that silently,
+/// so it is refused here instead. The default, without `max_heap_words`, is
+/// the runtime's own (four mebiwords, 32 MiB).
+pub const HEAP_CEILING_WORDS: u64 = u32::MAX as u64;
 
 /// `app.toml` as written.
 #[derive(Debug, Default, Deserialize)]
@@ -581,11 +580,10 @@ impl AppOverride {
 pub struct AppLimits {
     /// Each request's run: fuel, deadline, host calls, call depth, tasks.
     pub run: Limits,
-    /// A run whose heap is larger than this when it answers is answered 500
-    /// instead (`heap` in `/_host/stats`). Checked when the run answers,
-    /// because that is the one point the runtime lets an embedder read a
-    /// run's heap (`OwnedVm::heap_words`; a parked or yielded run does not
-    /// expose it); the hard ceiling is [`HEAP_CEILING_WORDS`].
+    /// The capacity of each run's heap, in words: a run that needs more fails
+    /// the allocation ("this run has no memory left", 500, `heap` in
+    /// `/_host/stats`) while it runs, not after (ADR 0088). `None` is the
+    /// runtime's default; the hard ceiling is [`HEAP_CEILING_WORDS`].
     pub max_heap_words: Option<u64>,
     /// Runs of this app started and not yet answered — running, parked or
     /// waiting to continue. A request beyond it waits in the queue.
@@ -714,8 +712,8 @@ pub fn parse_app_with(
     if let Some(words) = l.max_heap_words {
         if words > HEAP_CEILING_WORDS {
             return Err(format!(
-                "`limits.max_heap_words = {words}` is above the runtime's fixed per-run heap of \
-                 {HEAP_CEILING_WORDS} words, which `OwnedVm` cannot raise"
+                "`limits.max_heap_words = {words}` is above the largest heap a run can have, \
+                 {HEAP_CEILING_WORDS} words"
             ));
         }
     }
@@ -885,8 +883,10 @@ mod tests {
 
     #[test]
     fn a_heap_above_the_ceiling_is_refused() {
-        let error = parse_app("[limits]\nmax_heap_words = 99999999\n", "a").unwrap_err();
-        assert!(error.contains("fixed per-run heap"), "{error}");
+        let error = parse_app("[limits]\nmax_heap_words = 9999999999\n", "a").unwrap_err();
+        assert!(error.contains("largest heap a run can have"), "{error}");
+        // Above the runtime's default heap is a capacity like any other now.
+        parse_app("[limits]\nmax_heap_words = 99999999\n", "a").unwrap();
     }
 
     #[test]

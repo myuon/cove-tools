@@ -50,7 +50,7 @@ use cove_runtime::{
 };
 
 use crate::config::FetchPolicy;
-use crate::hosts::{transfer, AppContext, HostModule, PendingWork};
+use crate::hosts::{AppContext, HostModule, PendingWork};
 use crate::stats::AppCounters;
 
 const STRING_MAP: HostType = HostType::Map(&HostType::String, &HostType::String);
@@ -224,7 +224,7 @@ impl FetchHost {
             if fetched.is_err() {
                 counters.fetch_errors.fetch_add(1, Ordering::Relaxed);
             }
-            transfer(&answer(&url, fetched))
+            Ok(answer(&url, fetched))
         }
     }
 }
@@ -282,26 +282,29 @@ fn describe(error: reqwest::Error) -> String {
     text
 }
 
-/// A fetch's outcome as the `Result<fetch.Response, Error>` value.
-fn answer(url: &str, fetched: Result<Fetched, String>) -> Value {
+/// A fetch's outcome as the `Result<fetch.Response, Error>` a parked run
+/// is resumed with, built as a [`Transfer`] where it is made — on the I/O
+/// runtime, across `.await`s, where an `Rc`-based [`Value`] cannot be held.
+fn answer(url: &str, fetched: Result<Fetched, String>) -> Transfer {
     match fetched {
-        Ok(fetched) => Value::ok(Value::structure(
+        Ok(fetched) => Transfer::ok(Transfer::structure(
             "fetch.Response",
-            vec![
-                ("status", Value::int(i64::from(fetched.status))),
+            [
+                ("status", Transfer::Int(i64::from(fetched.status))),
                 (
                     "headers",
-                    Value::map(
+                    Transfer::Map(
                         fetched
                             .headers
                             .into_iter()
-                            .map(|(k, v)| (MapKey::Str(k), Value::string(v))),
+                            .map(|(k, v)| (MapKey::Str(k), Transfer::string(v)))
+                            .collect(),
                     ),
                 ),
-                ("body", Value::string(fetched.body)),
+                ("body", Transfer::string(fetched.body)),
             ],
         )),
-        Err(why) => Value::err(Value::error(format!("{url}: {why}"))),
+        Err(why) => Transfer::err(Transfer::error(format!("{url}: {why}"))),
     }
 }
 

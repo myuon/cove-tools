@@ -212,14 +212,17 @@ error[cove_host::spawn]: `spawner.handle` can spawn a task, which cove-host does
   |                   ^^^^^^^^^^^^^^^^^^^^^^
   rule: A spawned task runs outside the host's worker pool and keeps its parent from parking or yielding; cove-host refuses an app that can spawn.
 greedy     requires [log]  granted [-]  REFUSED: `greedy.handle` requires `log`, which app.toml does not grant
-spawner    requires [-]  granted [-]  REFUSED: can spawn a task:
+spawner    requires [-]  granted [-]  REFUSED: `spawner.handle` can spawn a task, which cove-host does not run
 checked 2 app(s) against the host's schemas (web, log, timer); 0 warning(s), 2 refused
 $ echo $?
 1
 ```
 
-`test` runs every `test fn` of each app the way `cove test` does, with the
-app's grant (not the test's derived one), its limits, and the host's modules:
+`test` runs every `test fn` of each app the way `cove test` does — through
+Cove's own `cove_runtime::testing::TestRun`, so a failure is reported by the
+same rules — with the app's grant (not the test's derived one), its limits,
+and the host's modules. A lowering that refuses an entry, in `check`, at load
+or for a test, is printed with each refusal's location:
 
 ```console
 $ ./target/checked/cove-host test --apps apps
@@ -704,7 +707,7 @@ reason, and every other app starts.
 | fuel, host calls, call depth spent | 500, the runtime's diagnostic |
 | deadline passed, running or parked | 504, the runtime's diagnostic |
 | other runtime error (an assertion, an overflow, out of memory) | 500, the runtime's diagnostic |
-| the run's heap above `max_heap_words` when it answered | 500 |
+| the run's heap needs more than `max_heap_words` | 500 while it allocates, `x-cove-stop: heap` |
 | response body over `max_response_bytes`, or not a valid response | 500, saying which |
 | the client went away before the answer | the run is cancelled (queued, running, yielded or parked) and counted as `errors.cancelled`; 499 in the app's log |
 | a `kv.put` past a quota, a `fetch` off the allowlist or past its limits | not a status: the app's `Err` to answer as it likes |
@@ -785,8 +788,12 @@ never by trusting it:
 - **`spawn` is refused at load.** A spawned task is a thread outside the
   worker pool and its accounting; while one is alive its parent can neither
   park nor yield (ADR 0080 §2, 0084 §3), and it has no native tier (ADR
-  0085). An app whose lowered entry contains a `spawn` is refused with a
-  diagnostic at the `spawn` (`cove_host::spawn`, above), and every run also
+  0085). An app whose entry the checker says can reach a task `scope`
+  (`FnEntry::can_spawn`, ADR 0088) is refused before it is prepared, with a
+  diagnostic at the `spawn` (`cove_host::spawn`, above) — or at the entry
+  when there is none to point at. That fact is a lower bound for a
+  capability-open entry, so such an entry in a package where some function
+  opens a scope is decided by its lowered program instead. Every run also
   carries `max_tasks = 0` as the runtime's backstop.
 - **A run that cannot yield is surfaced.** Below an encoded function that
   compiled code called, inside a host call, or beside a task, a run declines a
@@ -804,13 +811,15 @@ never by trusting it:
   places a call cannot park; `timer.sleep` then sleeps on the worker
   (`blocking_host_calls`), bounded by its 60 s maximum. None of the sample
   apps reaches this.
-- **The per-run heap is the runtime's fixed 32 MiB.** `OwnedVm::new` builds
-  every run over the runtime's `DEFAULT_HEAP_WORDS` (4 Mi words) and offers no
-  way to choose another, so that is the hard ceiling ("this run has no memory
-  left", 500). `max_heap_words` is checked when a run answers — the one point
-  the runtime exposes a run's heap — and replaces an over-limit answer with a
-  500; it cannot stop a run while it allocates, and a value above the ceiling
-  is refused.
+- **`max_heap_words` is the run's heap capacity.** Each isolate is built
+  with `OwnedVm::with_heap_words` (ADR 0088), so a run that needs more fails
+  the allocation where it makes it ("this run has no memory left", 500,
+  `errors.heap`) rather than after it answers. Without it a run gets the
+  runtime's default, 4 Mi words (32 MiB). It bounds Cove's heap, not what a
+  host module holds outside it; above `u32::MAX` words, the most the runtime
+  addresses, it is refused. A run's heap and declined yields are read at its
+  every park and yield as well as its answer (`heap_peak_words`,
+  `yields_declined`).
 - **The native tier is used where it exists.** `--backend auto` compiles each
   app with `PreparedProgram::with_native` once at load on Unix x86-64 and
   says once, on stderr, that it falls back to the encoded VM elsewhere;
@@ -820,7 +829,8 @@ never by trusting it:
   future when the connection closes, and a guard on it raises the request's
   cancellation: the runtime's `Cancellation` in the run's budget stops a
   running run at its next safepoint and a yielded one when it is continued;
-  a token wakes a parked run's wait, which cancels the run and drops its
+  `Cancellation::on_cancel`, registered on the flag the parked run's meter
+  hands back, wakes a parked run's wait, which cancels the run and drops its
   pending work (a fetch's connection with it); a request still queued is
   dropped when a worker reaches it. A run that cannot yield stops at its next
   safepoint all the same, since cancellation is checked there.
