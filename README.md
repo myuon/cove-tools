@@ -44,8 +44,13 @@ that run Cove; default one per hardware thread), `--io-threads N` (HTTP and
 pending host work; default 2), `--slice MS` (default 2; `0` never asks a run
 to yield), `--max-connections N` and `--max-in-flight N` (default 10,000
 each), `--backend auto|vm|native` (default `auto`), `--quiet` (no `log`
-lines on stdout), and `--admin ADDR` (the admin listener for updates, default
-`127.0.0.1:8081`) or `--no-admin`.
+lines on stdout), `--admin ADDR` (the admin listener for updates, default
+`127.0.0.1:8081`) or `--no-admin`, `--ops-listener public|admin` (which
+listener serves `/_host/`; default `public`), `--public-origin URL` and
+`--trust-proxy` (what apps are told of the client's scheme and host, behind
+a reverse proxy), and `--shutdown-grace SECONDS` (default 10). Those last
+four are for [deploying](#deploying). `cove-host --version` names the Cove
+commit the binary was built against.
 
 ### The sample apps
 
@@ -164,9 +169,14 @@ $ curl -s http://127.0.0.1:8080/_host/apps/notes/logs
 | `GET /_host/apps/<app>` | one app as JSON: the above, its `limits`, every version it has had (`version`, `loaded_unix_s`, `current`, `alive`, `program_alive`), its last 50 errors (`unix_ms`, `kind`, `status`, `version`, `message`) and, on the native tier, `native`: how many functions have machine code (`compiled` of `reachable`) and each one left on the encoded tier (`refusals`: `function`, `reason`, the `instruction` the code generator stopped at, and `at`/`source`, where the source wrote it) |
 | `GET /_host/apps/<app>/logs?n=200` | its recent log lines, as text |
 
-They are on the public listener and unauthenticated, so a reverse proxy in
-front of the host should not forward `/_host/` (an error message names
-source lines).
+They are read-only and unauthenticated, and by default on the public
+listener. Behind a reverse proxy start the host with `--ops-listener admin`:
+then the public listener answers 404 for everything under `/_host/`, and the
+views are served on the admin listener instead — without its token, as they
+change nothing, and only to a request whose `Host` is a loopback name
+(`localhost`, `127.0.0.1`, `[::1]`), so that a web page cannot reach them by
+rebinding its own name to 127.0.0.1. Reach them over SSH:
+`ssh -L 8791:127.0.0.1:8791 <server>`, then `http://localhost:8791/_host/ui`.
 
 `/_host/stats`, per app: `state`
 (`ready`, `refused` with the reason, or `removed`), `version`, `tier`, `required` and `granted`,
@@ -291,6 +301,63 @@ nothing. The endpoints are `POST /apps/<app>/update`, `DELETE /apps/<app>`
 and `GET /apps` (the stats). There is no file watcher: an update is an
 explicit act, which is what makes a refused one a report rather than a
 silent non-event.
+
+## Deploying
+
+`deploy/` runs the host as a systemd service on one Linux machine, behind a
+TLS-terminating proxy — written for the owner's home server (Ubuntu 24.04,
+x86-64), a Cloudflare Tunnel to `https://covtools.ramda.io`, and Cloudflare
+Access in front:
+
+| file | what |
+| --- | --- |
+| [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code) |
+| [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`), as `~/cove-tools/env` |
+| [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks its apps, replaces `~/cove-tools/apps`, points `~/cove-tools/current` at it, and prints the one `sudo` command |
+| [`deploy/backup.sh`](deploy/backup.sh) | SQLite online backups of every app's `kv.sqlite3`, kept 14 days; a user crontab line is in the file |
+| [`deploy/cloudflare.md`](deploy/cloudflare.md) | the tunnel's public hostname and the Access applications, with the paths left open to outside callers |
+
+A release is a tag: pushing `v<version>` (the workspace's version) runs
+[`release.yml`](.github/workflows/release.yml), which builds `cove-host` on
+Ubuntu 24.04 with the native tier, and publishes
+`cove-host-<version>-x86_64-linux.tar.gz` (the binary, `apps/`, `deploy/`,
+this README), its `.sha256`, and `install.sh`. CI installs the same tarball
+into a scratch home and runs the unit's own command line against it
+(`deploy/smoke.sh`).
+
+On the server, as the service's user:
+
+```console
+$ curl -fsSLO https://github.com/myuon/cove-tools/releases/download/v0.1.0/install.sh
+$ bash install.sh v0.1.0
+...
+first time: install the unit and start the service (needs sudo, once):
+
+  sudo install -m644 /home/ioijoi/cove-tools/current/deploy/cove-tools.service /etc/systemd/system/cove-tools.service && sudo systemctl daemon-reload && sudo systemctl enable --now cove-tools
+```
+
+An upgrade is the same two lines with the new tag, then
+`sudo systemctl restart cove-tools` (the script says which). The service
+stops on SIGTERM by answering new requests 503 and waiting up to
+`--shutdown-grace` for those in flight. By default the webhook lab, the ledger
+and the algorithm playground are installed (`--apps "..."` to choose); the
+sample apps are not.
+
+What the deployment relies on from the host:
+
+- **`--ops-listener admin`**: `/_host/` is 404 on the public listener; the
+  operations views are on the admin listener, which is never in the tunnel.
+- **`--public-origin https://covtools.ramda.io`**: cloudflared reaches the
+  host as plain HTTP on localhost, but the browser's `Origin` is the public
+  one. The host tells every app `x-forwarded-proto: https` and
+  `host: covtools.ramda.io`, so the webhook lab's and the ledger's
+  cross-site refusals compare against the right origin and the receive URLs
+  the lab shows are the public ones. Without it a client cannot claim
+  `https` (the host sets `x-forwarded-proto: http` itself); `--trust-proxy`
+  believes a proxy's `X-Forwarded-Proto` and `X-Forwarded-Host` instead, for
+  a proxy that serves several names. Nothing in the host or the apps uses the
+  client's address; cloudflared's `cf-connecting-ip` reaches the apps as a
+  header (the webhook lab stores it with each request).
 
 ## Writing an app
 
@@ -597,8 +664,11 @@ bug, overload or budget overrun ends that app's requests and nobody else's.
 apps share one process, one address space and one native code generator, and
 nothing here has been reviewed as a sandbox.
 
-There is no TLS. Put the host behind a reverse proxy (Caddy, nginx) that
-terminates TLS and forwards to `--addr`, which defaults to localhost.
+There is no TLS. Put the host behind a reverse proxy (Caddy, nginx,
+cloudflared) that terminates TLS and forwards to `--addr`, which defaults to
+localhost, and tell the host where it is reached (`--public-origin`) so that
+the apps' same-origin checks and the URLs they write use the public origin:
+see [Deploying](#deploying).
 
 ## Performance
 

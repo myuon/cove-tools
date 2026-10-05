@@ -23,9 +23,11 @@ fn config(extra: &str) -> String {
         "the shipped app.toml changed shape"
     );
     // The tests' hosts listen on a free port, not 8080.
-    let allow = "allow = [\"http://127.0.0.1:8080\", \"http://localhost:8080\"]";
-    assert!(config.contains(allow), "the shipped app.toml changed shape");
-    config = config.replace(allow, "allow = [\"http://127.0.0.1:*\"]");
+    let start = config
+        .find("allow = [")
+        .expect("the shipped app.toml has an allowlist");
+    let end = start + config[start..].find(']').unwrap() + 1;
+    config.replace_range(start..end, "allow = [\"http://127.0.0.1:*\"]");
     config.push_str(extra);
     config
 }
@@ -813,4 +815,94 @@ fn base64(text: &str) -> String {
         }
     }
     out
+}
+
+/// A lab host told how clients reach it.
+fn behind(apps: &Apps, forwarding: cove_host::Forwarding) -> cove_host::Host {
+    let mut options = options(apps, 1);
+    options.forwarding = forwarding;
+    cove_host::Host::start(options).expect("the host starts")
+}
+
+/// Makes an endpoint, as the given headers say; its id and receive URL.
+fn endpoint_as(addr: SocketAddr, headers: &[&str]) -> (String, String) {
+    let mut all = vec![bearer(), "Accept: application/json".to_string()];
+    all.extend(headers.iter().map(|h| h.to_string()));
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    let made = request(addr, "POST", "/webhooks/admin/endpoints", &all, "name=x");
+    assert_eq!(made.status, 201, "{made:?}");
+    let made: Json = serde_json::from_str(&made.body).unwrap();
+    (
+        made["id"].as_str().unwrap().to_string(),
+        made["url"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Deletes endpoint `id` as a browser on `origin` would; the status.
+fn delete_from(addr: SocketAddr, id: &str, origin: &str) -> u16 {
+    let origin = format!("Origin: {origin}");
+    request(
+        addr,
+        "POST",
+        &format!("/webhooks/admin/e/{id}/delete"),
+        &[&bearer(), &origin],
+        "",
+    )
+    .status
+}
+
+#[test]
+fn behind_a_tls_proxy_the_public_origin_is_the_one_the_lab_sees() {
+    let apps = lab("");
+    let host = behind(
+        &apps,
+        cove_host::Forwarding {
+            public_origin: Some("https://covtools.example".parse().unwrap()),
+            trust_proxy: false,
+        },
+    );
+    // cloudflared reaches the host on localhost, over plain HTTP.
+    let (id, url) = endpoint_as(host.addr, &["X-Forwarded-Proto: http"]);
+    assert_eq!(url, format!("https://covtools.example/webhooks/in/{id}"));
+    let page = request(host.addr, "GET", "/webhooks/admin", &[&bearer()], "");
+    assert!(page.body.contains(&url), "{}", page.body);
+    // The browser's form says the public origin, and that is this site.
+    assert_eq!(delete_from(host.addr, &id, "http://lab.test"), 403);
+    assert_eq!(delete_from(host.addr, &id, "http://localhost:8790"), 403);
+    assert_eq!(delete_from(host.addr, &id, "https://covtools.example"), 303);
+}
+
+#[test]
+fn forwarded_headers_count_only_from_a_trusted_proxy() {
+    let apps = lab("");
+    let forged = [
+        "X-Forwarded-Proto: https",
+        "X-Forwarded-Host: covtools.example",
+    ];
+    {
+        // By default a client cannot claim to have come over TLS.
+        let host = start(&apps, 1);
+        let (id, url) = endpoint_as(host.addr, &forged);
+        assert_eq!(url, format!("http://lab.test/webhooks/in/{id}"));
+        assert_eq!(delete_from(host.addr, &id, "https://covtools.example"), 403);
+        assert_eq!(delete_from(host.addr, &id, "http://lab.test"), 303);
+    }
+    let host = behind(
+        &apps,
+        cove_host::Forwarding {
+            public_origin: None,
+            trust_proxy: true,
+        },
+    );
+    let (id, url) = endpoint_as(host.addr, &forged);
+    assert_eq!(url, format!("https://covtools.example/webhooks/in/{id}"));
+    let origin = "Origin: https://covtools.example";
+    let deleted = request(
+        host.addr,
+        "POST",
+        &format!("/webhooks/admin/e/{id}/delete"),
+        &[&bearer(), origin, forged[0], forged[1]],
+        "",
+    );
+    assert_eq!(deleted.status, 303);
 }

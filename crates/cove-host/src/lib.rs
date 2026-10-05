@@ -29,6 +29,7 @@ pub mod hosts;
 pub mod kv;
 pub mod logs;
 pub mod ops;
+pub mod proxy;
 pub mod router;
 pub mod sched;
 pub mod server;
@@ -38,5 +39,7 @@ pub mod toolchain;
 
 pub use apps::{App, AppState, Backend, LoadOptions};
 pub use hosts::{HostModule, HostModules, PendingWork};
+pub use ops::OpsListener;
+pub use proxy::{Forwarding, PublicOrigin};
 pub use router::{PathPrefix, Route, Router};
 pub use server::{Host, ServeOptions, UpdateError};

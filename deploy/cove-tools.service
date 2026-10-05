@@ -1,0 +1,83 @@
+# cove-tools: the Cove apps on cove-host, behind cloudflared.
+#
+# Installed once, by the owner, with sudo (deploy/install.sh prints the
+# command):
+#   sudo install -m644 /home/ioijoi/cove-tools/current/deploy/cove-tools.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cove-tools
+#
+# Public:  127.0.0.1:8790, which the Cloudflare Tunnel forwards
+#          https://covtools.ramda.io to (deploy/cloudflare.md).
+# Admin:   127.0.0.1:8791 — updates (token in data/admin.token) and the
+#          read-only operations views under /_host/. Never put it in the
+#          tunnel; reach it with `ssh -L 8791:127.0.0.1:8791 whisky`.
+
+[Unit]
+Description=cove-tools (Cove apps on cove-host)
+Documentation=https://github.com/myuon/cove-tools#deploying
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ioijoi
+Group=ioijoi
+WorkingDirectory=/home/ioijoi/cove-tools
+# The apps' secrets: WEBHOOKS_ADMIN_TOKEN, LEDGER_TOKEN (deploy/env.example).
+EnvironmentFile=/home/ioijoi/cove-tools/env
+# Two workers and two I/O threads on a shared four-core N100; at most this
+# many connections and admitted requests (one more is answered 503).
+ExecStart=/home/ioijoi/cove-tools/current/cove-host serve \
+    --apps /home/ioijoi/cove-tools/apps \
+    --data /home/ioijoi/cove-tools/data \
+    --addr 127.0.0.1:8790 \
+    --admin 127.0.0.1:8791 \
+    --ops-listener admin \
+    --public-origin https://covtools.ramda.io \
+    --workers 2 \
+    --io-threads 2 \
+    --max-connections 2000 \
+    --max-in-flight 1000 \
+    --shutdown-grace 10 \
+    --quiet
+Restart=always
+RestartSec=2
+# SIGTERM: stop admitting, wait up to --shutdown-grace for what is in
+# flight, exit. systemd waits a little longer before it kills.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Resources: the machine runs other services too.
+CPUQuota=200%
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=256
+LimitNOFILE=8192
+
+# Hardening. Everything is read-only but the data directory.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ioijoi/cove-tools/data
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+# Not MemoryDenyWriteExecute=yes: the native tier writes machine code and
+# maps it executable, and would be refused.
+
+[Install]
+WantedBy=multi-user.target

@@ -8,9 +8,11 @@
 //! | `GET /_host/apps/<app>/logs?n=` | its recent log lines, as text |
 //! | `GET /_host/ui` | a page of all of it; every value from an app is escaped |
 //!
-//! They are read-only and unauthenticated, on the public listener. A reverse
-//! proxy in front of the host should not forward `/_host/` (the README's
-//! deployment note): error messages name source lines.
+//! They are read-only and unauthenticated. Where they are served is
+//! [`OpsListener`] (`--ops-listener`): on the public listener (the default,
+//! as before), or only on the admin listener, where the public one answers
+//! 404 for all of `/_host/`. Behind a reverse proxy use `admin`: error
+//! messages name source lines, and the logs are the apps' own.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,6 +24,29 @@ use serde_json::{json, Map, Value as Json};
 use crate::apps::{list, AppState};
 use crate::sched::{Engine, Slot};
 use crate::stats::ServerCounters;
+
+/// Which listener serves the views.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpsListener {
+    /// The public listener, unauthenticated, as before `--ops-listener`.
+    #[default]
+    Public,
+    /// The admin listener only, without its token (they are read-only, and
+    /// the admin listener is kept on localhost); the public listener
+    /// answers 404 under `/_host/`.
+    Admin,
+}
+
+impl std::str::FromStr for OpsListener {
+    type Err = String;
+    fn from_str(text: &str) -> Result<OpsListener, String> {
+        match text {
+            "public" => Ok(OpsListener::Public),
+            "admin" => Ok(OpsListener::Admin),
+            other => Err(format!("`{other}` is not an ops listener: public or admin")),
+        }
+    }
+}
 
 /// What the views read besides the engine.
 pub struct OpsContext<'a> {

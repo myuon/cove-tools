@@ -43,3 +43,12 @@ jobs:
         run: |
           ./target/checked/cove-host check --apps apps
           ./target/checked/cove-host test --apps apps
+      - name: lint the deploy scripts
+        run: shellcheck deploy/*.sh
+      # The release tarball, built from this binary, installed into a
+      # scratch home and run with the systemd unit's own command line.
+      - name: package, install and run as deployed
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tarball="$(deploy/package.sh "$version" target/checked/cove-host "$RUNNER_TEMP/dist")"
+          deploy/smoke.sh "$tarball"

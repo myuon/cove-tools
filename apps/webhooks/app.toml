@@ -16,9 +16,18 @@ max_keys = 1000000
 max_bytes = 1073741824
 
 # Where a stored request may be resent: this host's own receive URLs, as
-# the walkthrough serves them. Add the services you resend to.
+# the walkthrough serves them (port 8080), as `deploy/` serves them (port
+# 8790), and at the deployment's public origin, whose `/webhooks/in/` the
+# Cloudflare Access setup leaves open (`deploy/cloudflare.md`). Add the
+# services you resend to.
 [fetch]
-allow = ["http://127.0.0.1:8080", "http://localhost:8080"]
+allow = [
+  "http://127.0.0.1:8080",
+  "http://localhost:8080",
+  "http://127.0.0.1:8790",
+  "http://localhost:8790",
+  "https://covtools.ramda.io",
+]
 # Below the run's deadline, so that a slow target is a stored failure rather
 # than a 504.
 timeout = "8s"

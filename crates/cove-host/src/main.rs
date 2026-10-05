@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use cove_host::toolchain;
-use cove_host::{Backend, Host, HostModules, ServeOptions};
+use cove_host::{Backend, Forwarding, Host, HostModules, OpsListener, PublicOrigin, ServeOptions};
 
 #[derive(Parser)]
 #[command(
     name = "cove-host",
-    version,
+    version = env!("COVE_HOST_VERSION"),
     about = "Hosts many small Cove web apps on one machine"
 )]
 struct Cli {
@@ -60,6 +60,26 @@ enum Command {
         /// Run without an admin listener: no updates but a restart.
         #[arg(long)]
         no_admin: bool,
+        /// Which listener serves `/_host/` (stats, ops page, app details,
+        /// logs): `public`, unauthenticated as before, or `admin`, where the
+        /// public listener answers 404 for all of `/_host/`. Use `admin`
+        /// behind a reverse proxy.
+        #[arg(long, default_value = "public")]
+        ops_listener: OpsListener,
+        /// The origin clients reach the host at, such as
+        /// `https://tools.example`: apps are told this scheme and host
+        /// whatever the request says (behind a TLS-terminating proxy).
+        #[arg(long)]
+        public_origin: Option<PublicOrigin>,
+        /// Believe the request's `X-Forwarded-Proto` and `X-Forwarded-Host`
+        /// (only behind a proxy that sets them); without it, and without
+        /// `--public-origin`, apps are told `http` and the request's `Host`.
+        #[arg(long)]
+        trust_proxy: bool,
+        /// On SIGTERM or Ctrl-C, how long to wait for requests in flight, in
+        /// seconds; new ones are answered 503 meanwhile.
+        #[arg(long, default_value_t = 10.0)]
+        shutdown_grace: f64,
     },
     /// Load an app's directory again and switch the running host to the new
     /// version if it loads (or add the app, for a new name). In-flight
@@ -170,6 +190,10 @@ fn main() -> ExitCode {
             quiet,
             admin,
             no_admin,
+            ops_listener,
+            public_origin,
+            trust_proxy,
+            shutdown_grace,
         } => {
             let mut options = ServeOptions::new(apps);
             options.addr = addr;
@@ -184,6 +208,11 @@ fn main() -> ExitCode {
             options.backend = backend;
             options.quiet = quiet;
             options.admin = (!no_admin).then_some(admin);
+            options.ops_listener = ops_listener;
+            options.forwarding = Forwarding {
+                public_origin,
+                trust_proxy,
+            };
             eprintln!("cove-host: loading apps from {}", options.apps.display());
             let host = match Host::start(options) {
                 Ok(host) => host,
@@ -192,9 +221,14 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            eprintln!("cove-host {}", env!("COVE_HOST_VERSION"));
             eprint!("{}", host.banner());
-            host.wait_for_ctrl_c();
+            host.wait_for_signal();
             eprintln!("cove-host: shutting down");
+            let left = host.shutdown(Duration::from_secs_f64(shutdown_grace.max(0.0)));
+            if left > 0 {
+                eprintln!("cove-host: {left} request(s) still in flight after {shutdown_grace} s; stopping anyway");
+            }
             ExitCode::SUCCESS
         }
         Command::Update { app, admin: args } => {
