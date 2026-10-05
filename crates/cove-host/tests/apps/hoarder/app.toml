@@ -1,0 +1,6 @@
+# Keeps `?n=` numbers, then waits `?ms=`: a heap that outgrows its capacity
+# fails while it allocates, before the wait.
+grant = ["timer"]
+
+[limits]
+max_heap_words = 65536

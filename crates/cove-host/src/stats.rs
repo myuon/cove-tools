@@ -27,7 +27,7 @@ pub enum ErrorKind {
     CallDepth,
     /// The run tried to `spawn` past its task limit (500).
     Concurrency,
-    /// The run answered with a heap larger than `max_heap_words` (500).
+    /// The run needed a heap larger than `max_heap_words`, its capacity (500).
     Heap,
     /// Any other runtime error: a failed assertion, an overflow, a host
     /// that failed, a run out of the runtime's own memory (500).
@@ -145,7 +145,7 @@ pub struct AppCounters {
     pub fuel: AtomicU64,
     /// Nanoseconds workers spent running this app's code.
     pub worker_ns: AtomicU64,
-    /// The largest heap an answered run had, in words.
+    /// The largest heap a run had at a park, a yield or its answer, in words.
     pub heap_peak_words: AtomicU64,
     /// `fetch` calls made, refused by the allowlist or a limit before
     /// anything was sent, and failed (no response: unreachable, too slow,

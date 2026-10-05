@@ -60,7 +60,6 @@ use cove_runtime::{
     Budget, Cancellation, ParkedVm, RuntimeError, Step, Transfer, YieldRequest, YieldedVm,
 };
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 use crate::apps::App;
 use crate::config::AppLimits;
@@ -97,6 +96,10 @@ pub struct Tally {
     pub parks: u64,
     /// Time on a worker, every slice summed.
     pub worker: Duration,
+    /// The run's declined yields already added to its app's counters, at
+    /// its parks and yields: the runtime's count is the run's whole total so
+    /// far, so each point adds what is new since the last.
+    pub declined: u64,
 }
 
 /// The headers every answer of a run carries, saying what the run cost: the
@@ -124,32 +127,14 @@ pub const STOP_HEADER: &str = "x-cove-stop";
 /// Calls a request off: raised by the HTTP side when the client goes away
 /// before its answer.
 ///
-/// Two halves, for the two places a run can be. The runtime's
-/// [`Cancellation`] is in the run's budget, so a running run stops at its
-/// next safepoint and a yielded one stops when it is continued; the token
-/// wakes a parked run's wait on the I/O runtime, which cancels the run and
-/// drops its pending host work (an outbound fetch's connection with it). A
-/// request still queued is dropped when a worker takes it.
-#[derive(Clone, Debug, Default)]
-pub struct Cancel {
-    flag: Cancellation,
-    token: CancellationToken,
-}
-
-impl Cancel {
-    pub fn new() -> Cancel {
-        Cancel::default()
-    }
-
-    pub fn cancel(&self) {
-        self.flag.cancel();
-        self.token.cancel();
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.flag.is_cancelled()
-    }
-}
+/// It is the runtime's own [`Cancellation`], in the run's budget, and it
+/// reaches the run wherever the run is. A running run stops at its next
+/// safepoint; a yielded one stops when it is continued; a parked one's wait
+/// on the I/O runtime is woken by [`Cancellation::on_cancel`], registered on
+/// the flag the parked run's meter hands back (ADR 0088), which cancels the
+/// run and drops its pending host work (an outbound fetch's connection with
+/// it). A request still queued is dropped when a worker takes it.
+pub type Cancel = Cancellation;
 
 /// A request waiting to start.
 pub struct Start {
@@ -714,9 +699,9 @@ impl Engine {
                         return;
                     }
                 }
-                let vm = ready.isolate();
+                let vm = ready.isolate(app.limits.max_heap_words);
                 let budget =
-                    Budget::with_cancellation(app.limits.run.clone(), flight.cancel.flag.clone());
+                    Budget::with_cancellation(app.limits.run.clone(), flight.cancel.clone());
                 let signal = vm.yield_request();
                 let step = self.sliced(worker, &app, &mut flight.tally, signal, || {
                     let argument = request_value(&request);
@@ -840,35 +825,25 @@ impl Engine {
                 counters
                     .fuel
                     .fetch_add(vm.meter().fuel_spent(), Ordering::Relaxed);
-                counters
-                    .yields_declined
-                    .fetch_add(vm.yields_declined(), Ordering::Relaxed);
-                counters.heap_peak_words.fetch_max(heap, Ordering::Relaxed);
+                note_progress(&mut flight.tally, counters, heap, vm.yields_declined());
                 let answered = match outcome {
-                    Ok(value) => match app.limits.max_heap_words {
-                        Some(limit) if heap > limit => Err((
-                            ErrorKind::Heap,
+                    // The heap's capacity is the app's `max_heap_words`
+                    // (`Ready::isolate`), so a run that needed more has
+                    // already failed its allocation and is an `Err`.
+                    Ok(value) => match response_of(&value, app.limits.max_response_bytes) {
+                        Ok(reply) => Ok(reply),
+                        Err(BadResponse::Invalid(why)) => Err((
+                            ErrorKind::BadResponse,
+                            format!("app `{}` answered a bad response: {why}\n", app.name),
+                        )),
+                        Err(BadResponse::TooLarge { bytes, limit }) => Err((
+                            ErrorKind::ResponseTooLarge,
                             format!(
-                                "app `{}`: the run's heap grew to {heap} words, above its \
-                                 max_heap_words of {limit}; its answer was discarded\n",
+                                "app `{}` answered a body of {bytes} bytes, above its \
+                                 max_response_bytes of {limit}\n",
                                 app.name
                             ),
                         )),
-                        _ => match response_of(&value, app.limits.max_response_bytes) {
-                            Ok(reply) => Ok(reply),
-                            Err(BadResponse::Invalid(why)) => Err((
-                                ErrorKind::BadResponse,
-                                format!("app `{}` answered a bad response: {why}\n", app.name),
-                            )),
-                            Err(BadResponse::TooLarge { bytes, limit }) => Err((
-                                ErrorKind::ResponseTooLarge,
-                                format!(
-                                    "app `{}` answered a body of {bytes} bytes, above its \
-                                     max_response_bytes of {limit}\n",
-                                    app.name
-                                ),
-                            )),
-                        },
                     },
                     Err(error) => {
                         let ready = app.ready().expect("only a loaded app runs");
@@ -910,6 +885,12 @@ impl Engine {
                 }
             }
             Step::Parked(mut parked) => {
+                note_progress(
+                    &mut flight.tally,
+                    counters,
+                    parked.heap_words(),
+                    parked.yields_declined(),
+                );
                 flight.tally.parks += 1;
                 counters.parks.fetch_add(1, Ordering::Relaxed);
                 counters.parked.fetch_add(1, Ordering::Relaxed);
@@ -917,7 +898,12 @@ impl Engine {
                     Some(Ok(work)) => {
                         // The deadline, or "never" for a run without one.
                         let left = parked.time_left().unwrap_or(Duration::MAX);
-                        let cancelled = flight.cancel.token.clone();
+                        // The run's own flag tells this wait when the client
+                        // leaves — at once if it already has.
+                        let (told, cancelled) = oneshot::channel::<()>();
+                        parked.meter().cancellation().on_cancel(move || {
+                            let _ = told.send(());
+                        });
                         let engine = Arc::clone(self);
                         self.io.spawn(async move {
                             let work = *work;
@@ -926,7 +912,7 @@ impl Engine {
                             let answer = tokio::select! {
                                 answer = work.answer => Some(answer),
                                 () = sleep_at_most(left) => None,
-                                () = cancelled.cancelled() => None,
+                                Ok(()) = cancelled => None,
                             };
                             engine.resume(parked, answer, flight);
                         });
@@ -940,6 +926,12 @@ impl Engine {
                 }
             }
             Step::Yielded(yielded) => {
+                note_progress(
+                    &mut flight.tally,
+                    counters,
+                    yielded.heap_words(),
+                    yielded.yields_declined(),
+                );
                 flight.tally.yields += 1;
                 counters.yields.fetch_add(1, Ordering::Relaxed);
                 let app = flight.app;
@@ -1027,6 +1019,9 @@ impl Engine {
 
 /// The kind of error a run stopped with.
 fn kind_of(error: &RuntimeError) -> ErrorKind {
+    if error.message == OUT_OF_HEAP {
+        return ErrorKind::Heap;
+    }
     match error.outcome {
         RunOutcome::Fuel => ErrorKind::Fuel,
         RunOutcome::Deadline => ErrorKind::Deadline,
@@ -1036,6 +1031,21 @@ fn kind_of(error: &RuntimeError) -> ErrorKind {
         RunOutcome::Cancelled => ErrorKind::Cancelled,
         _ => ErrorKind::Runtime,
     }
+}
+
+/// What the runtime says when a run's heap is at its capacity — the app's
+/// `max_heap_words` — and an allocation does not fit (ADR 0088).
+const OUT_OF_HEAP: &str = "this run has no memory left";
+
+/// Adds what a run has come to so far at one of its parks, yields or its
+/// answer: its heap to its app's peak, and the yields it declined since the
+/// last such point to its app's count.
+fn note_progress(tally: &mut Tally, counters: &AppCounters, heap: u64, declined: u64) {
+    counters.heap_peak_words.fetch_max(heap, Ordering::Relaxed);
+    counters
+        .yields_declined
+        .fetch_add(declined.saturating_sub(tally.declined), Ordering::Relaxed);
+    tally.declined = tally.declined.max(declined);
 }
 
 /// Sleeps for `left`, or forever for a duration no timer can hold.

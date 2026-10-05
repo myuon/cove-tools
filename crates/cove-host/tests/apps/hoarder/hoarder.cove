@@ -1,0 +1,17 @@
+use web
+use timer
+
+/// Keeps `?n=` numbers in a vector, waits `?ms=` milliseconds, and answers
+/// how many it kept.
+export fn handle(request: web.Request) -> web.Response {
+  let n = Int.parse(request.query.get("n").unwrapOr("10")).unwrapOr(10)
+  let ms = Int.parse(request.query.get("ms").unwrapOr("0")).unwrapOr(0)
+  var kept = Vector.of()
+  var i = 0
+  while i < n {
+    kept.push(i)
+    i += 1
+  }
+  timer.sleep(ms)
+  web.Response(status: 200, headers: Map.of(), body: "kept {kept.length()}\n")
+}

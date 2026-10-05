@@ -32,7 +32,7 @@ use cove_runtime::{
 };
 
 use crate::access::{Gate, Presented, Step, Verifier};
-use crate::hosts::{transfer, AppContext, HostModule, PendingWork};
+use crate::hosts::{AppContext, HostModule, PendingWork};
 
 const fn op(
     name: &'static str,
@@ -233,10 +233,10 @@ struct AuthHost {
 }
 
 /// `auth.identity`'s answer, as the `Result` value.
-fn identity_answer(identity: Result<crate::access::Identity, String>) -> Value {
+fn identity_answer(identity: Result<crate::access::Identity, String>) -> Transfer {
     match identity {
-        Ok(identity) => Value::ok(identity.value()),
-        Err(why) => Value::err(Value::error(why)),
+        Ok(identity) => Transfer::ok(identity.transfer()),
+        Err(why) => Transfer::err(Transfer::error(why)),
     }
 }
 
@@ -251,7 +251,7 @@ impl AuthHost {
         let gate = Arc::clone(&self.gate);
         async move {
             let verified = verifier.verify(&assertion).await;
-            transfer(&identity_answer(gate.finish(&presented, verified)))
+            Ok(identity_answer(gate.finish(&presented, verified)))
         }
     }
 }
@@ -268,7 +268,7 @@ impl HostApi for AuthHost {
             "identity" => {
                 let presented = Presented::from_headers(args.first().unwrap_or(&Value::unit()));
                 match self.gate.begin(&presented) {
-                    Step::Done(identity) => Ok(identity_answer(identity)),
+                    Step::Done(identity) => Ok(identity_answer(identity).into_value()),
                     Step::Verify(verifier, assertion) => self
                         .io
                         .block_on(self.verify(verifier, assertion, presented))
@@ -293,7 +293,7 @@ impl HostApi for AuthHost {
         }
         let presented = Presented::from_headers(args.first().unwrap_or(&Value::unit()));
         match self.gate.begin(&presented) {
-            Step::Done(identity) => HostAnswer::Ready(Ok(identity_answer(identity))),
+            Step::Done(identity) => HostAnswer::Ready(Ok(identity_answer(identity).into_value())),
             Step::Verify(verifier, assertion) => {
                 PendingWork::new("auth.identity", self.verify(verifier, assertion, presented))
                     .answer()

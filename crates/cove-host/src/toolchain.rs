@@ -6,17 +6,17 @@
 //! `check` runs the compile, the admission and the lowering `serve` runs at
 //! load ([`apps::compile`], [`apps::admit`], [`apps::lower`]), so it cannot
 //! pass an app the server would refuse. `test` runs each `test fn` the way
-//! `cove test` does — lowered as an entry of its own, on the VM, an `Err` is
-//! a failure pointing at its assertion — with the app's grant (not the
-//! test's derived one), the app's limits, and the host's modules answered
-//! through their blocking path, since a test runs to its end on one thread.
-//! Adapted from `examples/edge/host/src/toolchain.rs` in the Cove repository.
+//! `cove test` does — through Cove's own `cove_runtime::testing`, lowered as
+//! an entry of its own, on the VM, an `Err` is a failure pointing at its
+//! assertion — with the app's grant (not the test's derived one), the app's
+//! limits, and the host's modules answered through their blocking path, since
+//! a test runs to its end on one thread.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use cove_diag::{render, Diagnostic, Severity, Span};
-use cove_runtime::{Budget, Runtime, Value, Vm};
+use cove_diag::{render, Diagnostic, Severity};
+use cove_runtime::testing::{self, TestBackend, TestRun};
 use cove_sema::resolve::DeclaredTest;
 use cove_sema::HostSchemas;
 
@@ -69,8 +69,9 @@ pub fn check(root: &Path, only: &[String], modules: &HostModules) -> Result<Repo
             AppState::Refused(why) => {
                 refused += 1;
                 // A refusal that is not a diagnostic already printed above —
-                // the grant, a spawn — is printed in full.
-                if !why.starts_with("does not") && !why.starts_with("checks with warnings") {
+                // the grant, a spawn, the lowering — is printed in full.
+                let printed = ["does not parse", "does not check", "checks with warnings"];
+                if !printed.iter().any(|stage| why.starts_with(stage)) {
                     if let Some((_, rest)) = why.split_once('\n') {
                         report.err.push_str(rest);
                         if !rest.ends_with('\n') {
@@ -118,9 +119,6 @@ fn diagnostics_of(why: &str) -> String {
     }
     format!("{why}\n")
 }
-
-/// The diagnostic a failing test is reported as — `cove test`'s.
-const FAILED: &str = "cove::test::failed";
 
 /// `cove-host test [app…]`: every `test fn` in each app's modules.
 pub fn test(
@@ -191,8 +189,11 @@ pub fn test(
     Ok(report)
 }
 
-/// Runs one test as `cove test` would, with the app's grant, modules and
-/// limits; the diagnostic to report when it failed.
+/// Runs one test as `cove test` would — through Cove's own
+/// [`testing::TestRun`], which lowers it as an entry of its own, runs it on
+/// the VM and reports its outcome by `cove test`'s rules, a lowering refusal
+/// labelled where each gap is — with the app's grant, modules and limits; the
+/// diagnostic to report when it failed.
 fn run_test(
     test: &DeclaredTest,
     app: &App,
@@ -210,7 +211,7 @@ fn run_test(
     if let Some(missing) = missing {
         return Some(
             Diagnostic::error(
-                FAILED,
+                testing::FAILED,
                 format!(
                     "test `{}` requires `{missing}`, which app.toml does not grant app `{}`",
                     test.qualified_name(),
@@ -221,93 +222,26 @@ fn run_test(
             .rule("`cove-host test` grants a test what the host grants its app."),
         );
     }
-    let lowered = match cove_ir::lower_entry(
-        program,
-        sources,
-        &HostSchemas::only(modules.schemas()),
-        test.module,
-        test.name,
-    ) {
-        Ok(ir) => ir,
-        Err(items) => {
-            return Some(
-                Diagnostic::error(
-                    FAILED,
-                    format!(
-                        "test `{}` could not be lowered: {}",
-                        test.qualified_name(),
-                        items
-                            .iter()
-                            .map(|item| item.message.clone())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                )
-                .at(test.entry.decl.name.span),
-            )
-        }
-    };
     // A registry per test, with its state in memory: no test sees what
     // another left in the store, and nothing reaches the data directory.
     let context = app.context(true, None, io);
-    let hosts = match modules.registry(&app.granted, &context) {
-        Ok(hosts) => hosts,
-        Err(why) => {
-            return Some(
-                Diagnostic::error(FAILED, format!("app `{}` {why}", app.name)).at(test
-                    .entry
-                    .decl
-                    .name
-                    .span),
-            )
-        }
+    let hosts =
+        match modules.registry(&app.granted, &context) {
+            Ok(hosts) => hosts,
+            Err(why) => {
+                return Some(
+                    Diagnostic::error(testing::FAILED, format!("app `{}` {why}", app.name))
+                        .at(test.entry.decl.name.span),
+                )
+            }
+        };
+    let schemas = HostSchemas::only(modules.schemas());
+    let run = TestRun {
+        program,
+        sources,
+        schemas: &schemas,
+        backend: TestBackend::Vm,
+        limits: Some(app.limits.run.clone()),
     };
-    let runtime = Runtime::new(Arc::clone(program), Arc::clone(sources), Arc::new(hosts));
-    let mut vm = Vm::new(&runtime, runtime.hosts(), &lowered);
-    let outcome = vm.run_entry_within(
-        Budget::new(app.limits.run.clone()),
-        test.module,
-        test.name,
-        Vec::new(),
-    );
-    let assertion = vm
-        .assertion_failure()
-        .map(|(span, message)| (span, message.to_string()));
-    match outcome {
-        Ok(value) => {
-            let message = failure_message(&value)?;
-            Some(failure(test, &message, assertion))
-        }
-        Err(error) => {
-            let mut diagnostic = error.to_diagnostic();
-            diagnostic.message =
-                format!("test `{}` failed: {}", test.qualified_name(), error.message);
-            Some(diagnostic)
-        }
-    }
-}
-
-fn failure_message(value: &Value) -> Option<String> {
-    Some(
-        value
-            .err_payload()?
-            .first()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
-    )
-}
-
-fn failure(test: &DeclaredTest, message: &str, assertion: Option<(Span, String)>) -> Diagnostic {
-    let span = match assertion {
-        Some((span, recorded)) if recorded == message => span,
-        _ => test.entry.decl.name.span,
-    };
-    Diagnostic::error(
-        FAILED,
-        format!("test `{}` failed: {message}", test.qualified_name()),
-    )
-    .at(span)
-    .rule(
-        "A test reports failure as an `Err`, the way every Cove function reports expected failure.",
-    )
+    run.run(test, hosts).map(|failure| failure.diagnostic)
 }
