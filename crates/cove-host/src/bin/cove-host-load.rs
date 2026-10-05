@@ -26,6 +26,7 @@
 //! | `slow` | `/slow/?ms=60&times=3`: three parks, 180 ms of waiting, `aggregate`'s shape |
 //! | `proxy` | `/proxy/?url=http://127.0.0.1:<port>/hello/`: a fetch of `hello` from the same host |
 //! | `algo-sat` | `/algo/sat?example=hard&part=result`: the playground's heavy SAT run, DPLL refuting 8 pigeons in 7 holes |
+//! | `algo-anneal` | `/algo/anneal?example=cooling&part=result`: the playground's annealing comparison, two runs of 200,000 iterations |
 //! | `algo` | `/algo/matching?example=large&algorithm=augmenting&part=result`: the playground's heavy run, a maximum matching of a 2000 × 2000 graph by the simple algorithm |
 //!
 //! `--mix cpu-io` is `crunch=35,slow=30,proxy=10,hello=25`, `cove-edge-load`'s
@@ -61,7 +62,7 @@ struct Args {
     /// Kept-alive connections, one thread each.
     #[arg(long, default_value_t = 64)]
     connections: usize,
-    /// What to ask: `hello`, `crunch`, `crunch20k`, `slow`, `proxy`, `algo`, `algo-sat`,
+    /// What to ask: `hello`, `crunch`, `crunch20k`, `slow`, `proxy`, `algo`, `algo-sat`, `algo-anneal`,
     /// `cpu-io`, or weights like `hello=3,crunch=1`.
     #[arg(long, default_value = "hello")]
     mix: String,
@@ -101,8 +102,9 @@ fn mix(text: &str) -> Vec<(&'static str, u32)> {
                 "proxy" => "proxy",
                 "algo" => "algo",
                 "algo-sat" => "algo-sat",
+                "algo-anneal" => "algo-anneal",
                 other => {
-                    panic!("`{other}` is not hello, crunch, crunch20k, slow, proxy, algo, algo-sat or cpu-io")
+                    panic!("`{other}` is not hello, crunch, crunch20k, slow, proxy, algo, algo-sat, algo-anneal or cpu-io")
                 }
             };
             (name, weight.parse().expect("a whole-number weight"))
@@ -134,12 +136,13 @@ fn request(i: u64, mix: &[(&'static str, u32)], port: u16) -> (&'static str, Str
         "slow" => "/slow/?ms=60&times=3".to_string(),
         "algo" => "/algo/matching?example=large&algorithm=augmenting&part=result".to_string(),
         "algo-sat" => "/algo/sat?example=hard&part=result".to_string(),
+        "algo-anneal" => "/algo/anneal?example=cooling&part=result".to_string(),
         _ => format!("/proxy/?url=http://127.0.0.1:{port}/hello/"),
     };
     (
         match app {
             "crunch20k" => "crunch",
-            "algo-sat" => "algo",
+            "algo-sat" | "algo-anneal" => "algo",
             other => other,
         },
         path,

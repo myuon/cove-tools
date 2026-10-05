@@ -16,6 +16,7 @@ keep answering.
 | `GET /matching?example=<name>[&algorithm=…]` | the form filled with an example; the page's script runs it at once |
 | `POST /matching` (`graph`, `algorithm`) | runs a graph; the page with the result (works without scripts) |
 | `GET /sat`, `GET /sat?example=<name>`, `POST /sat` (`formula`, `budget`) | satisfiability, the same way |
+| `GET /anneal`, `GET /anneal?example=<name>&…`, `POST /anneal` | simulated annealing, two runs compared (fields below) |
 | `…&part=result` (`GET` or `POST`) | the result alone, as HTML — what the page's script asks for |
 | `GET /app.js` | the page's script |
 
@@ -229,13 +230,73 @@ first 200 clauses).
 | `hard` | 8 pigeons, 7 holes | unsatisfiable | 32,780 decisions, ~170 ms |
 | `heavy` | 10 pigeons, 9 holes | — | stopped: fuel |
 
+## Simulated annealing
+
+### The problem and the runs
+
+A travelling-salesman tour through `n` points (4–500): **random points**
+in the unit square from the problem seed (`pseed`), or **points on a
+circle**, shuffled by the seed, whose optimum is known — around the circle,
+`n · 0.9 · sin(π/n)`. Two runs, **A** and **B**, anneal the same problem
+from the same tour `0, 1, …, n−1`, each with its own:
+
+| field | what |
+| --- | --- |
+| `a_seed`, `b_seed` | the run's seed: every random move and acceptance comes from it |
+| `a_iterations`, `b_iterations` | 1 to 5,000,000 |
+| `a_start`, `a_end` (and `b_…`) | the temperature at the first and the last iteration, above 0, at most 1000 |
+| `a_schedule`, `b_schedule` | `geometric` (the same factor each iteration) or `linear` (the same amount) |
+
+and the problem's `problem` (`random` or `circle`), `n` and `pseed`. Every
+field may be given in the query, over an example's: `?example=cooling&a_seed=9`.
+
+Each iteration proposes a **2-opt move** — reverse the tour between two
+random positions, changing its length by `d(a,c) + d(b,e) − d(a,b) − d(c,e)`
+— and takes it if it is shorter, or with probability `e^(−Δ/T)` if it is
+longer by Δ (a move worse by more than 40 T is not even drawn for). The
+temperature is stepped, not recomputed. The best tour seen is kept, and the
+page's lengths are **recomputed from the tours**, not from the running sum
+of the moves; both answers are checked to be tours through every point.
+
+The standard library has no `exp` (or `ln`, `sin`), so `anneal.exp` is
+range reduction by ln 2 and the series to 1e-16, `anneal.ln` the atanh
+series after scaling into [0.75, 1.5), checked against the library's values
+in the tests.
+
+**Reproducible**: the points and both runs come from the playground's
+xorshift64, never the host's `random`, so `?example=cooling` gives the same
+two tours, the same lengths and the same trajectories every time, on both
+backends (`aSeedIsAlwaysTheSameRun`, and `algo.rs` asks twice).
+
+### The picture
+
+**One chart, one y-axis** — the tour length — against the **share of each
+run done**, so runs of different lengths share the x-axis: each run's
+current length (2 px; A solid in the first colour, B dashed in the second,
+so the two differ by more than colour) and, thinner, its best so far; the
+greedy nearest-neighbour tour, and on the circle the optimum, as dotted
+reference lines labelled at the right in ink. A legend names each. Beside it,
+both best tours drawn over the points; under it, the table view: every tenth
+of the 200 recorded points of both trajectories, with the temperature.
+
+### Examples
+
+| example | A | B | result (native) |
+| --- | --- | --- | --- |
+| `cooling` | 60 points, T 0.5 → 0.001 | T 0.002 → 0.001 (quenched) | A 6.2157, B 7.2554: A shorter by 14.33%, 11.1% below greedy; ≈ 160 ms |
+| `schedules` | geometric | linear, the same temperatures | A shorter by 8.84% |
+| `seeds` | seed 1 | seed 2, the same settings | A shorter by 3.13% |
+| `circle` | 40 points on a circle | 20,000 iterations only | both find the known optimum |
+| `long` | 200 points, 200,000 iterations | seed 2 | ≈ 270 M fuel of 400 M |
+| `heavy` | 500 points, 5,000,000 iterations | the same | stopped: fuel |
+
 ## Limits
 
 `app.toml`, per request:
 
 | limit | value | why |
 | --- | --- | --- |
-| `fuel` | 400,000,000 | `large` by the simple algorithm takes about 125 M (both algorithms and the check, native tier), SAT's `hard` about 160 M; matching's and SAT's `heavy` do not fit, on purpose |
+| `fuel` | 400,000,000 | `large` by the simple algorithm takes about 125 M (both algorithms and the check, native tier), SAT's `hard` about 160 M, annealing's `cooling` about 185 M and `long` 275 M; every `heavy` does not fit, on purpose |
 | `deadline` | 10 s | far above any run that fits its fuel, on the VM too; a run parked or queued past it is stopped |
 | `max_heap_words` | 2 Mi words (16 MiB) | a 5,000 × 5,000 graph with 50,000 edges, or a formula at its bounds, and their working arrays are well inside it |
 | `max_in_flight` | 4 | at most four runs of this app at once, on any number of workers: a burst of heavy runs cannot take every worker of a larger host |
@@ -277,6 +338,13 @@ $ cargo test --profile checked --test algo              # the app on a host
   clause; a seed is always the same formula, with distinct variables per
   clause; the sudoku's known first row, and a sudoku with two fives in a row
   unsatisfiable; the decision budget; every refusal, with the line.
+- `anneal_test.cove`: `exp`, `ln`, `sin`, `cos` against the library's
+  values; the schedules' ends and midpoints; a run's answer is a tour of the
+  length it reports, its trajectory starts at the start and ends at the end
+  and its best never rises; a seed is always the same run and the same
+  points; on 24 shuffled points on a circle it finds the known optimum; on
+  four random 7-point problems it finds the optimum an exhaustive search
+  finds; four corners of a square, the perimeter; the greedy tour is a tour.
 - `rng_test.cove`: Marsaglia's sequence, seeds, ranges.
 - `crates/cove-host/tests/algo.rs`: the known answers through the page,
   for all three algorithm choices, with the proof; the meter headers; CSP,
@@ -284,7 +352,11 @@ $ cargo test --profile checked --test algo              # the app on a host
   answered `x-cove-stop: fuel`, one past its deadline `deadline`; SAT's
   known answers through the page, its models re-checked in Rust against the
   formula as the page prints it, the sudoku's first row, the budget's
-  *Unknown*, SAT's `heavy` stopped by fuel; a client
+  *Unknown*, SAT's `heavy` stopped by fuel; annealing's comparison (the
+  hot start beats the cold one), reproduced exactly on a second request, a
+  reseeded run changed and the other not, the chart's two series and
+  references, the circle's optimum found, every refusal, and `heavy`
+  stopped by fuel; a client
   that goes away cancels its heavy run (`errors.cancelled`, nothing in
   flight after); and **the responsiveness test** below, on the VM and on the
   native tier; and that every function on the heavy path has machine code.
@@ -293,8 +365,9 @@ $ cargo test --profile checked --test algo              # the app on a host
 
 **Tested** (`algo.rs::the_other_apps_answer_while_algo_computes_on_*`, no
 duration asserted): a host with **two workers** and **four clients**, two
-asking for the simple matching algorithm on `large` and two for SAT's `hard`
-(DPLL refuting 8 pigeons in 7 holes), each again as soon as it is answered;
+asking for the simple matching algorithm on `large`, one for SAT's `hard`
+(DPLL refuting 8 pigeons in 7 holes) and one for annealing's `cooling`, each
+again as soon as it is answered;
 while at least one heavy run is in flight, ten `hello` requests and ten
 webhooks posted to the webhook lab all complete, the heavy answers all agree,
 and the heavy runs yielded (`yields > 0`). On the VM and on the native tier.
@@ -327,6 +400,19 @@ bench/algo.sh 3 <backend>`; `bench/results/algo-sat-2026-10-05-*.txt`):
 | VM | 0 | 1.15 ms | 2.03 ms | — | — | — | — |
 | VM | 4 | 2.65 ms | **4.45 ms** | ~48 | 302 | 0 | 0 |
 
+And with annealing's `cooling` as the heavy run (`MIX=algo-anneal`;
+`bench/results/algo-anneal-2026-10-05-*.txt`):
+
+| tier | heavy clients | `hello` p50 | `hello` p99 | heavy runs answered in the 10 s | yields per heavy run | declined per run | overdue |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| native | 0 | 1.67 ms | 2.49 ms | — | — | — | — |
+| native | 4 | 2.57 ms | **4.43 ms** | ~266 | 52 | ~6 | 0 |
+| VM | 0 | 1.76 ms | 2.58 ms | — | — | — | — |
+| VM | 4 | 2.54 ms | **4.29 ms** | ~48 | 302 | 0 | 0 |
+
+(The few declined yields per annealing run are polls while the clock's
+encoded leaf, `now()`, runs.)
+
 With every worker held by a heavy run, a `hello` waits for the next yield —
 at most one 2 ms slice plus a tick of the monitor — and its p99 goes from 2
 to under 5 ms. Eight heavy clients are no worse than four: the app's
@@ -342,6 +428,7 @@ $ cargo build --profile checked
 $ sh bench/algo.sh 3 native > bench/results/algo-$(date +%F)-native.txt
 $ sh bench/algo.sh 3 vm > bench/results/algo-$(date +%F)-vm.txt
 $ MIX=algo-sat HEAVY="0 4" sh bench/algo.sh 3 native > bench/results/algo-sat-$(date +%F)-native.txt
+$ MIX=algo-anneal HEAVY="0 4" sh bench/algo.sh 3 native > bench/results/algo-anneal-$(date +%F)-native.txt
 ```
 
 ## Yields on the native tier
@@ -410,6 +497,11 @@ The ~290 declined yields per heavy run that remain are those leaves (the
 input's words, the form) being polled while they run: none is long enough
 to be overdue.
 
+**Annealing met the second shape again, as `!=`.** `annealPage` laid the
+request's fields over the defaults with `if entry.key != "example"` — and a
+`String` `!=` is not lowered where `==` is, so the page function above every
+run was encoded. `!(entry.key == "example")` gives it machine code. 
+
 **SAT met the third shape.** `sat.read` began `if generator != "" {` — and
 a `String` comparison is "an operand outside a bound" to the code
 generator, so the whole reader, the DIMACS byte scanner and the calls into
@@ -453,7 +545,8 @@ SAT solver makes no such copy.
 
 **For upstream (myuon/cove)**: (1) a function that makes any host call is
 left on the encoded tier by the template compiler, and so is any function
-that writes a lambda or compares two `String`s; (2) compiled code below such a frame cannot yield
+that writes a lambda or compares two `String`s with `!=` or `<` (`==` is
+lowered); (2) compiled code below such a frame cannot yield
 (ADR 0085), so an algorithm whose caller reads the clock — the natural way to
 time it — holds its worker for its whole run, with nothing at the source
 level to say so. Either lowering `CallHost`/`FuncRef` (a call to a runtime
@@ -471,7 +564,9 @@ monitor's request is seen at.
 
 For upstream (myuon/cove), besides the native-tier shapes above:
 
-- **No `Float.exp`/`ln`** in the standard library (`sqrt` is there).
+- **No `Float.exp`/`ln`/`sin`/`cos`** in the standard library (`sqrt` is
+  there): the annealing's are written in Cove (`anneal.exp`, `anneal.ln`,
+  `anneal.sine`), and cost a loop of 20–30 multiplications each.
 - **An `if` in statement position must still have matching branch types**:
   `if a { x += 1 } else { v.set(i, 0) }` is refused because `set` answers an
   `Option`. Reordering the branch so it ends in a `Unit` statement is the
@@ -486,3 +581,14 @@ For upstream (myuon/cove), besides the native-tier shapes above:
   (`var a = filled(n, -1)` … `a.freeze()` is refused), so the algorithms
   answer with `toArray()`, an O(n) copy; and there is no
   `Vector.filled(n, value)` to make one.
+
+## Issue #4's completion criteria
+
+| criterion | where it is shown |
+| --- | --- |
+| results verified on small known problems | matching: `matching_test.cove` (known maxima, 60 graphs against exhaustive search, König's certificate checked edge by edge, non-maximum matchings refused) and `algo.rs::the_examples_have_their_known_maximum_and_a_proof`; SAT: `sat_test.cove` (80 formulas against all 2^n assignments, pigeonhole 1–5 holes, the sudoku's known solution, every model checked) and `algo.rs::sat_answers_known_formulas_and_checks_its_models`; annealing: `anneal_test.cove` (the circle's known optimum, 7-point problems against exhaustive search, the square) and `algo.rs::annealing_compares_two_runs_reproducibly` |
+| execution limits work, and say which stopped a run | `algo.rs::a_run_a_limit_stops_says_which_limit` (fuel, deadline), `::a_sat_run_out_of_fuel_says_so`, annealing's `heavy`; the app's own bounds and SAT's decision budget answered in the page; [The page](#the-page) (`x-cove-stop` shown as *Stopped: fuel* and so on) |
+| cancellation works | `algo.rs::a_client_that_goes_away_cancels_its_run` (the connection closed mid-run: `errors.cancelled`, nothing in flight after); the page's Cancel button aborts the fetch, which is that |
+| the webhook lab and a light app answer while it computes | `algo.rs::the_other_apps_answer_while_algo_computes_on_the_vm` / `_on_the_native_tier` (two workers, four heavy clients of all three algorithms, twenty requests to `hello` and `webhooks` all answered, the heavy runs yielded); [Responsiveness](#responsiveness): `hello`'s p99 4.3–5.0 ms beside them on both tiers |
+| input examples and reproduction steps | every page's examples (seeded generators, so each is the same input everywhere); [Running it](#running-it), the input formats above, `bench/algo.sh`, `bench/repro/run.sh` |
+| shapes that stop park/yield on the native tier recorded and returned as runtime issues | [Yields on the native tier](#yields-on-the-native-tier): a host call (`CallHost`) or a lambda (`FuncRef`) or a `String` `!=`/`<` in a function above a heavy loop keeps that loop from yielding (measured: `hello` p99 10.2 s, 624 overdue yields); a sliced native run's `toVector`/`snapshot` can resume with a wrong-sized store (`bench/repro/`); a `toVector` loop that never yields. `/_host/apps/<app>`'s `native.refusals` names such functions; `algo.rs::the_heavy_path_has_machine_code_on_the_native_tier` holds the app to it |

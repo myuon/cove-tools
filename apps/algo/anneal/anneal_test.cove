@@ -1,0 +1,138 @@
+fn near(actual: Float, expected: Float, tolerance: Float) -> Result<Unit, Error> {
+  if (actual - expected).abs() <= tolerance {
+    Ok(())
+  } else {
+    Err(Error("{actual} is not within {tolerance} of {expected}"))
+  }
+}
+
+fn settings(seed: Int, iterations: Int) -> Settings {
+  Settings(seed: seed, iterations: iterations, start: 0.5, end: 0.001, schedule: Schedule.Geometric, samples: 50)
+}
+
+test fn theMathIsTheLibrarysAnswer() -> Result<Unit, Error> {
+  near(exp(0.0), 1.0, 0.0)?
+  near(exp(1.0), 2.718281828459045, 1e-15)?
+  near(exp(-1.0), 0.36787944117144233, 1e-16)?
+  near(exp(-20.0), 2.061153622438558e-9, 1e-23)?
+  near(exp(10.0), 22026.465794806718, 1e-10)?
+  assertEqual(exp(-800.0), 0.0)?
+  near(ln(2.718281828459045), 1.0, 1e-15)?
+  near(ln(0.001), -6.907755278982137, 1e-14)?
+  near(ln(500.0), 6.214608098422191, 1e-14)?
+  near(sine(pi() / 6.0), 0.5, 1e-15)?
+  near(cosine(pi()), -1.0, 1e-15)?
+  near(sine(10.0), -0.5440211108893698, 1e-14)?
+  Ok(())
+}
+
+test fn theScheduleRunsFromStartToEnd() -> Result<Unit, Error> {
+  let geometric = settings(1, 1000)
+  near(temperature(geometric, 0), 0.5, 1e-15)?
+  near(temperature(geometric, 1000), 0.001, 1e-15)?
+  // Halfway in a geometric schedule is the geometric mean.
+  near(temperature(geometric, 500), (0.5 * 0.001).sqrt(), 1e-15)?
+  let linear = Settings(seed: 1, iterations: 1000, start: 0.5, end: 0.001, schedule: Schedule.Linear, samples: 10)
+  near(temperature(linear, 500), 0.2505, 1e-15)?
+  Ok(())
+}
+
+test fn aRunIsATourOfTheLengthItSays() -> Result<Unit, Error> {
+  let problem = points(60, 3)
+  let done = run(problem, settings(7, 20000))
+  assert(isTour(problem, done.tour))?
+  near(done.length, tourLength(problem, done.tour), 1e-12)?
+  // It got shorter, and the trajectory says so from start to end.
+  assert(done.length < done.startLength)?
+  let first = done.trajectory.get(0).unwrapOr(Sample(iteration: -1, current: 0.0, best: 0.0, temperature: 0.0))
+  let last = done.trajectory.get(done.trajectory.length() - 1).unwrapOr(first)
+  assertEqual(first.iteration, 0)?
+  assertEqual(last.iteration, 20000)?
+  near(first.current, done.startLength, 1e-12)?
+  near(last.current, done.finalLength, 1e-9)?
+  near(last.best, done.length, 1e-9)?
+  assertEqual(done.trajectory.length(), 51)?
+  // The best never rises.
+  var previous = first.best
+  for sample in done.trajectory {
+    assert(sample.best <= previous + 1e-12)?
+    previous = sample.best
+  }
+  Ok(())
+}
+
+test fn aSeedIsAlwaysTheSameRun() -> Result<Unit, Error> {
+  let problem = points(40, 5)
+  let a = run(problem, settings(11, 5000))
+  let b = run(problem, settings(11, 5000))
+  let c = run(problem, settings(12, 5000))
+  assertEqual(a.tour, b.tour)?
+  assertEqual(a.length, b.length)?
+  assertEqual(a.accepted, b.accepted)?
+  assert(a.tour != c.tour)?
+  assertEqual(points(40, 5).xs, problem.xs)?
+  assert(points(40, 6).xs != problem.xs)?
+  Ok(())
+}
+
+test fn itFindsTheCircle() -> Result<Unit, Error> {
+  // Shuffled points on a circle: the optimum is around it.
+  let problem = circle(24, 2)
+  let done = run(problem, settings(1, 60000))
+  near(done.length, circleOptimum(24), 1e-9)?
+  // And it is well below where it started.
+  assert(done.startLength > 2.0 * done.length)?
+  Ok(())
+}
+
+test fn itFindsTheOptimumOfSmallProblems() -> Result<Unit, Error> {
+  for seed in [1, 2, 3, 4] {
+    let problem = points(7, seed)
+    let done = run(problem, settings(seed, 20000))
+    near(done.length, bruteForce(problem), 1e-9)?
+  }
+  // Four corners of a square: the perimeter.
+  let square = Problem(xs: [0.0, 1.0, 0.0, 1.0], ys: [0.0, 1.0, 1.0, 0.0], origin: "square")
+  near(run(square, settings(1, 1000)).length, 4.0, 1e-12)?
+  Ok(())
+}
+
+/// The shortest tour of a small problem, by trying every order of the
+/// points after the first.
+fn bruteForce(problem: Problem) -> Float {
+  let n = problem.xs.length()
+  var order = Vector.of()
+  var k = 0
+  while k < n {
+    order.push(k)
+    k += 1
+  }
+  permute(problem, var order, 1)
+}
+
+fn permute(problem: Problem, var order: Vector<Int>, from: Int) -> Float {
+  if from == order.length() {
+    return tourLength(problem, order.toArray())
+  }
+  var best = 1000000.0
+  var i = from
+  while i < order.length() {
+    let a = order.get(from).unwrapOr(0)
+    order.set(from, order.get(i).unwrapOr(0))
+    order.set(i, a)
+    best = best.min(permute(problem, var order, from + 1))
+    let b = order.get(from).unwrapOr(0)
+    order.set(from, order.get(i).unwrapOr(0))
+    order.set(i, b)
+    i += 1
+  }
+  best
+}
+
+test fn theGreedyTourIsATour() -> Result<Unit, Error> {
+  let problem = points(50, 9)
+  let greedy = nearestNeighbour(problem)
+  assert(isTour(problem, greedy))?
+  assert(!isTour(problem, [0, 1, 2]))?
+  Ok(())
+}

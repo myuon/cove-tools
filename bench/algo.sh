@@ -18,7 +18,8 @@ set -eu
 REPS=${1:-3}
 BACKEND=${2:-auto}
 HEAVY=${HEAVY:-0 4 8}
-# `algo` (matching) or `algo-sat` (DPLL on pigeonhole 8 7).
+# `algo` (matching), `algo-sat` (DPLL on pigeonhole 8 7) or `algo-anneal`
+# (two annealing runs of 200,000 iterations).
 MIX=${MIX:-algo}
 RATE=${RATE:-500}
 REQUESTS=${REQUESTS:-5000}

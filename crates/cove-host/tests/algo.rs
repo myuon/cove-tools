@@ -229,6 +229,86 @@ fn a_sat_run_out_of_fuel_says_so() {
     assert!(answer.body.contains("fuel budget of 400000000 exhausted"));
 }
 
+/// Runs the annealing page with `query` and answers the result.
+fn run_anneal(addr: SocketAddr, query: &str) -> Answer {
+    let answer = get(addr, &format!("/algo/anneal?{query}&part=result"));
+    assert_eq!(answer.status, 200, "{answer:?}");
+    answer
+}
+
+/// The best length a run reports: `run A</dt><dd>best <strong>6.2157`.
+fn best_of(answer: &Answer, run: &str) -> f64 {
+    let marker = format!("run {run}</dt><dd>best <strong>");
+    let at = answer
+        .body
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no run {run}: {}", answer.body));
+    let rest = &answer.body[at + marker.len()..];
+    rest[..rest.find('<').unwrap()].parse().unwrap()
+}
+
+#[test]
+fn annealing_compares_two_runs_reproducibly() {
+    let apps = apps(&[sample("algo")]);
+    let host = start(&apps, 2);
+    let addr = host.addr;
+    // The default comparison: the hot start beats the cold one, both
+    // answers are tours, and a second run is the same run.
+    let first = run_anneal(addr, "example=cooling");
+    assert!(first.body.contains("data-checked=true"), "{}", first.body);
+    let (a, b) = (best_of(&first, "A"), best_of(&first, "B"));
+    assert!(a < b, "annealed {a} against quenched {b}");
+    let again = run_anneal(addr, "example=cooling");
+    assert_eq!((best_of(&again, "A"), best_of(&again, "B")), (a, b));
+    // Another run seed is another run; the problem seed is another problem.
+    let reseeded = run_anneal(addr, "example=cooling&a_seed=9");
+    assert_ne!(best_of(&reseeded, "A"), a);
+    assert_eq!(best_of(&reseeded, "B"), b);
+    // One axis, two series, a legend, the references, both tours, a table.
+    assert_eq!(first.body.matches("<path class=current").count(), 2);
+    assert!(first.body.contains("stroke-dasharray=\"6 4\""));
+    assert!(first.body.contains("greedy 6.989"));
+    assert!(
+        first.body.contains("run A&#39;s best tour") || first.body.contains("run A's best tour")
+    );
+    assert!(first.body.contains("Table view: the trajectories"));
+    // On the circle the optimum is known, and found.
+    let circle = run_anneal(addr, "example=circle");
+    assert!(
+        circle.body.contains("The better one is the known optimum."),
+        "{}",
+        circle.body
+    );
+    let optimum = 40.0 * 2.0 * 0.45 * (std::f64::consts::PI / 40.0).sin();
+    assert!(
+        (best_of(&circle, "A") - optimum).abs() < 1e-3,
+        "{}",
+        best_of(&circle, "A")
+    );
+    // What it cannot run is answered with why.
+    for (query, why) in [
+        ("n=3", "4 to 500 points"),
+        ("a_iterations=0", "run A takes 1 to 5,000,000 iterations"),
+        ("b_start=-1", "run B&#39;s temperatures"),
+        ("a_seed=x", "run A&#39;s seed"),
+    ] {
+        let refused = run_anneal(addr, query);
+        assert!(
+            refused.body.contains("data-stop=app"),
+            "{query}: {}",
+            refused.body
+        );
+        assert!(refused.body.contains(why), "{query}: {}", refused.body);
+    }
+    let page = get(addr, "/algo/anneal?example=circle");
+    assert!(page.body.contains("data-autorun"));
+    assert!(page.body.contains("value=circle checked"));
+    // Too much for the fuel: the host stops it and says so.
+    let heavy = get(addr, "/algo/anneal?example=heavy&part=result");
+    assert_eq!(heavy.status, 500, "{heavy:?}");
+    assert_eq!(heavy.header("x-cove-stop"), Some("fuel"));
+}
+
 #[test]
 fn the_examples_have_their_known_maximum_and_a_proof() {
     let apps = apps(&[sample("algo")]);
@@ -485,21 +565,21 @@ fn the_other_apps_answer_while_algo_computes(backend: &str) {
     let made: serde_json::Value = serde_json::from_str(&made.body).unwrap();
     let id = made["id"].as_str().unwrap().to_string();
 
-    // Four clients, two workers: each asks for the slow algorithm on the
-    // large graph again as soon as it is answered.
+    // Four clients, two workers: each asks for a heavy run again as soon as
+    // it is answered — two for the simple matching algorithm on the large
+    // graph, one for DPLL refuting 8 pigeons in 7 holes, one for the
+    // annealing comparison.
     let stop = Arc::new(AtomicBool::new(false));
-    // Two of them ask for the matching, two for DPLL refuting 8 pigeons in
-    // 7 holes.
     let heavy: Vec<_> = (0..4)
         .map(|client| {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 let mut answers = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
-                    answers.push(if client % 2 == 0 {
-                        run_matching(addr, "random 2000 2000 12000 42", "augmenting")
-                    } else {
-                        run_sat(addr, "pigeonhole 8 7", "")
+                    answers.push(match client {
+                        1 => run_sat(addr, "pigeonhole 8 7", ""),
+                        2 => get(addr, "/algo/anneal?example=cooling&part=result"),
+                        _ => run_matching(addr, "random 2000 2000 12000 42", "augmenting"),
                     });
                 }
                 answers
@@ -540,11 +620,16 @@ fn the_other_apps_answer_while_algo_computes(backend: &str) {
                 answer.status, 200,
                 "a heavy run of client {client}: {answer:?}"
             );
-            seen.push(if client % 2 == 0 {
-                proved_size(&answer)
-            } else {
-                assert_eq!(verdict(&answer), "unsat", "{answer:?}");
-                number_before(&answer.body, " decisions")
+            seen.push(match client {
+                1 => {
+                    assert_eq!(verdict(&answer), "unsat", "{answer:?}");
+                    number_before(&answer.body, " decisions")
+                }
+                2 => {
+                    assert!(answer.body.contains("data-checked=true"), "{answer:?}");
+                    number_before(&answer.body, " moves taken")
+                }
+                _ => proved_size(&answer),
             });
         }
         assert!(seen.windows(2).all(|pair| pair[0] == pair[1]), "{seen:?}");
@@ -620,6 +705,16 @@ fn the_heavy_path_has_machine_code_on_the_native_tier() {
         "sat.sudoku",
         "sat.solve",
         "sat.unsatisfied",
+        "algo.annealPage",
+        "algo.annealResult",
+        "algo.timedRun",
+        "anneal.points",
+        "anneal.circle",
+        "anneal.run",
+        "anneal.exp",
+        "anneal.ln",
+        "anneal.tourLength",
+        "anneal.nearestNeighbour",
     ] {
         assert!(
             !refused.contains(&function),
