@@ -55,6 +55,8 @@ fn receive(request: web.Request, parts: Array<String>) -> web.Response {
     None => return textResponse(404, "no endpoint `{id}`\n")
   }
   let rest = "/{"/".join(parts.slice(3, parts.length()))}"
+  let reply = loadReply(endpoint.id)
+  let decision = decide(endpoint.id, reply)
   let event = eventFor(
     endpoint,
     time.nowMicros(),
@@ -63,6 +65,7 @@ fn receive(request: web.Request, parts: Array<String>) -> web.Response {
     request.query,
     request.headers,
     request.body,
+    decision.status,
   )
   match storeEvent(event, endpoint.retention) {
     Ok(_) => {}
@@ -71,17 +74,44 @@ fn receive(request: web.Request, parts: Array<String>) -> web.Response {
       return jsonResponse(507, json.render(problem("the request could not be stored: {error.message}")))
     }
   }
-  log.info("{endpoint.name}: {request.method} {rest} ({event.bytes} bytes) -> {event.id}")
-  jsonResponse(
-    200,
-    json.render(
-      Json.Fields(
-        Map.of(
-          MapEntry(key: "ok", value: Json.Bool(true)),
-          MapEntry(key: "endpoint", value: Json.Text(endpoint.id)),
-          MapEntry(key: "event", value: Json.Text(event.id)),
-        ),
-      ),
+  log.info("{endpoint.name}: {request.method} {rest} ({event.bytes} bytes) -> {event.id}, answering {decision.status}")
+  // Stored first, so the request is on its page while the sender waits.
+  delay(reply)
+  if decision.failing {
+    let body = if reply.errorBody == "" {
+      "simulated error: request {decision.count} of endpoint {endpoint.id} fails (every {reply.errorEvery})\n"
+    } else {
+      reply.errorBody
+    }
+    return web.Response(
+      status: decision.status,
+      headers: Map.of(MapEntry(key: "x-webhook-event", value: event.id)),
+      body: body,
+    )
+  }
+  if reply.body == "" {
+    return web.Response(
+      status: decision.status,
+      headers: reply.headers
+        .inserted("content-type", reply.headers.get("content-type").unwrapOr("application/json"))
+        .inserted("x-webhook-event", event.id),
+      body: "{json.render(receipt(endpoint, event))}\n",
+    )
+  }
+  web.Response(
+    status: decision.status,
+    headers: reply.headers.inserted("x-webhook-event", event.id),
+    body: reply.body,
+  )
+}
+
+/// What a receive URL answers by default.
+fn receipt(endpoint: Endpoint, event: Event) -> Json {
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "ok", value: Json.Bool(true)),
+      MapEntry(key: "endpoint", value: Json.Text(endpoint.id)),
+      MapEntry(key: "event", value: Json.Text(event.id)),
     ),
   )
 }
@@ -135,6 +165,18 @@ fn admin(request: web.Request, parts: Array<String>) -> web.Response {
   }
   if action == "" && get {
     return history(request, endpoint)
+  }
+  if action == "settings" && post {
+    return match replyFromForm(text.parseForm(request.body)) {
+      Ok(reply) => match saveReply(endpoint.id, reply) {
+        Ok(_) => {
+          log.info("{endpoint.name}: now answers {reply.status} after {reply.delayMs} ms, failing every {reply.errorEvery}")
+          redirect("{at}/admin/e/{endpoint.id}")
+        }
+        Err(error) => textResponse(507, "the settings could not be stored: {error.message}\n")
+      }
+      Err(error) => textResponse(400, "the response settings were not changed: {error.message}\n")
+    }
   }
   if action == "clear" && post {
     let deleted = clearEvents(endpoint.id)
@@ -264,6 +306,7 @@ fn history(request: web.Request, endpoint: Endpoint) -> web.Response {
             MapEntry(key: "path", value: Json.Text(event.path)),
             MapEntry(key: "bytes", value: Json.Number(event.bytes.toFloat())),
             MapEntry(key: "contentType", value: Json.Text(event.contentType)),
+            MapEntry(key: "answered", value: Json.Number(event.answered.toFloat())),
           ),
         ),
       )
@@ -274,13 +317,17 @@ fn history(request: web.Request, endpoint: Endpoint) -> web.Response {
         Json.Fields(
           Map.of(
             MapEntry(key: "endpoint", value: endpointJson(endpoint)),
+            MapEntry(key: "reply", value: replyJson(loadReply(endpoint.id))),
             MapEntry(key: "events", value: Json.Items(items.freeze())),
           ),
         ),
       ),
     )
   }
-  htmlResponse(200, endpointPage(base(request), origin(request), endpoint, events, pageSize()))
+  htmlResponse(
+    200,
+    endpointPage(base(request), origin(request), endpoint, loadReply(endpoint.id), events, pageSize()),
+  )
 }
 
 /// One request: the page, `?view=json`, or `?view=raw` (the body alone, as

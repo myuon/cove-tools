@@ -10,6 +10,9 @@ use text
 //   index:<id>:<event>      one received request's summary, for listing
 //   event:<id>:<event>      the request in full
 //   resend:<id>:<event>:<n> one resend of it, and what came back
+//   reply:<id>              what the endpoint answers (`simulate.cove`)
+//   count:<id>              how many requests it has answered, for its
+//                           error schedule (`kv.increment`, atomic)
 //
 // An event id is the time it arrived in microseconds, zero-padded to sixteen
 // digits — `time.nowMicros()`, which the host makes strictly increasing, so
@@ -48,6 +51,9 @@ struct Event {
   truncated: Bool
   // The names of the headers whose values were masked.
   masked: Array<String>
+  // The status the endpoint answered it with (0 for a request stored
+  // before endpoints had responses).
+  answered: Int
 }
 
 /// What a list of events shows of each.
@@ -58,6 +64,7 @@ struct Summary {
   path: String
   bytes: Int
   contentType: String
+  answered: Int
 }
 
 /// The headers whose values are masked on an endpoint that masks.
@@ -130,6 +137,7 @@ fn eventJson(event: Event) -> Json {
       MapEntry(key: "bytes", value: number(event.bytes)),
       MapEntry(key: "truncated", value: Json.Bool(event.truncated)),
       MapEntry(key: "masked", value: Json.Items(masked.freeze())),
+      MapEntry(key: "answered", value: number(event.answered)),
     ),
   )
 }
@@ -159,6 +167,7 @@ fn eventOf(value: Json) -> Event {
     bytes: json.int(value, "bytes", 0),
     truncated: json.bool(value, "truncated", false),
     masked: masked.freeze(),
+    answered: json.int(value, "answered", 0),
   )
 }
 
@@ -174,6 +183,7 @@ fn summaryJson(event: Event) -> Json {
         key: "contentType",
         value: Json.Text(event.headers.get("content-type").unwrapOr("")),
       ),
+      MapEntry(key: "answered", value: number(event.answered)),
     ),
   )
 }
@@ -186,6 +196,7 @@ fn summaryOf(value: Json) -> Summary {
     path: json.text(value, "path"),
     bytes: json.int(value, "bytes", 0),
     contentType: json.text(value, "contentType"),
+    answered: json.int(value, "answered", 0),
   )
 }
 
@@ -232,6 +243,8 @@ fn listEndpoints() -> Array<Endpoint> {
 
 /// Deletes every event of endpoint `id`; how many there were.
 fn clearEvents(id: String) -> Int {
+  // The count the error schedule runs on starts again with the history.
+  kv.delete("count:{id}")
   var deleted = 0
   var more = true
   while more {
@@ -249,6 +262,7 @@ fn clearEvents(id: String) -> Int {
 /// Deletes endpoint `id` and its events.
 fn deleteEndpoint(id: String) -> Int {
   let deleted = clearEvents(id)
+  kv.delete("reply:{id}")
   kv.delete("endpoint:{id}")
   deleted
 }
@@ -331,6 +345,7 @@ fn eventFor(
   query: Map<String, String>,
   headers: Map<String, String>,
   body: String,
+  answered: Int,
 ) -> Event {
   let kept = storedHeaders(headers, endpoint.mask)
   let stored = text.truncateBytes(body, endpoint.maxBody)
@@ -346,6 +361,7 @@ fn eventFor(
     bytes: body.byteLength(),
     truncated: stored.byteLength() < body.byteLength(),
     masked: kept.masked,
+    answered: answered,
   )
 }
 

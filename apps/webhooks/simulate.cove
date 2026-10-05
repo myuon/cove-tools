@@ -1,0 +1,217 @@
+use kv
+use timer
+use json
+use json.Json
+use text
+
+// What an endpoint answers the sender: a status, headers and a body of the
+// admin's choosing, after a delay, failing every `errorEvery`-th request.
+//
+// The delay is `timer.sleep`, which the host answers pending: the run parks
+// and holds no worker while it waits, so a slow endpoint costs the other
+// apps nothing. The count the error schedule runs on is `kv.increment`,
+// which is atomic, so two senders at once both count. The request is stored
+// before the delay, so it is on the history page while the sender waits.
+
+/// An endpoint's simulated response.
+struct Reply {
+  status: Int
+  headers: Map<String, String>
+  // Empty: the receipt, `{"ok":true,...}`.
+  body: String
+  delayMs: Int
+  // 0: never fail.
+  errorEvery: Int
+  errorStatus: Int
+  // Empty: a line saying it is a simulated error.
+  errorBody: String
+}
+
+/// The longest delay an endpoint may ask for: below the app's 10 s deadline,
+/// so the sender gets the simulated answer and not the host's 504.
+fn maxDelayMs() -> Int {
+  8000
+}
+
+/// What a new endpoint answers: 200 and the receipt, at once, never failing.
+fn defaultReply() -> Reply {
+  Reply(
+    status: 200,
+    headers: Map.of(),
+    body: "",
+    delayMs: 0,
+    errorEvery: 0,
+    errorStatus: 500,
+    errorBody: "",
+  )
+}
+
+fn replyJson(reply: Reply) -> Json {
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "status", value: Json.Number(reply.status.toFloat())),
+      MapEntry(key: "headers", value: json.fromTextMap(reply.headers)),
+      MapEntry(key: "body", value: Json.Text(reply.body)),
+      MapEntry(key: "delayMs", value: Json.Number(reply.delayMs.toFloat())),
+      MapEntry(key: "errorEvery", value: Json.Number(reply.errorEvery.toFloat())),
+      MapEntry(key: "errorStatus", value: Json.Number(reply.errorStatus.toFloat())),
+      MapEntry(key: "errorBody", value: Json.Text(reply.errorBody)),
+    ),
+  )
+}
+
+fn replyOf(value: Json) -> Reply {
+  Reply(
+    status: json.int(value, "status", 200),
+    headers: json.textMap(value, "headers"),
+    body: json.text(value, "body"),
+    delayMs: json.int(value, "delayMs", 0),
+    errorEvery: json.int(value, "errorEvery", 0),
+    errorStatus: json.int(value, "errorStatus", 500),
+    errorBody: json.text(value, "errorBody"),
+  )
+}
+
+/// Endpoint `id`'s reply.
+fn loadReply(id: String) -> Reply {
+  match kv.get("reply:{id}") {
+    Some(stored) => match json.parse(stored) {
+      Ok(value) => replyOf(value)
+      Err(_) => defaultReply()
+    }
+    None => defaultReply()
+  }
+}
+
+fn saveReply(id: String, reply: Reply) -> Result<Unit, Error> {
+  kv.put("reply:{id}", json.render(replyJson(reply)))
+}
+
+/// What the endpoint does with its `count`-th request: the status, and
+/// whether it is one of the failures.
+struct Decision {
+  status: Int
+  failing: Bool
+  count: Int
+}
+
+/// Counts a request against endpoint `id`'s schedule and decides its answer.
+fn decide(id: String, reply: Reply) -> Decision {
+  let count = kv.increment("count:{id}", 1).unwrapOr(0)
+  let failing = reply.errorEvery > 0 && count > 0 && count % reply.errorEvery == 0
+  Decision(
+    status: if failing { reply.errorStatus } else { reply.status },
+    failing: failing,
+    count: count,
+  )
+}
+
+/// Waits the reply's delay, parked.
+fn delay(reply: Reply) {
+  if reply.delayMs > 0 {
+    timer.sleep(reply.delayMs)
+  }
+}
+
+/// A settings form as a reply, or what is wrong with it.
+fn replyFromForm(form: Map<String, String>) -> Result<Reply, Error> {
+  var problems = Vector.of()
+  let status = whole(form, "status", 200, 100, 599, "status", var problems)
+  let delayMs = whole(form, "delayMs", 0, 0, maxDelayMs(), "delay", var problems)
+  let errorEvery = whole(form, "errorEvery", 0, 0, 1000000, "error every", var problems)
+  let errorStatus = whole(form, "errorStatus", 500, 100, 599, "error status", var problems)
+  let headers = parseHeaders(form.get("headers").unwrapOr(""), var problems)
+  if problems.length() > 0 {
+    return Err(Error("; ".join(problems.freeze())))
+  }
+  Ok(
+    Reply(
+      status: status,
+      headers: headers,
+      body: form.get("body").unwrapOr(""),
+      delayMs: delayMs,
+      errorEvery: errorEvery,
+      errorStatus: errorStatus,
+      errorBody: form.get("errorBody").unwrapOr(""),
+    ),
+  )
+}
+
+/// The form field `name` as a whole number from `least` to `most`, or
+/// `fallback` when it is empty; a problem noted otherwise.
+fn whole(
+  form: Map<String, String>,
+  name: String,
+  fallback: Int,
+  least: Int,
+  most: Int,
+  label: String,
+  var problems: Vector<String>,
+) -> Int {
+  let given = form.get(name).unwrapOr("").trim()
+  if given == "" {
+    return fallback
+  }
+  match Int.parse(given) {
+    Ok(value) => {
+      if value < least || value > most {
+        problems.push("{label} must be {least} to {most}")
+        fallback
+      } else {
+        value
+      }
+    }
+    Err(_) => {
+      problems.push("{label} must be a whole number")
+      fallback
+    }
+  }
+}
+
+/// `Name: value` lines as headers. A name must be letters, digits and `-`;
+/// a blank line is skipped; anything else is a problem noted.
+fn parseHeaders(lines: String, var problems: Vector<String>) -> Map<String, String> {
+  var headers: Map<String, String> = Map.of()
+  for raw in lines.split("\n") {
+    let line = raw.trim()
+    if line != "" {
+      let parts = line.split(":")
+      let name = parts.get(0).unwrapOr("").trim().toLower()
+      let value = ":".join(parts.slice(1, parts.length())).trim()
+      if parts.length() < 2 || !isHeaderName(name) {
+        problems.push("`{line}` is not a `Name: value` header")
+      } else {
+        headers = headers.inserted(name, value)
+      }
+    }
+  }
+  headers
+}
+
+/// Whether `name` is letters, digits and `-` only, and not empty.
+fn isHeaderName(name: String) -> Bool {
+  if name == "" {
+    return false
+  }
+  let end = name.byteLength()
+  var at = 0
+  while at < end {
+    let byte = name.byteAt(at)
+    let letter = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90)
+    let digit = byte >= 48 && byte <= 57
+    if !letter && !digit && byte != 45 {
+      return false
+    }
+    at += 1
+  }
+  true
+}
+
+/// The headers as the settings form shows them, one `Name: value` a line.
+fn headerLines(headers: Map<String, String>) -> String {
+  var lines = Vector.of()
+  for entry in headers {
+    lines.push("{entry.key}: {entry.value}")
+  }
+  "\n".join(lines.freeze())
+}
