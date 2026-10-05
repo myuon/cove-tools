@@ -1,0 +1,397 @@
+use rng
+
+// Simulated annealing on a small travelling-salesman problem: points in the
+// unit square from a seed, a tour through all of them, and 2-opt moves
+// accepted by the Metropolis rule under a falling temperature.
+//
+// - `points` makes the problem from its seed; `circle` makes one whose
+//   optimum is known (the points in order around the circle).
+// - `run` anneals from the tour 0, 1, …, n−1 with its own seed, so two runs
+//   on one problem differ only by their parameters and their seed, and
+//   records the tour length — current and best — at evenly spaced
+//   iterations, for the chart.
+// - `exp` is here because the standard library has none.
+//
+// Like the other algorithms it writes no lambda, calls no host, compares
+// no strings and copies no vector with `toVector`/`snapshot`, so on the
+// native tier all of it has machine code and a long run yields (see the
+// README).
+
+/// A problem: `n` points, `xs[i]`, `ys[i]` in [0, 1).
+export struct Problem {
+  xs: Array<Float>
+  ys: Array<Float>
+  origin: String
+}
+
+/// How the temperature falls from `start` to `end` over the run.
+export enum Schedule {
+  /// `start · (end / start)^(t / iterations)`: the same factor each step.
+  Geometric
+  /// `start + (end − start) · t / iterations`.
+  Linear
+}
+
+/// One run's settings.
+export struct Settings {
+  seed: Int
+  iterations: Int
+  start: Float
+  end: Float
+  schedule: Schedule
+  /// How many points of the trajectory to record (the chart's x).
+  samples: Int
+}
+
+/// One recorded point of a run.
+export struct Sample {
+  iteration: Int
+  current: Float
+  best: Float
+  temperature: Float
+}
+
+/// What a run came to.
+export struct Annealed {
+  /// The best tour found, as point indices.
+  tour: Array<Int>
+  length: Float
+  /// The tour the run ended on, and its length.
+  finalLength: Float
+  startLength: Float
+  accepted: Int
+  improving: Int
+  trajectory: Array<Sample>
+}
+
+// --------------------------------------------------------------- problems
+
+/// `n` points uniformly in the unit square; the same for the same seed.
+export fn points(n: Int, seed: Int) -> Problem {
+  var generator = rng.seeded(seed)
+  var xs = Vector.of()
+  var ys = Vector.of()
+  var i = 0
+  while i < n {
+    xs.push(generator.unit())
+    ys.push(generator.unit())
+    i += 1
+  }
+  Problem(xs: xs.freeze(), ys: ys.freeze(), origin: "{n} random points, seed {seed}")
+}
+
+/// `n` points evenly on a circle of radius 0.45 around the centre, in a
+/// scrambled order: the best tour visits them around the circle, and its
+/// length is `n · 2 · 0.45 · sin(π / n)`.
+export fn circle(n: Int, seed: Int) -> Problem {
+  var generator = rng.seeded(seed)
+  // A random order of the positions: Fisher–Yates.
+  var order = Vector.of()
+  var i = 0
+  while i < n {
+    order.push(i)
+    i += 1
+  }
+  i = n - 1
+  while i > 0 {
+    let j = generator.below(i + 1)
+    let a = order.get(i).unwrapOr(0)
+    order.set(i, order.get(j).unwrapOr(0))
+    order.set(j, a)
+    i -= 1
+  }
+  var xs = Vector.of()
+  var ys = Vector.of()
+  for position in order {
+    let angle = 2.0 * pi() * position.toFloat() / n.toFloat()
+    xs.push(0.5 + 0.45 * cosine(angle))
+    ys.push(0.5 + 0.45 * sine(angle))
+  }
+  Problem(xs: xs.freeze(), ys: ys.freeze(), origin: "{n} points on a circle, shuffled with seed {seed}")
+}
+
+/// The length of the best tour of `circle(n, _)`.
+export fn circleOptimum(n: Int) -> Float {
+  n.toFloat() * 2.0 * 0.45 * sine(pi() / n.toFloat())
+}
+
+// ------------------------------------------------------------------- math
+
+/// π.
+export fn pi() -> Float {
+  3.141592653589793
+}
+
+/// e^x, for any `x`: x = k ln 2 + r with |r| ≤ ln 2 / 2, e^r by its series
+/// to 1e-16, times 2^k. Below −745 it is 0, as a double's is.
+export fn exp(x: Float) -> Float {
+  if x < -745.0 {
+    return 0.0
+  }
+  if x > 709.0 {
+    return 1.0 / 0.0
+  }
+  let ln2 = 0.6931471805599453
+  let k = match (x / ln2 + if x < 0.0 { -0.5 } else { 0.5 }).toInt() {
+    Ok(whole) => whole
+    Err(_) => 0
+  }
+  let r = x - k.toFloat() * ln2
+  var term = 1.0
+  var sum = 1.0
+  var n = 1
+  while n < 20 {
+    term = term * r / n.toFloat()
+    sum = sum + term
+    n += 1
+  }
+  var scale = 1.0
+  var steps = k.abs()
+  let factor = if k < 0 { 0.5 } else { 2.0 }
+  while steps > 0 {
+    scale = scale * factor
+    steps -= 1
+  }
+  sum * scale
+}
+
+/// sin x, by reduction to [−π, π] and its series.
+export fn sine(x: Float) -> Float {
+  var y = x
+  let turn = 2.0 * pi()
+  while y > pi() {
+    y = y - turn
+  }
+  while y < 0.0 - pi() {
+    y = y + turn
+  }
+  var term = y
+  var sum = y
+  var n = 1
+  while n < 14 {
+    term = 0.0 - term * y * y / ((2 * n) * (2 * n + 1)).toFloat()
+    sum = sum + term
+    n += 1
+  }
+  sum
+}
+
+/// cos x.
+export fn cosine(x: Float) -> Float {
+  sine(x + pi() / 2.0)
+}
+
+// -------------------------------------------------------------------- run
+
+fn distance(problem: Problem, a: Int, b: Int) -> Float {
+  let dx = problem.xs.get(a).unwrapOr(0.0) - problem.xs.get(b).unwrapOr(0.0)
+  let dy = problem.ys.get(a).unwrapOr(0.0) - problem.ys.get(b).unwrapOr(0.0)
+  (dx * dx + dy * dy).sqrt()
+}
+
+/// The length of `tour`, closed.
+export fn tourLength(problem: Problem, tour: Array<Int>) -> Float {
+  let n = tour.length()
+  var total = 0.0
+  var i = 0
+  while i < n {
+    total = total + distance(problem, tour.get(i).unwrapOr(0), tour.get((i + 1) % n).unwrapOr(0))
+    i += 1
+  }
+  total
+}
+
+/// Whether `tour` visits every point of `problem` exactly once.
+export fn isTour(problem: Problem, tour: Array<Int>) -> Bool {
+  let n = problem.xs.length()
+  if tour.length() != n {
+    return false
+  }
+  var seen = Vector.of()
+  var i = 0
+  while i < n {
+    seen.push(false)
+    i += 1
+  }
+  for city in tour {
+    if city < 0 || city >= n || seen.get(city).unwrapOr(true) {
+      return false
+    }
+    seen.set(city, true)
+  }
+  true
+}
+
+/// The greedy tour from point 0: always the nearest unvisited point. A
+/// reference for the chart.
+export fn nearestNeighbour(problem: Problem) -> Array<Int> {
+  let n = problem.xs.length()
+  var visited = Vector.of()
+  var i = 0
+  while i < n {
+    visited.push(false)
+    i += 1
+  }
+  var tour = Vector.of(0)
+  visited.set(0, true)
+  var at = 0
+  while tour.length() < n {
+    var best = -1
+    var bestDistance = 0.0
+    var j = 0
+    while j < n {
+      if !visited.get(j).unwrapOr(true) {
+        let d = distance(problem, at, j)
+        if best == -1 || d < bestDistance {
+          best = j
+          bestDistance = d
+        }
+      }
+      j += 1
+    }
+    visited.set(best, true)
+    tour.push(best)
+    at = best
+  }
+  tour.freeze()
+}
+
+/// The temperature at iteration `t` of `settings`.
+export fn temperature(settings: Settings, t: Int) -> Float {
+  let fraction = t.toFloat() / settings.iterations.toFloat()
+  match settings.schedule {
+    Schedule.Linear => settings.start + (settings.end - settings.start) * fraction
+    Schedule.Geometric => settings.start * exp(fraction * ln(settings.end / settings.start))
+  }
+}
+
+/// ln x for x > 0: x = m · 2^e with m in [0.75, 1.5), and ln m by the series
+/// of atanh((m − 1) / (m + 1)).
+export fn ln(x: Float) -> Float {
+  if x <= 0.0 {
+    return 0.0 - 1.0 / 0.0
+  }
+  var m = x
+  var e = 0
+  while m >= 1.5 {
+    m = m / 2.0
+    e += 1
+  }
+  while m < 0.75 {
+    m = m * 2.0
+    e -= 1
+  }
+  let s = (m - 1.0) / (m + 1.0)
+  let s2 = s * s
+  var term = s
+  var sum = 0.0
+  var k = 0
+  while k < 30 {
+    sum = sum + term / (2 * k + 1).toFloat()
+    term = term * s2
+    k += 1
+  }
+  2.0 * sum + e.toFloat() * 0.6931471805599453
+}
+
+/// Anneals `problem` from the tour 0, 1, …, n−1.
+///
+/// Each iteration picks two positions `i < j` and considers reversing the
+/// tour between them (a 2-opt move), which changes the length by
+/// `d(a, c) + d(b, e) − d(a, b) − d(c, e)` where `a`…`e` are the cities
+/// around the cut. A move that shortens the tour is taken; one that
+/// lengthens it by `Δ` is taken with probability `e^(−Δ / T)`.
+export fn run(problem: Problem, settings: Settings) -> Annealed {
+  let n = problem.xs.length()
+  var tour = Vector.of()
+  var k = 0
+  while k < n {
+    tour.push(k)
+    k += 1
+  }
+  var current = tourLength(problem, tour.toArray())
+  let startLength = current
+  var best = current
+  var bestTour = tour.toArray()
+  var generator = rng.seeded(settings.seed)
+  var accepted = 0
+  var improving = 0
+  var samples = Vector.of()
+  let every = (settings.iterations / settings.samples.max(1)).max(1)
+  samples.push(Sample(iteration: 0, current: current, best: best, temperature: temperature(settings, 0)))
+  // The temperature, stepped rather than recomputed: by a constant factor
+  // (geometric) or a constant amount (linear) per iteration.
+  var heat = settings.start
+  let factor = exp(ln(settings.end / settings.start) / settings.iterations.toFloat())
+  let step = (settings.end - settings.start) / settings.iterations.toFloat()
+  let geometric = match settings.schedule {
+    Schedule.Geometric => true
+    Schedule.Linear => false
+  }
+  var t = 1
+  while t <= settings.iterations && n >= 4 {
+    if geometric {
+      heat = heat * factor
+    } else {
+      heat = heat + step
+    }
+    var i = generator.below(n)
+    var j = generator.below(n)
+    if i > j {
+      let swap = i
+      i = j
+      j = swap
+    }
+    // Reversing all but one city, or nothing, changes nothing.
+    if j - i >= 1 && j - i < n - 1 {
+      let a = tour.get((i + n - 1) % n).unwrapOr(0)
+      let b = tour.get(i).unwrapOr(0)
+      let c = tour.get(j).unwrapOr(0)
+      let e = tour.get((j + 1) % n).unwrapOr(0)
+      let delta = distance(problem, a, c) + distance(problem, b, e) - distance(problem, a, b) - distance(problem, c, e)
+      var take = delta < 0.0
+      // A move worse by more than 40 temperatures has a chance below
+      // e^-40: not worth the exponential.
+      if !take && heat > 0.0 && delta < 40.0 * heat {
+        take = generator.unit() < exp(0.0 - delta / heat)
+      }
+      if take {
+        var low = i
+        var high = j
+        while low < high {
+          let x = tour.get(low).unwrapOr(0)
+          tour.set(low, tour.get(high).unwrapOr(0))
+          tour.set(high, x)
+          low += 1
+          high -= 1
+        }
+        current = current + delta
+        accepted += 1
+        if delta < 0.0 {
+          improving += 1
+        }
+        if current < best - 0.000000001 {
+          // A new best: kept as it is. O(n), and rare once the run cools.
+          best = current
+          bestTour = tour.toArray()
+        }
+      }
+    }
+    if t % every == 0 || t == settings.iterations {
+      samples.push(Sample(iteration: t, current: current, best: best, temperature: heat))
+    }
+    t += 1
+  }
+  // Lengths recomputed from the tours, not the running sums the moves
+  // kept, so rounding in a long run does not reach the answer.
+  let finalLength = tourLength(problem, tour.toArray())
+  Annealed(
+    tour: bestTour,
+    length: tourLength(problem, bestTour),
+    finalLength: finalLength,
+    startLength: startLength,
+    accepted: accepted,
+    improving: improving,
+    trajectory: samples.freeze(),
+  )
+}

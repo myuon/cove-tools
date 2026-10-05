@@ -54,7 +54,7 @@ fn css() -> String {
 /// The page around `content`; `here` is the nav entry to mark.
 fn layout(base: String, title: String, here: String, content: String) -> String {
   var nav = Vector.of()
-  for entry in [["matching", "Matching"], ["sat", "SAT"]] {
+  for entry in [["matching", "Matching"], ["sat", "SAT"], ["anneal", "Annealing"]] {
     let path = entry.get(0).unwrapOr("")
     let name = entry.get(1).unwrapOr("")
     let mark = if path == here { " class=here" } else { "" }

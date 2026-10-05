@@ -1,0 +1,455 @@
+use web
+use anneal
+use anneal.Problem
+use anneal.Settings
+use anneal.Annealed
+use anneal.Sample
+use anneal.Schedule
+use draw
+
+// The annealing page: one problem, two runs of it with their own settings,
+// side by side — the trajectory of both on one chart, both tours, and the
+// table view.
+
+/// One built-in comparison: the fields it sets.
+struct AnnealExample {
+  name: String
+  title: String
+  fields: Map<String, String>
+}
+
+fn field(key: String, value: String) -> MapEntry<String, String> {
+  MapEntry(key: key, value: value)
+}
+
+fn annealExamples() -> Array<AnnealExample> {
+  [
+    AnnealExample(
+      name: "cooling",
+      title: "annealed against quenched: 60 points, a hot start against a cold one",
+      fields: Map.of(field("a_start", "0.5"), field("b_start", "0.002")),
+    ),
+    AnnealExample(
+      name: "schedules",
+      title: "geometric against linear cooling, the same temperatures",
+      fields: Map.of(field("b_schedule", "linear"), field("b_start", "0.5")),
+    ),
+    AnnealExample(
+      name: "seeds",
+      title: "the same settings, two seeds: how much is luck",
+      fields: Map.of(field("b_seed", "2"), field("b_start", "0.5")),
+    ),
+    AnnealExample(
+      name: "circle",
+      title: "40 points on a circle, shuffled: the optimum is known",
+      fields: Map.of(field("problem", "circle"), field("n", "40"), field("b_start", "0.5"), field("b_iterations", "20000")),
+    ),
+    AnnealExample(
+      name: "long",
+      title: "200 points, 200,000 iterations each (about 70% of the fuel budget)",
+      fields: Map.of(field("n", "200"), field("a_iterations", "200000"), field("b_iterations", "200000"), field("b_start", "0.5"), field("b_seed", "2")),
+    ),
+    AnnealExample(
+      name: "heavy",
+      title: "500 points, 5,000,000 iterations each (runs out of fuel)",
+      fields: Map.of(field("n", "500"), field("a_iterations", "5000000"), field("b_iterations", "5000000"), field("b_start", "0.5"), field("b_seed", "2")),
+    ),
+  ]
+}
+
+/// The form's defaults, under any example or request.
+fn annealDefaults() -> Map<String, String> {
+  Map.of(
+    field("problem", "random"),
+    field("n", "60"),
+    field("pseed", "1"),
+    field("a_seed", "1"),
+    field("a_iterations", "200000"),
+    field("a_start", "0.5"),
+    field("a_end", "0.001"),
+    field("a_schedule", "geometric"),
+    field("b_seed", "1"),
+    field("b_iterations", "200000"),
+    field("b_start", "0.002"),
+    field("b_end", "0.001"),
+    field("b_schedule", "geometric"),
+  )
+}
+
+/// The largest problem and run the page takes.
+fn maxPoints() -> Int {
+  500
+}
+
+fn maxIterations() -> Int {
+  5000000
+}
+
+/// `GET` or `POST /anneal`, as `/matching` is.
+fn annealPage(base: String, given: Map<String, String>, post: Bool) -> web.Response {
+  var fields = annealDefaults()
+  var chosen = false
+  let exampleName = given.get("example").unwrapOr("")
+  for example in annealExamples() {
+    if example.name == exampleName {
+      for entry in example.fields {
+        fields = fields.inserted(entry.key, entry.value)
+      }
+      chosen = true
+    }
+  }
+  for entry in given {
+    // `!(a == b)` rather than `a != b`: the native tier lowers a `String`
+    // `==` and not a `!=`, and this function is above every run.
+    if !(entry.key == "example") && !(entry.key == "part") {
+      fields = fields.inserted(entry.key, entry.value)
+      chosen = true
+    }
+  }
+  let part = given.get("part").unwrapOr("") == "result"
+  let title = "Simulated annealing"
+  if post || part {
+    let result = annealResult(fields)
+    if part {
+      return htmlResponse(200, result)
+    }
+    return htmlResponse(200, page(base, "anneal", title, annealForm(base, fields), resultSection(result)))
+  }
+  let result = if chosen { pendingSection() } else { resultSection("<p class=muted>Pick an example, or set two runs and compare them.</p>") }
+  htmlResponse(200, page(base, "anneal", title, annealForm(base, fields), result))
+}
+
+fn value(fields: Map<String, String>, key: String) -> String {
+  fields.get(key).unwrapOr("")
+}
+
+fn annealForm(base: String, fields: Map<String, String>) -> String {
+  var examples = Vector.of()
+  for example in annealExamples() {
+    examples.push("<li><a href=\"{h(base)}/anneal?example={example.name}\">{h(example.name)}</a> — {h(example.title)}</li>")
+  }
+  let problem = value(fields, "problem")
+  let circleChecked = if problem == "circle" { " checked" } else { "" }
+  let randomChecked = if problem == "circle" { "" } else { " checked" }
+  let runFields = fn(prefix: String, name: String, colour: Int) {
+    let geometric = if value(fields, "{prefix}_schedule") == "linear" { "" } else { " selected" }
+    let linear = if value(fields, "{prefix}_schedule") == "linear" { " selected" } else { "" }
+    "<fieldset><legend><svg width=\"26\" height=\"10\" aria-hidden=true><line x1=\"1\" y1=\"5\" x2=\"25\" y2=\"5\" stroke=\"{draw.colour(colour)}\" stroke-width=\"2.5\"{dashOf(colour)}/></svg> Run {name}</legend><label>seed <input type=number name={prefix}_seed value=\"{h(value(fields, "{prefix}_seed"))}\"></label><label>iterations <input type=number name={prefix}_iterations min=1 max={maxIterations()} value=\"{h(value(fields, "{prefix}_iterations"))}\"></label><label>temperature from <input type=text inputmode=decimal size=7 name={prefix}_start value=\"{h(value(fields, "{prefix}_start"))}\"> to <input type=text inputmode=decimal size=7 name={prefix}_end value=\"{h(value(fields, "{prefix}_end"))}\"></label><label>schedule <select name={prefix}_schedule><option value=geometric{geometric}>geometric</option><option value=linear{linear}>linear</option></select></label></fieldset>"
+  }
+  "<form class=run method=post action=\"{h(base)}/anneal\"><div><fieldset><legend>Problem: a tour through every point</legend><label><input type=radio name=problem value=random{randomChecked}> random points in the unit square</label><label><input type=radio name=problem value=circle{circleChecked}> points on a circle, shuffled (the optimum is known)</label><label>points <input type=number name=n min=4 max={maxPoints()} value=\"{h(value(fields, "n"))}\"></label><label>problem seed <input type=number name=pseed value=\"{h(value(fields, "pseed"))}\"></label></fieldset><div class=pair>{runFields("a", "A", 0)}{runFields("b", "B", 1)}</div><div class=buttons><button type=submit>Run both</button><button type=button class=cancel hidden>Cancel</button></div></div><div><fieldset><legend>Examples</legend><ul class=examples>{"".join(examples.freeze())}</ul></fieldset><details class=note><summary>What runs</summary><p>Both runs start from the tour 0, 1, …, n−1. Each iteration proposes a 2-opt move — reverse the tour between two random positions — and takes it if it is shorter, or with probability e<sup>−Δ/T</sup> if it is longer by Δ. T falls from the first temperature to the second over the run, by the same factor each step (geometric) or the same amount (linear). Every random choice comes from the run's seed, so a seed and its settings are always the same run.</p><p>At most {maxPoints()} points and {grouped(maxIterations())} iterations a run.</p></details></div></form>"
+}
+
+/// The dash pattern of run `index`: A solid, B dashed, so the two differ by
+/// more than colour.
+fn dashOf(index: Int) -> String {
+  if index == 0 { "" } else { " stroke-dasharray=\"6 4\"" }
+}
+
+/// What a form says, read, or why it cannot be.
+enum Asked {
+  Ok(Settings)
+  Invalid(String)
+}
+
+fn settingsOf(fields: Map<String, String>, prefix: String, name: String) -> Asked {
+  let seed = Int.parse(value(fields, "{prefix}_seed")).unwrapOr(-1)
+  let iterations = Int.parse(value(fields, "{prefix}_iterations")).unwrapOr(-1)
+  let start = Float.parse(value(fields, "{prefix}_start")).unwrapOr(-1.0)
+  let end = Float.parse(value(fields, "{prefix}_end")).unwrapOr(-1.0)
+  if seed < 0 {
+    return Asked.Invalid("run {name}'s seed is a whole number, 0 or more")
+  }
+  if iterations < 1 || iterations > maxIterations() {
+    return Asked.Invalid("run {name} takes 1 to {grouped(maxIterations())} iterations")
+  }
+  if !(start > 0.0) || !(end > 0.0) || start > 1000.0 || end > 1000.0 {
+    return Asked.Invalid("run {name}'s temperatures are numbers above 0 and at most 1000")
+  }
+  let schedule = if value(fields, "{prefix}_schedule") == "linear" { Schedule.Linear } else { Schedule.Geometric }
+  Asked.Ok(Settings(seed: seed, iterations: iterations, start: start, end: end, schedule: schedule, samples: 200))
+}
+
+/// One run, timed on the app's clock.
+struct TimedRun {
+  name: String
+  settings: Settings
+  done: Annealed
+  micros: Int
+}
+
+fn timedRun(problem: Problem, name: String, settings: Settings) -> TimedRun {
+  let started = now()
+  let done = anneal.run(problem, settings)
+  TimedRun(name: name, settings: settings, done: done, micros: now() - started)
+}
+
+fn annealResult(fields: Map<String, String>) -> String {
+  let n = Int.parse(value(fields, "n")).unwrapOr(-1)
+  let pseed = Int.parse(value(fields, "pseed")).unwrapOr(-1)
+  if n < 4 || n > maxPoints() {
+    return stopNote("Not run:", "a problem has 4 to {maxPoints()} points")
+  }
+  if pseed < 0 {
+    return stopNote("Not run:", "the problem seed is a whole number, 0 or more")
+  }
+  let a = match settingsOf(fields, "a", "A") {
+    Asked.Ok(settings) => settings
+    Asked.Invalid(why) => return stopNote("Not run:", why)
+  }
+  let b = match settingsOf(fields, "b", "B") {
+    Asked.Ok(settings) => settings
+    Asked.Invalid(why) => return stopNote("Not run:", why)
+  }
+  let onCircle = value(fields, "problem") == "circle"
+  let problem = if onCircle { anneal.circle(n, pseed) } else { anneal.points(n, pseed) }
+  let greedy = anneal.tourLength(problem, anneal.nearestNeighbour(problem))
+  let optimum = if onCircle { Some(anneal.circleOptimum(n)) } else { None }
+  let runA = timedRun(problem, "A", a)
+  let runB = timedRun(problem, "B", b)
+  let runs = [runA, runB]
+  var problems = Vector.of()
+  for one in runs {
+    if !anneal.isTour(problem, one.done.tour) {
+      problems.push("run {one.name}'s answer is not a tour")
+    }
+  }
+  let checked = if problems.length() == 0 {
+    "<div class=ok data-checked=true><strong>{h(winner(runA, runB))}</strong> Both answers are tours through all {n} points, and their lengths are recomputed from the tours. {h(reference(greedy, optimum, runA, runB))}</div>"
+  } else {
+    "<div class=stop data-checked=false><strong>{h(", ".join(problems.freeze()))}</strong></div>"
+  }
+  var rows = Vector.of()
+  rows.push(["problem", "{h(problem.origin)} · greedy nearest-neighbour tour {length(greedy)}{optimumText(optimum)}"])
+  for one in runs {
+    let done = one.done
+    rows.push([
+      "run {one.name}",
+      "best <strong>{length(done.length)}</strong> (from {length(done.startLength)}; ended on {length(done.finalLength)}) · {grouped(one.settings.iterations)} iterations, {grouped(done.accepted)} moves taken ({grouped(done.improving)} shorter) · T {one.settings.start} → {one.settings.end} {scheduleName(one.settings.schedule)}, seed {one.settings.seed} · {showMicros(one.micros)}",
+    ])
+  }
+  "{checked}{summary(rows.freeze())}{trajectoryChart(runs, greedy, optimum)}<div class=pair>{tourPicture(problem, runA, 0)}{tourPicture(problem, runB, 1)}</div>{trajectoryTable(runs)}"
+}
+
+fn scheduleName(schedule: Schedule) -> String {
+  match schedule {
+    Schedule.Geometric => "geometric"
+    Schedule.Linear => "linear"
+  }
+}
+
+fn length(value: Float) -> String {
+  value.format(4)
+}
+
+fn optimumText(optimum: Option<Float>) -> String {
+  match optimum {
+    Some(best) => " · the optimum, around the circle, {length(best)}"
+    None => ""
+  }
+}
+
+fn winner(a: TimedRun, b: TimedRun) -> String {
+  let difference = a.done.length - b.done.length
+  if difference.abs() < 0.0000001 {
+    "The two runs found tours of the same length."
+  } else if difference < 0.0 {
+    "Run A's tour is shorter, by {(0.0 - difference / b.done.length * 100.0).format(2)}%."
+  } else {
+    "Run B's tour is shorter, by {(difference / a.done.length * 100.0).format(2)}%."
+  }
+}
+
+fn reference(greedy: Float, optimum: Option<Float>, a: TimedRun, b: TimedRun) -> String {
+  let best = a.done.length.min(b.done.length)
+  match optimum {
+    Some(known) => {
+      let gap = (best - known) / known * 100.0
+      if gap < 0.0000001 {
+        "The better one is the known optimum."
+      } else {
+        "The better one is {gap.format(2)}% above the known optimum."
+      }
+    }
+    None => "The better one is {((greedy - best) / greedy * 100.0).format(1)}% shorter than the greedy tour."
+  }
+}
+
+/// The trajectory of both runs on one axis: the tour length the run was
+/// on at each recorded iteration (and, thinner, the best so far), against
+/// the iteration as a share of the run; the greedy tour and a known optimum
+/// as reference lines.
+fn trajectoryChart(runs: Array<TimedRun>, greedy: Float, optimum: Option<Float>) -> String {
+  let width = 760.0
+  let height = 320.0
+  let left = 70.0
+  let right = 150.0
+  let top = 40.0
+  let bottom = 46.0
+  let plotWidth = width - left - right
+  let plotHeight = height - top - bottom
+  var least = greedy
+  var most = greedy
+  for one in runs {
+    for sample in one.done.trajectory {
+      least = least.min(sample.best)
+      most = most.max(sample.current)
+    }
+  }
+  match optimum {
+    Some(known) => {
+      least = least.min(known)
+    }
+    None => {}
+  }
+  let axis = scaleOf(least, most)
+  let yAt = fn(value: Float) {
+    top + plotHeight - (value - axis.low) / (axis.high - axis.low) * plotHeight
+  }
+  let xAt = fn(share: Float) {
+    left + share * plotWidth
+  }
+  var out = Vector.of()
+  out.push(draw.open(width, height, "tour length against the share of each run done, runs A and B"))
+  // The legend: each run's line, the best-so-far line, the references.
+  var x = left
+  var index = 0
+  for one in runs {
+    let colour = draw.colour(index)
+    out.push("<line x1=\"{draw.px(x)}\" y1=\"16\" x2=\"{draw.px(x + 22.0)}\" y2=\"16\" stroke=\"{colour}\" stroke-width=\"2\"{dashOf(index)}/>")
+    out.push(draw.label(x + 28.0, 20.0, "start", "run {one.name}"))
+    x = x + 90.0
+    index += 1
+  }
+  out.push("<line x1=\"{draw.px(x)}\" y1=\"16\" x2=\"{draw.px(x + 22.0)}\" y2=\"16\" stroke=\"{draw.secondary()}\" stroke-width=\"1\"/>")
+  out.push(draw.label(x + 28.0, 20.0, "start", "best so far (thin)"))
+  // The grid and the y-axis.
+  var tick = axis.low
+  var guard = 0
+  while tick <= axis.high + axis.step / 1000.0 && guard < 40 {
+    let y = yAt(tick)
+    out.push("<line x1=\"{draw.px(left)}\" y1=\"{draw.px(y)}\" x2=\"{draw.px(left + plotWidth)}\" y2=\"{draw.px(y)}\" stroke=\"{draw.grid()}\" stroke-width=\"1\"/>")
+    out.push("<text x=\"{draw.px(left - 8.0)}\" y=\"{draw.px(y + 4.0)}\" text-anchor=end fill=\"{draw.secondary()}\">{tick.format(1)}</text>")
+    tick = tick + axis.step
+    guard += 1
+  }
+  out.push("<line x1=\"{draw.px(left)}\" y1=\"{draw.px(top + plotHeight)}\" x2=\"{draw.px(left + plotWidth)}\" y2=\"{draw.px(top + plotHeight)}\" stroke=\"{draw.muted()}\" stroke-width=\"1\"/>")
+  out.push("<text transform=\"translate(16 {draw.px(top + plotHeight / 2.0)}) rotate(-90)\" text-anchor=middle fill=\"{draw.ink()}\">tour length</text>")
+  for share in [0.0, 0.25, 0.5, 0.75, 1.0] {
+    out.push(draw.note(xAt(share), top + plotHeight + 16.0, "middle", "{(share * 100.0).format(0)}%"))
+  }
+  out.push(draw.note(left + plotWidth / 2.0, height - 8.0, "middle", "share of the run done (each run's own iterations)"))
+  // The references, labelled at the right end in ink.
+  let referenceLine = fn(value: Float, name: String, lift: Float) {
+    let y = yAt(value)
+    "<g class=reference><line x1=\"{draw.px(left)}\" y1=\"{draw.px(y)}\" x2=\"{draw.px(left + plotWidth)}\" y2=\"{draw.px(y)}\" stroke=\"{draw.secondary()}\" stroke-width=\"1\" stroke-dasharray=\"2 3\"/>{draw.label(left + plotWidth + 6.0, y + 4.0 - lift, "start", "{name} {value.format(3)}")}</g>"
+  }
+  out.push(referenceLine(greedy, "greedy", 0.0))
+  match optimum {
+    Some(known) => {
+      // Above the greedy line's label when the two would overlap.
+      let lift = if (yAt(known) - yAt(greedy)).abs() < 14.0 { 14.0 } else { 0.0 }
+      out.push(referenceLine(known, "optimum", lift))
+    }
+    None => {}
+  }
+  // The runs.
+  index = 0
+  for one in runs {
+    let colour = draw.colour(index)
+    var current = Vector.of()
+    var best = Vector.of()
+    let total = one.settings.iterations.toFloat()
+    for sample in one.done.trajectory {
+      let share = sample.iteration.toFloat() / total
+      current.push("{draw.px(xAt(share))} {draw.px(yAt(sample.current))}")
+      best.push("{draw.px(xAt(share))} {draw.px(yAt(sample.best))}")
+    }
+    out.push("<path class=best data-run={one.name} d=\"M{"L".join(best.freeze())}\" fill=\"none\" stroke=\"{colour}\" stroke-width=\"1\" stroke-opacity=\"0.7\"{dashOf(index)}/>")
+    out.push("<path class=current data-run={one.name} d=\"M{"L".join(current.freeze())}\" fill=\"none\" stroke=\"{colour}\" stroke-width=\"2\" stroke-linejoin=\"round\"{dashOf(index)}><title>run {one.name}: from {length(one.done.startLength)} to a best of {length(one.done.length)}</title></path>")
+    let last = one.done.trajectory.get(one.done.trajectory.length() - 1).unwrapOr(Sample(iteration: 0, current: 0.0, best: 0.0, temperature: 0.0))
+    out.push(draw.marker(index, xAt(1.0), yAt(last.best), colour))
+    index += 1
+  }
+  out.push("</svg>")
+  "".join(out.freeze())
+}
+
+/// A value axis of round ticks, about five of them.
+struct Axis {
+  low: Float
+  high: Float
+  step: Float
+}
+
+fn scaleOf(least: Float, most: Float) -> Axis {
+  var low = least
+  var high = most
+  if high <= low {
+    low = low - 1.0
+    high = high + 1.0
+  }
+  let raw = (high - low) / 5.0
+  var power = 1.0
+  while power * 10.0 <= raw {
+    power = power * 10.0
+  }
+  while power > raw && power > 0.000001 {
+    power = power / 10.0
+  }
+  let fraction = raw / power
+  let step = if fraction <= 1.0 { power } else if fraction <= 2.0 { power * 2.0 } else if fraction <= 5.0 { power * 5.0 } else { power * 10.0 }
+  var start = 0.0
+  while start + step <= low {
+    start = start + step
+  }
+  var end = start
+  while end < high {
+    end = end + step
+  }
+  Axis(low: start, high: end, step: step)
+}
+
+/// A run's best tour over the points.
+fn tourPicture(problem: Problem, one: TimedRun, index: Int) -> String {
+  let size = 300.0
+  let pad = 14.0
+  let at = fn(v: Float) { pad + v * (size - 2.0 * pad) }
+  var out = Vector.of()
+  out.push(draw.open(size, size + 20.0, "run {one.name}'s best tour, length {length(one.done.length)}"))
+  out.push(draw.label(pad, 16.0, "start", "run {one.name}: {length(one.done.length)}"))
+  var points = Vector.of()
+  for city in one.done.tour {
+    points.push("{draw.px(at(problem.xs.get(city).unwrapOr(0.0)))} {draw.px(20.0 + at(problem.ys.get(city).unwrapOr(0.0)))}")
+  }
+  out.push("<path d=\"M{"L".join(points.freeze())}Z\" fill=\"none\" stroke=\"{draw.colour(index)}\" stroke-width=\"1.5\" stroke-linejoin=\"round\"{dashOf(index)}/>")
+  var i = 0
+  while i < problem.xs.length() {
+    out.push("<circle cx=\"{draw.px(at(problem.xs.get(i).unwrapOr(0.0)))}\" cy=\"{draw.px(20.0 + at(problem.ys.get(i).unwrapOr(0.0)))}\" r=\"2.5\" fill=\"{draw.ink()}\"><title>point {i}</title></circle>")
+    i += 1
+  }
+  out.push("</svg>")
+  "".join(out.freeze())
+}
+
+/// The table view: both trajectories, every tenth recorded point.
+fn trajectoryTable(runs: Array<TimedRun>) -> String {
+  let a = runs.get(0).unwrapOr(runs.get(1).unwrapOr(TimedRun(name: "", settings: Settings(seed: 0, iterations: 1, start: 1.0, end: 1.0, schedule: Schedule.Linear, samples: 1), done: Annealed(tour: [], length: 0.0, finalLength: 0.0, startLength: 0.0, accepted: 0, improving: 0, trajectory: []), micros: 0)))
+  let b = runs.get(1).unwrapOr(a)
+  var rows = Vector.of()
+  var k = 0
+  let count = a.done.trajectory.length().max(b.done.trajectory.length())
+  while k < count {
+    if k % 10 == 0 || k == count - 1 {
+      rows.push("<tr><td class=num>{(k * 100 / (count - 1).max(1))}%</td>{sampleCells(a.done.trajectory, k)}{sampleCells(b.done.trajectory, k)}</tr>")
+    }
+    k += 1
+  }
+  "<details class=table><summary>Table view: the trajectories</summary><table><tr><th class=num>done</th><th class=num>A iteration</th><th class=num>A T</th><th class=num>A current</th><th class=num>A best</th><th class=num>B iteration</th><th class=num>B T</th><th class=num>B current</th><th class=num>B best</th></tr>{"".join(rows.freeze())}</table></details>"
+}
+
+fn sampleCells(trajectory: Array<Sample>, at: Int) -> String {
+  match trajectory.get(at) {
+    Some(sample) => "<td class=num>{grouped(sample.iteration)}</td><td class=num>{sample.temperature.format(4)}</td><td class=num>{length(sample.current)}</td><td class=num>{length(sample.best)}</td>"
+    None => "<td></td><td></td><td></td><td></td>"
+  }
+}
