@@ -37,6 +37,9 @@ impl Drop for Apps {
     }
 }
 
+/// The admin token every test host is started with.
+pub const ADMIN_TOKEN: &str = "test-admin-token";
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// One app of a test's apps directory: `name`, whose `.cove` files are
@@ -117,6 +120,8 @@ pub fn options(apps: &Apps, workers: usize) -> ServeOptions {
     options.workers = workers;
     options.quiet = true;
     options.data = Some(apps.data.clone());
+    options.admin = Some("127.0.0.1:0".to_string());
+    options.admin_token = Some(ADMIN_TOKEN.to_string());
     // `COVE_HOST_TEST_BACKEND=vm` runs the suite on the encoded VM where the
     // native tier would otherwise be chosen.
     if let Ok(backend) = std::env::var("COVE_HOST_TEST_BACKEND") {

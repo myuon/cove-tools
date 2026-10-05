@@ -1,0 +1,24 @@
+use web
+use timer
+
+/// Answers which version of the source it is: `/sleep?ms=` after parking
+/// that long, `/spin?turns=` after counting that far, anything else at once.
+export fn handle(request: web.Request) -> web.Response {
+  if request.path == "/sleep" {
+    timer.sleep(Int.parse(request.query.get("ms").unwrapOr("0")).unwrapOr(0))
+  }
+  var spun = 0
+  if request.path == "/spin" {
+    spun = spin(Int.parse(request.query.get("turns").unwrapOr("0")).unwrapOr(0))
+  }
+  web.Response(status: 200, headers: Map.of(), body: "VERSION {spun}\n")
+}
+
+/// Counts to `turns`, for as long as that takes.
+fn spin(turns: Int) -> Int {
+  var done = 0
+  while done < turns {
+    done += 1
+  }
+  done
+}

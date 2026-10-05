@@ -1,0 +1,8 @@
+# The app the update tests load, change and load again. `VERSION` in its
+# source is replaced by the test with the version it writes.
+grant = ["timer"]
+
+[limits]
+fuel = 100000000000
+deadline = "60s"
+max_in_flight = 3
