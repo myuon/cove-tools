@@ -67,7 +67,9 @@ fi
 (cd "$work" && sha256sum -c "$name.sha256") || die "checksum mismatch for $name"
 version="${name#cove-host-}"
 version="${version%-x86_64-linux.tar.gz}"
-[ -n "$version" ] && [ "$version" != "$name" ] || die "cannot read a version from $name"
+if [ -z "$version" ] || [ "$version" = "$name" ]; then
+  die "cannot read a version from $name"
+fi
 
 # 2. Unpack into releases/<version>, and point current at it.
 mkdir -p "$ROOT/releases"
