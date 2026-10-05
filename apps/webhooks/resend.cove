@@ -1,0 +1,204 @@
+use kv
+use fetch
+use time
+use json
+use json.Json
+use text
+
+// Resending a stored request to another URL — one the app's `[fetch] allow`
+// admits — and keeping what came back.
+//
+// The request goes out as it was received: the same method, the same body,
+// and its headers less those that belong to the connection it arrived on
+// (`host`, `content-length`, `connection`, ...), the host's own
+// `x-forwarded-*`, `accept-encoding` (an answer this app could not decode),
+// and any header that was masked, whose stored value is a placeholder. The
+// run parks while the request is out. Whatever happens — a response with any
+// status, a refusal by the allowlist, a connection that failed, a timeout —
+// is stored as one attempt under the request, newest first.
+
+/// One resend of a stored request.
+struct Attempt {
+  id: String
+  at: Int
+  url: String
+  method: String
+  // A response came back (whatever its status).
+  ok: Bool
+  status: Int
+  headers: Map<String, String>
+  body: String
+  bytes: Int
+  truncated: Bool
+  // Why no response came back, when none did.
+  error: String
+  millis: Int
+}
+
+/// The headers a resend does not carry.
+fn notResent() -> Array<String> {
+  [
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-connection",
+    "accept-encoding",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-forwarded-prefix",
+  ]
+}
+
+/// How many resends of one request are kept.
+fn keptAttempts() -> Int {
+  20
+}
+
+/// The headers of `event` as a resend sends them.
+fn resentHeaders(event: Event) -> Map<String, String> {
+  var headers: Map<String, String> = Map.of()
+  for entry in event.headers {
+    if !notResent().contains(entry.key) && !event.masked.contains(entry.key) {
+      headers = headers.inserted(entry.key, entry.value)
+    }
+  }
+  headers
+}
+
+/// Sends `event` to `url` and stores the attempt.
+fn resend(endpoint: Endpoint, event: Event, url: String) -> Attempt {
+  let started = time.nowMillis()
+  let micros = time.nowMicros()
+  let id = text.padded(micros, 16)
+  let answer = fetch.request(event.method, url, resentHeaders(event), event.body)
+  let millis = time.nowMillis() - started
+  let attempt = match answer {
+    Ok(response) => {
+      let stored = text.truncateBytes(response.body, endpoint.maxBody)
+      Attempt(
+        id: id,
+        at: started,
+        url: url,
+        method: event.method,
+        ok: true,
+        status: response.status,
+        headers: response.headers,
+        body: stored,
+        bytes: response.body.byteLength(),
+        truncated: stored.byteLength() < response.body.byteLength(),
+        error: "",
+        millis: millis,
+      )
+    }
+    Err(error) => Attempt(
+      id: id,
+      at: started,
+      url: url,
+      method: event.method,
+      ok: false,
+      status: 0,
+      headers: Map.of(),
+      body: "",
+      bytes: 0,
+      truncated: false,
+      error: error.message,
+      millis: millis,
+    )
+  }
+  let key = "resend:{endpoint.id}:{event.id}:"
+  match kv.put("{key}{attempt.id}", json.render(attemptJson(attempt))) {
+    Ok(_) => {}
+    Err(_) => {}
+  }
+  // Keep the newest few.
+  let newest = kv.listDesc(key, "", keptAttempts())
+  match newest.get(keptAttempts() - 1) {
+    Some(oldest) => {
+      for older in kv.listDesc(key, oldest.key, 100) {
+        kv.delete(older.key)
+      }
+    }
+    None => {}
+  }
+  attempt
+}
+
+/// The resends of `event` of endpoint `id`, newest first.
+fn listResends(id: String, event: String) -> Array<Attempt> {
+  var attempts = Vector.of()
+  for entry in kv.listDesc("resend:{id}:{event}:", "", keptAttempts()) {
+    match json.parse(entry.value) {
+      Ok(value) => attempts.push(attemptOf(value))
+      Err(_) => {}
+    }
+  }
+  attempts.freeze()
+}
+
+/// Deletes every resend of `event` of endpoint `id`.
+fn clearResends(id: String, event: String) {
+  var more = true
+  while more {
+    let page = kv.list("resend:{id}:{event}:", "", 100)
+    for entry in page {
+      kv.delete(entry.key)
+    }
+    more = page.length() > 0
+  }
+}
+
+/// The last URL `event` was resent to, or `""`.
+fn lastTarget(attempts: Array<Attempt>) -> String {
+  match attempts.get(0) {
+    Some(last) => last.url
+    None => ""
+  }
+}
+
+fn attemptJson(attempt: Attempt) -> Json {
+  Json.Fields(
+    Map.of(
+      entry("id", Json.Text(attempt.id)),
+      entry("at", number(attempt.at)),
+      entry("atIso", Json.Text(text.isoTime(attempt.at))),
+      entry("url", Json.Text(attempt.url)),
+      entry("method", Json.Text(attempt.method)),
+      entry("ok", Json.Bool(attempt.ok)),
+      entry("status", number(attempt.status)),
+      entry("headers", json.fromTextMap(attempt.headers)),
+      entry("body", Json.Text(attempt.body)),
+      entry("bytes", number(attempt.bytes)),
+      entry("truncated", Json.Bool(attempt.truncated)),
+      entry("error", Json.Text(attempt.error)),
+      entry("millis", number(attempt.millis)),
+    ),
+  )
+}
+
+fn attemptOf(value: Json) -> Attempt {
+  Attempt(
+    id: json.text(value, "id"),
+    at: json.int(value, "at", 0),
+    url: json.text(value, "url"),
+    method: json.text(value, "method"),
+    ok: json.bool(value, "ok", false),
+    status: json.int(value, "status", 0),
+    headers: json.textMap(value, "headers"),
+    body: json.text(value, "body"),
+    bytes: json.int(value, "bytes", 0),
+    truncated: json.bool(value, "truncated", false),
+    error: json.text(value, "error"),
+    millis: json.int(value, "millis", 0),
+  )
+}
+
+/// A field of a JSON object.
+fn entry(key: String, value: Json) -> MapEntry<String, Json> {
+  MapEntry(key: key, value: value)
+}

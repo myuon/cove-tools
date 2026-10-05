@@ -9,6 +9,7 @@ use text
 //   endpoint:<id>           an endpoint's settings
 //   index:<id>:<event>      one received request's summary, for listing
 //   event:<id>:<event>      the request in full
+//   resend:<id>:<event>:<n> one resend of it, and what came back
 //
 // An event id is the time it arrived in microseconds, zero-padded to sixteen
 // digits — `time.nowMicros()`, which the host makes strictly increasing, so
@@ -237,8 +238,7 @@ fn clearEvents(id: String) -> Int {
     let page = kv.list("index:{id}:", "", 100)
     for entry in page {
       let event = entry.key.slice("index:{id}:".length(), entry.key.length())
-      kv.delete(entry.key)
-      kv.delete("event:{id}:{event}")
+      forgetEvent(id, event)
       deleted += 1
     }
     more = page.length() > 0
@@ -255,6 +255,13 @@ fn deleteEndpoint(id: String) -> Int {
 
 /// Deletes the event `event` of endpoint `id`; whether it was there.
 fn deleteEvent(id: String, event: String) -> Bool {
+  forgetEvent(id, event)
+}
+
+/// Deletes the event `event` of endpoint `id`: its record, its summary and
+/// every resend of it. Whether it was there.
+fn forgetEvent(id: String, event: String) -> Bool {
+  clearResends(id, event)
   kv.delete("event:{id}:{event}")
   kv.delete("index:{id}:{event}")
 }
@@ -277,8 +284,7 @@ fn trim(id: String, retention: Int) -> Int {
         let older = kv.listDesc(prefix, kept.key, 100)
         for entry in older {
           let event = entry.key.slice(prefix.length(), entry.key.length())
-          kv.delete(entry.key)
-          kv.delete("event:{id}:{event}")
+          forgetEvent(id, event)
           deleted += 1
         }
         more = older.length() > 0
