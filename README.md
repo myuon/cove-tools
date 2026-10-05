@@ -9,8 +9,9 @@ that runs them on one machine.
 - **`apps/`** — the sample apps: `hello` (pure), `crunch` (CPU-heavy),
   `slow` (waits on a timer that parks the run), `notes` (the persistent
   key-value store) and `proxy` (allowlisted outbound HTTP); and the real
-  apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2). A
-  benchmark ledger (#3) and an algorithm playground (#4) come next.
+  apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2), and
+  [**`ledger`**](apps/ledger/README.md), the bench ledger (#3). An algorithm
+  playground (#4) comes next.
 
 The host is Rust; the apps are Cove. Cove is a git dependency pinned to one
 commit (`rev` in the workspace `Cargo.toml`), and a change the compiler or

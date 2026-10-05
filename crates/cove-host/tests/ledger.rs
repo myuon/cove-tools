@@ -1,0 +1,566 @@
+//! The bench ledger (`apps/ledger`, issue #3) on a host started in-process:
+//! posting, validation, units, duplicates, persistence and escaping.
+
+mod common;
+
+use std::net::SocketAddr;
+
+use common::*;
+use serde_json::{json, Value as Json};
+
+const SECRET: &str = "test-ledger-secret";
+
+/// The sample's `app.toml` with the post secret given literally.
+fn config() -> String {
+    let shipped = std::fs::read_to_string(samples().join("ledger/app.toml")).unwrap();
+    let config = shipped.replace(
+        "post = { env = \"LEDGER_TOKEN\" }",
+        &format!("post = {{ value = \"{SECRET}\" }}"),
+    );
+    assert!(
+        config.contains(SECRET),
+        "the shipped app.toml changed shape"
+    );
+    config
+}
+
+fn ledger() -> Apps {
+    let config = config();
+    apps(&[AppSpec {
+        name: "ledger",
+        from: samples().join("ledger"),
+        config: Some(Box::leak(config.into_boxed_str())),
+    }])
+}
+
+/// One of the converted real runs in `apps/ledger/samples`.
+fn sample_run(id: &str) -> String {
+    std::fs::read_to_string(samples().join(format!("ledger/samples/{id}.json"))).unwrap()
+}
+
+fn request(addr: SocketAddr, method: &str, path: &str, headers: &[&str], body: &str) -> Answer {
+    let mut head =
+        format!("{method} {path} HTTP/1.1\r\nHost: ledger.test\r\nConnection: close\r\n");
+    for header in headers {
+        head.push_str(header);
+        head.push_str("\r\n");
+    }
+    head.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    send_raw(addr, head.as_bytes())
+}
+
+fn bearer() -> String {
+    format!("Authorization: Bearer {SECRET}")
+}
+
+/// Posts `body` as a run with the secret.
+fn post_run(addr: SocketAddr, body: &str) -> Answer {
+    request(
+        addr,
+        "POST",
+        "/ledger/api/runs",
+        &[&bearer(), "Content-Type: application/json"],
+        body,
+    )
+}
+
+fn page(addr: SocketAddr, path: &str) -> Answer {
+    let answer = request(addr, "GET", path, &[], "");
+    assert_eq!(answer.status, 200, "{path}: {answer:?}");
+    answer
+}
+
+fn stored(addr: SocketAddr, id: &str) -> Json {
+    let answer = page(addr, &format!("/ledger/api/runs/{id}"));
+    serde_json::from_str(&answer.body).unwrap()
+}
+
+/// A small valid run, to be changed by each test.
+fn minimal(id: &str) -> Json {
+    json!({
+        "id": id,
+        "repository": "myuon/cove",
+        "commit": "abc1234",
+        "measuredAt": "2026-10-05T03:13:54Z",
+        "environment": {"cpu": "test cpu", "os": "test os"},
+        "toolchain": {"rustc": "1.98.1"},
+        "conditions": {"workers": "4"},
+        "results": [{
+            "case": "hello",
+            "input": "c=64",
+            "inputSize": 64,
+            "backend": "vm",
+            "load": [1.5, 2.0],
+            "metrics": {
+                "throughput": {"unit": "req/s", "values": [1000, 1100]},
+                "p99": {"unit": "ms", "values": [2.5, 3.0]}
+            }
+        }]
+    })
+}
+
+/// The `path`s of a 400's problems.
+fn problem_paths(answer: &Answer) -> Vec<String> {
+    assert_eq!(answer.status, 400, "{answer:?}");
+    let body: Json = serde_json::from_str(&answer.body).unwrap();
+    body["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn posting_needs_the_secret_and_reading_does_not() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let body = minimal("r1").to_string();
+    for header in [
+        None,
+        Some("Authorization: Bearer wrong".to_string()),
+        Some("Authorization: Basic dTp3cm9uZw==".to_string()),
+    ] {
+        let mut headers = vec!["Content-Type: application/json"];
+        if let Some(header) = &header {
+            headers.push(header);
+        }
+        let refused = request(addr, "POST", "/ledger/api/runs", &headers, &body);
+        assert_eq!(refused.status, 401, "{header:?}: {refused:?}");
+        let deleted = request(addr, "DELETE", "/ledger/api/runs/r1", &headers, "");
+        assert_eq!(deleted.status, 401);
+    }
+    assert_eq!(page(addr, "/ledger/api/runs").body.trim(), "[]");
+    // Basic with the secret as the password, as a browser would send it.
+    let basic = format!("Authorization: Basic {}", base64(&format!("ci:{SECRET}")));
+    let posted = request(
+        addr,
+        "POST",
+        "/ledger/api/runs",
+        &[&basic, "Content-Type: application/json"],
+        &body,
+    );
+    assert_eq!(posted.status, 201, "{posted:?}");
+    // Reading is open.
+    assert!(page(addr, "/ledger/").body.contains("r1"));
+    assert!(page(addr, "/ledger/runs/r1").body.contains("abc1234"));
+    // Not a JSON body, and from another site: refused even with the secret.
+    let form = request(
+        addr,
+        "POST",
+        "/ledger/api/runs",
+        &[&bearer(), "Content-Type: text/plain"],
+        &body,
+    );
+    assert_eq!(form.status, 415);
+    for cross in ["Origin: https://evil.example", "Sec-Fetch-Site: cross-site"] {
+        let forged = request(
+            addr,
+            "DELETE",
+            "/ledger/api/runs/r1",
+            &[&bearer(), cross],
+            "",
+        );
+        assert_eq!(forged.status, 403, "{cross}");
+    }
+    let deleted = request(addr, "DELETE", "/ledger/api/runs/r1", &[&bearer()], "");
+    assert_eq!(deleted.status, 200, "{deleted:?}");
+    assert_eq!(request(addr, "GET", "/ledger/runs/r1", &[], "").status, 404);
+}
+
+#[test]
+fn a_valid_run_is_stored_as_sent_and_in_canonical_units() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let mut run = minimal("units");
+    run["results"][0]["metrics"] = json!({
+        "p50": {"unit": "us", "values": [850, 900, 875]},
+        "p99": {"unit": "s", "values": [0.0025]},
+        "memory": {"unit": "KiB", "values": [2048, 3072]},
+        "cpu": {"unit": "ns", "values": [1500000]},
+        "throughput": {"unit": "req/min", "values": [600]},
+    });
+    let posted = post_run(addr, &run.to_string());
+    assert_eq!(posted.status, 201, "{posted:?}");
+    let answer: Json = serde_json::from_str(&posted.body).unwrap();
+    assert_eq!(answer["stored"], true);
+    assert_eq!(answer["url"], "/ledger/runs/units");
+    let back = stored(addr, "units");
+    assert_eq!(back["repository"], "myuon/cove");
+    assert_eq!(back["commit"], "abc1234");
+    assert_eq!(back["measuredAt"], "2026-10-05T03:13:54.000Z");
+    assert_eq!(back["environment"]["cpu"], "test cpu");
+    let result = &back["results"][0];
+    assert_eq!(result["case"], "hello");
+    assert_eq!(result["input"], "c=64");
+    assert_eq!(result["inputSize"].as_f64(), Some(64.0));
+    assert_eq!(floats(&result["load"]), [1.5, 2.0]);
+    let metrics = &result["metrics"];
+    // What was sent is kept...
+    assert_eq!(metrics["p50"]["unit"], "us");
+    assert_eq!(floats(&metrics["p50"]["values"]), [850.0, 900.0, 875.0]);
+    // ...beside the canonical unit of its dimension.
+    for (name, unit, canonical) in [
+        ("p50", "ms", vec![0.85, 0.9, 0.875]),
+        ("p99", "ms", vec![2.5]),
+        ("memory", "MiB", vec![2.0, 3.0]),
+        ("cpu", "ms", vec![1.5]),
+        ("throughput", "/s", vec![10.0]),
+    ] {
+        assert_eq!(metrics[name]["canonicalUnit"], unit, "{name}");
+        assert_eq!(floats(&metrics[name]["canonical"]), canonical, "{name}");
+    }
+    assert_eq!(metrics["throughput"]["better"], "higher");
+    assert_eq!(metrics["p99"]["better"], "lower");
+    // The page shows the canonical values: the median of 0.85, 0.875, 0.9 ms.
+    let html = page(addr, "/ledger/runs/units").body;
+    assert!(
+        html.contains(">0.875<br><span class=range>0.85–0.9</span>"),
+        "{html}"
+    );
+    assert!(html.contains("sent in us: 850, 900, 875"), "{html}");
+    // A metric keeps its dimension: `p99` in KiB is refused once it was a time.
+    let mut sizes = minimal("sizes");
+    sizes["results"][0]["metrics"]["p99"] = json!({"unit": "KiB", "values": [1]});
+    assert_eq!(
+        problem_paths(&post_run(addr, &sizes.to_string())),
+        ["results[0].metrics.p99.unit"]
+    );
+}
+
+#[test]
+fn an_invalid_run_is_refused_with_every_reason() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let not_json = post_run(addr, "{\"id\": ");
+    assert_eq!(problem_paths(&not_json), [""]);
+    assert!(not_json.body.contains("not JSON"), "{not_json:?}");
+    assert_eq!(problem_paths(&post_run(addr, "[]")), [""]);
+    assert_eq!(
+        problem_paths(&post_run(addr, "{\"id\": \"a\", \"id\": \"b\"}")),
+        [""]
+    );
+    let mut missing = problem_paths(&post_run(addr, "{}"));
+    missing.sort();
+    assert_eq!(
+        missing,
+        [
+            "commit",
+            "environment",
+            "id",
+            "measuredAt",
+            "repository",
+            "results"
+        ]
+    );
+    // One rule broken per case: (what is changed, the path that names it).
+    let cases: Vec<(Json, &str)> = vec![
+        (json!({"id": "has space"}), "id"),
+        (json!({"id": "x/../y"}), "id"),
+        (json!({"commit": ""}), "commit"),
+        (json!({"measuredAt": "2026-10-05 03:13"}), "measuredAt"),
+        (json!({"measuredAt": "2026-10-05T03:13:54"}), "measuredAt"),
+        (
+            json!({"measured_at": "2026-10-05T03:13:54Z"}),
+            "measured_at",
+        ),
+        (json!({"environment": {}}), "environment"),
+        (json!({"environment": {"cores": 8}}), "environment.cores"),
+        (json!({"schema": 2}), "schema"),
+        (json!({"results": []}), "results"),
+        (json!({"results": [1]}), "results[0]"),
+    ];
+    for (change, path) in cases {
+        let mut run = minimal("bad");
+        for (key, value) in change.as_object().unwrap() {
+            run[key] = value.clone();
+        }
+        let answer = post_run(addr, &run.to_string());
+        assert!(
+            problem_paths(&answer).contains(&path.to_string()),
+            "{change}: {answer:?}"
+        );
+    }
+    let metric_cases: Vec<(Json, &str)> = vec![
+        (
+            json!({"p99": {"unit": "mss", "values": [1]}}),
+            "results[0].metrics.p99.unit",
+        ),
+        (
+            json!({"p99": {"values": [1]}}),
+            "results[0].metrics.p99.unit",
+        ),
+        (
+            json!({"p99": {"unit": "ms"}}),
+            "results[0].metrics.p99.values",
+        ),
+        (
+            json!({"p99": {"unit": "ms", "values": []}}),
+            "results[0].metrics.p99.values",
+        ),
+        (
+            json!({"p99": {"unit": "ms", "values": [1, null]}}),
+            "results[0].metrics.p99.values[1]",
+        ),
+        (
+            json!({"p99": {"unit": "ms", "values": [-1]}}),
+            "results[0].metrics.p99.values[0]",
+        ),
+        (
+            json!({"p99": {"unit": "ms", "values": ["1"]}}),
+            "results[0].metrics.p99.values[0]",
+        ),
+        (json!({"p99": null}), "results[0].metrics.p99"),
+        (json!({"p99": 1.5}), "results[0].metrics.p99"),
+        (
+            json!({"9lives": {"unit": "ms", "values": [1]}}),
+            "results[0].metrics.9lives",
+        ),
+        (
+            json!({"p99": {"unit": "ms", "values": [1], "better": "up"}}),
+            "results[0].metrics.p99.better",
+        ),
+        (
+            json!({"p99": {"unit": "ms", "values": [1], "value": 1}}),
+            "results[0].metrics.p99.value",
+        ),
+        (json!({}), "results[0].metrics"),
+    ];
+    for (metrics, path) in metric_cases {
+        let mut run = minimal("bad");
+        run["results"][0]["metrics"] = metrics.clone();
+        let answer = post_run(addr, &run.to_string());
+        assert!(
+            problem_paths(&answer).contains(&path.to_string()),
+            "{metrics}: {answer:?}"
+        );
+    }
+    // Two results for one case, input and backend.
+    let mut twice = minimal("bad");
+    let first = twice["results"][0].clone();
+    twice["results"] = json!([first.clone(), first]);
+    assert_eq!(
+        problem_paths(&post_run(addr, &twice.to_string())),
+        ["results[1]"]
+    );
+    // Every problem is reported at once, each with a message.
+    let mut many = minimal("bad id");
+    many["commit"] = json!(7);
+    many["results"][0]["metrics"]["p99"]["unit"] = json!("parsecs");
+    let answer = post_run(addr, &many.to_string());
+    assert_eq!(problem_paths(&answer).len(), 3, "{answer:?}");
+    assert!(
+        answer.body.contains("`parsecs` is not a unit"),
+        "{answer:?}"
+    );
+    // Nothing of any of it was stored.
+    assert_eq!(page(addr, "/ledger/api/runs").body.trim(), "[]");
+}
+
+#[test]
+fn reposting_a_run_is_idempotent_and_a_conflict_is_refused() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let run = minimal("again");
+    assert_eq!(post_run(addr, &run.to_string()).status, 201);
+    // The same content — even written differently — is a duplicate.
+    let pretty = serde_json::to_string_pretty(&run).unwrap();
+    let repeat = post_run(addr, &pretty);
+    assert_eq!(repeat.status, 200, "{repeat:?}");
+    let answer: Json = serde_json::from_str(&repeat.body).unwrap();
+    assert_eq!(answer["duplicate"], true);
+    assert_eq!(answer["stored"], false);
+    let listed: Json = serde_json::from_str(&page(addr, "/ledger/api/runs").body).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    // Different content under the same ID is an explicit error.
+    let mut other = run.clone();
+    other["results"][0]["metrics"]["p99"]["values"] = json!([2.5, 3.5]);
+    let conflict = post_run(addr, &other.to_string());
+    assert_eq!(conflict.status, 409, "{conflict:?}");
+    assert!(
+        conflict.body.contains("results[0]") && conflict.body.contains("differs"),
+        "{conflict:?}"
+    );
+    let mut moved = run.clone();
+    moved["commit"] = json!("def5678");
+    let conflict = post_run(addr, &moved.to_string());
+    assert_eq!(conflict.status, 409);
+    assert!(conflict
+        .body
+        .contains("`commit` is `abc1234`, not `def5678`"));
+    // The stored run is untouched.
+    assert_eq!(
+        floats(&stored(addr, "again")["results"][0]["metrics"]["p99"]["values"]),
+        [2.5, 3.0]
+    );
+    // Deleted, the other content can be posted.
+    assert_eq!(
+        request(addr, "DELETE", "/ledger/api/runs/again", &[&bearer()], "").status,
+        200
+    );
+    assert_eq!(post_run(addr, &other.to_string()).status, 201);
+}
+
+#[test]
+fn an_unmeasured_metric_is_absent_not_zero() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let mut run = minimal("gaps");
+    run["results"] = json!([
+        {"case": "a", "backend": "vm", "metrics": {
+            "p99": {"unit": "ms", "values": [0]},
+            "throughput": {"unit": "req/s", "values": [10]}}},
+        {"case": "b", "backend": "vm", "metrics": {
+            "throughput": {"unit": "req/s", "values": [20]}}}
+    ]);
+    assert_eq!(post_run(addr, &run.to_string()).status, 201);
+    let back = stored(addr, "gaps");
+    assert!(back["results"][1]["metrics"].get("p99").is_none());
+    assert_eq!(
+        floats(&back["results"][0]["metrics"]["p99"]["values"]),
+        [0.0]
+    );
+    let html = page(addr, "/ledger/runs/gaps").body;
+    // `a` measured a p99 of zero; `b` did not measure one.
+    let row_a = html.split("<tr><td>a</td>").nth(1).unwrap();
+    let row_b = html.split("<tr><td>b</td>").nth(1).unwrap();
+    assert!(
+        row_a.split("</tr>").next().unwrap().contains(">0</td>"),
+        "{html}"
+    );
+    let row_b = row_b.split("</tr>").next().unwrap();
+    assert!(row_b.contains("title=\"not measured\">–</td>"), "{row_b}");
+    assert!(!row_b.contains(">0</td>"), "{row_b}");
+}
+
+#[test]
+fn real_runs_survive_a_restart() {
+    let apps = ledger();
+    let ids = [
+        "cove-589-capacity",
+        "cove-593-capacity",
+        "cove-host-perf-2026-10-05",
+    ];
+    {
+        let host = start(&apps, 2);
+        for id in ids {
+            let posted = post_run(host.addr, &sample_run(id));
+            assert_eq!(posted.status, 201, "{id}: {posted:?}");
+        }
+    }
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let listed: Json = serde_json::from_str(&page(addr, "/ledger/api/runs").body).unwrap();
+    let listed: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    // Newest measured first.
+    assert_eq!(
+        listed,
+        [
+            "cove-host-perf-2026-10-05",
+            "cove-593-capacity",
+            "cove-589-capacity"
+        ]
+    );
+    let html = page(addr, "/ledger/").body;
+    for id in ids {
+        assert!(html.contains(&format!("/ledger/runs/{id}\"")), "{id}");
+    }
+    // #593's native crunch at 16 in flight: 2,770, 2,783.x and 2,784 req/s.
+    let run = stored(addr, "cove-593-capacity");
+    assert_eq!(run["commit"], "11ce12f");
+    let native = run["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["case"] == "crunch" && r["input"] == "c=16" && r["backend"] == "native")
+        .unwrap();
+    assert_eq!(
+        native["metrics"]["throughput"]["values"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(page(addr, "/ledger/runs/cove-593-capacity")
+        .body
+        .contains("2,783"));
+    // Reposting after the restart is still a duplicate.
+    let again = post_run(addr, &sample_run("cove-589-capacity"));
+    assert_eq!(again.status, 200, "{again:?}");
+}
+
+#[test]
+fn everything_a_poster_controls_is_escaped() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let evil = "<script>alert(1)</script>";
+    let img = "<img src=x onerror=alert(2)>";
+    let mut run = minimal("escape");
+    run["repository"] = json!(evil);
+    run["commit"] = json!(img);
+    run["note"] = json!(evil);
+    run["source"] = json!(img);
+    run["environment"] = json!({ evil: img, "cpu": evil });
+    run["toolchain"] = json!({ "rustc": evil });
+    run["conditions"] = json!({ img: evil });
+    run["results"][0]["case"] = json!(evil);
+    run["results"][0]["input"] = json!(img);
+    run["results"][0]["backend"] = json!("\"><b>x</b>");
+    let posted = post_run(addr, &run.to_string());
+    assert_eq!(posted.status, 201, "{posted:?}");
+    for path in ["/ledger/", "/ledger/runs/escape"] {
+        let answer = page(addr, path);
+        assert!(!answer.body.contains("<script>"), "{path}");
+        assert!(!answer.body.contains("<img"), "{path}");
+        assert!(!answer.body.contains("<b>x"), "{path}");
+        assert!(answer.body.contains("&lt;script&gt;"), "{path}");
+        assert!(
+            answer
+                .header("content-security-policy")
+                .unwrap()
+                .contains("default-src 'none'"),
+            "{path}"
+        );
+    }
+}
+
+/// A JSON array of numbers, as numbers (`2` and `2.0` alike).
+fn floats(value: &Json) -> Vec<f64> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {value}"))
+        .iter()
+        .map(|n| n.as_f64().unwrap())
+        .collect()
+}
+
+/// Standard base64, for a Basic login.
+fn base64(text: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for at in 0..4 {
+            if at <= chunk.len() {
+                out.push(ALPHABET[(word >> (18 - 6 * at) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}

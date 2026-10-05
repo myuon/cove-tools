@@ -1,0 +1,92 @@
+/// A valid run with one result, `metrics` substituted in.
+fn runWith(metrics: String) -> String {
+  "\{\"id\": \"r1\", \"repository\": \"myuon/cove\", \"commit\": \"abc123\", \"measuredAt\": \"2026-10-05T03:13:54Z\", \"environment\": \{\"cpu\": \"i7\"\}, \"results\": [\{\"case\": \"hello\", \"backend\": \"vm\", \"metrics\": {metrics}\}]\}"
+}
+
+/// The problems `body` is refused with, as `path: message` lines.
+fn problemsOf(body: String) -> Array<String> {
+  match validate(body) {
+    Ok(_) => []
+    Err(problems) => {
+      var lines = Vector.of()
+      for problem in problems {
+        lines.push("{problem.path}: {problem.message}")
+      }
+      lines.freeze()
+    }
+  }
+}
+
+fn mentions(lines: Array<String>, path: String) -> Bool {
+  for line in lines {
+    if line.startsWith("{path}: ") {
+      return true
+    }
+  }
+  false
+}
+
+test fn readsAValidRunAndConvertsUnits() -> Result<Unit, Error> {
+  let run = match validate(runWith("\{\"p99\": \{\"unit\": \"us\", \"values\": [850, 900]\}, \"memory\": \{\"unit\": \"KiB\", \"values\": [2048]\}, \"throughput\": \{\"unit\": \"req/s\", \"values\": [100.5]\}\}")) {
+    Ok(run) => run
+    Err(problems) => return Err(Error("refused: {problems.length()} problems"))
+  }
+  assertEqual(run.id, "r1")?
+  assertEqual(run.measuredAt, 1791170034000)?
+  let result = run.results.get(0).unwrapOr(Measurement(case: "", input: "", inputSize: None, backend: "", conditions: Map.of(), load: [], metrics: []))
+  let p99 = metricOf(result, "p99").unwrapOr(Metric(name: "", unit: "", values: [], dimension: "", canonicalUnit: "", canonical: [], better: ""))
+  assertEqual(p99.unit, "us")?
+  assertEqual(p99.values, [850.0, 900.0])?
+  assertEqual(p99.canonicalUnit, "ms")?
+  assertEqual(p99.canonical, [0.85, 0.9])?
+  assertEqual(p99.better, "lower")?
+  let memory = metricOf(result, "memory").unwrapOr(p99)
+  assertEqual(memory.canonical, [2.0])?
+  assertEqual(memory.canonicalUnit, "MiB")?
+  let throughput = metricOf(result, "throughput").unwrapOr(p99)
+  assertEqual(throughput.better, "higher")?
+  // Absent is absent: nothing was invented for `p50`.
+  assert(metricOf(result, "p50").isNone())?
+  Ok(())
+}
+
+test fn aStoredRunReadsBackTheSame() -> Result<Unit, Error> {
+  let run = match validate(runWith("\{\"p99\": \{\"unit\": \"us\", \"values\": [850, 900.25]\}\}")) {
+    Ok(run) => run
+    Err(_) => return Err(Error("refused"))
+  }
+  let stored = json.render(runJson(run))
+  let back = runOf(json.parse(stored).unwrapOr(Json.Null))
+  assertEqual(json.render(runJson(back)), stored)?
+  Ok(())
+}
+
+test fn refusesEachBrokenRuleWithItsPath() -> Result<Unit, Error> {
+  assert(mentions(problemsOf("not json"), ""))?
+  assert(mentions(problemsOf("[1]"), ""))?
+  let missing = problemsOf("\{\"results\": []\}")
+  assert(mentions(missing, "id"))?
+  assert(mentions(missing, "repository"))?
+  assert(mentions(missing, "commit"))?
+  assert(mentions(missing, "measuredAt"))?
+  assert(mentions(missing, "environment"))?
+  assert(mentions(missing, "results"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"mss\", \"values\": [1]\}\}")), "results[0].metrics.p99.unit"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"ms\", \"values\": []\}\}")), "results[0].metrics.p99.values"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"ms\", \"values\": [1, null]\}\}")), "results[0].metrics.p99.values[1]"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"ms\", \"values\": [-1]\}\}")), "results[0].metrics.p99.values[0]"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"ms\", \"values\": [\"1\"]\}\}")), "results[0].metrics.p99.values[0]"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": null\}")), "results[0].metrics.p99"))?
+  assert(mentions(problemsOf(runWith("\{\}")), "results[0].metrics"))?
+  assert(mentions(problemsOf(runWith("\{\"9x\": \{\"unit\": \"ms\", \"values\": [1]\}\}")), "results[0].metrics.9x"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"ms\", \"values\": [1], \"better\": \"up\"\}\}")), "results[0].metrics.p99.better"))?
+  assert(mentions(problemsOf(runWith("\{\"p99\": \{\"unit\": \"ms\", \"values\": [1], \"vals\": [2]\}\}")), "results[0].metrics.p99.vals"))?
+  let shell = "\{\"id\": \"a b\", \"repository\": \"r\", \"commit\": \"c\", \"measured_at\": \"x\", \"measuredAt\": \"2026-10-05T03:13:54\", \"environment\": \{\"cores\": 8\}, \"results\": [\{\"case\": \"x\", \"backend\": \"vm\", \"metrics\": \{\"t\": \{\"unit\": \"ms\", \"values\": [1]\}\}\}, \{\"case\": \"x\", \"backend\": \"vm\", \"metrics\": \{\"t\": \{\"unit\": \"ms\", \"values\": [2]\}\}\}]\}"
+  let problems = problemsOf(shell)
+  assert(mentions(problems, "id"))?
+  assert(mentions(problems, "measured_at"))?
+  assert(mentions(problems, "measuredAt"))?
+  assert(mentions(problems, "environment.cores"))?
+  assert(mentions(problems, "results[1]"))?
+  Ok(())
+}

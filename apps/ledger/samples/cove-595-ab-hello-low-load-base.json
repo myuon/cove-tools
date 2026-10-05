@@ -1,0 +1,84 @@
+{
+ "schema": 1,
+ "id": "cove-595-ab-hello-low-load-base",
+ "repository": "myuon/cove",
+ "commit": "fcf64a9",
+ "measuredAt": "2026-10-05T01:43:47+09:00",
+ "source": "examples/edge/compare/results/ab-hello-low-load.jsonl (variant `base`)",
+ "note": "#595's A/B `hello-low-load`, build `base`: the build the comparison was made with (#589). Rounds interleaved with the other builds of the same file.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "hello",
+   "input": "c=64",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.8310546875,
+    4.06982421875,
+    3.83740234375
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      86837.06,
+      84806.9,
+      89146.31
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      0.5482,
+      0.5679,
+      0.5241
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.0055,
+      2.0055,
+      1.9818
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      8.09,
+      8.25,
+      7.84
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      40.45,
+      41.25,
+      39.2
+     ]
+    }
+   }
+  }
+ ]
+}

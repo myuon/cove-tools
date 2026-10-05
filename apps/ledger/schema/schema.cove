@@ -1,0 +1,711 @@
+use json
+use json.Json
+use text
+use units
+
+// A posted run, read and checked. `validate` takes the body of a `POST
+// /api/runs` and answers either the run, with every value also in its
+// canonical unit, or every problem it found, each with the path of the field
+// it is about. Nothing here touches the store: the one rule that needs it (a
+// metric keeps its dimension across runs) is `store.cove`'s.
+//
+// The rules a reader is most likely to trip over:
+//
+// - A value that was not measured is **left out**: the metric is absent, or
+//   the repetition is. `null` is refused and so is an empty `values`, because
+//   either would have to become something — and a zero is a measurement.
+// - Every number is finite and none is negative.
+// - Field names are checked, so a misspelt `measured_at` is an error rather
+//   than a run with no time.
+
+/// One metric of one measurement: the repetitions as sent, and the same in
+/// the canonical unit of their dimension.
+export struct Metric {
+  name: String
+  /// The unit the values were sent in.
+  unit: String
+  values: Array<Float>
+  dimension: String
+  canonicalUnit: String
+  canonical: Array<Float>
+  /// `higher` or `lower`: which way is an improvement.
+  better: String
+}
+
+/// One case, on one backend, at one input, measured some number of times.
+export struct Measurement {
+  case: String
+  /// A label for the input or the load: `n=20000`, `c=64 rate=2500`. `""`
+  /// when there is none.
+  input: String
+  inputSize: Option<Float>
+  backend: String
+  /// The run's conditions with this measurement's own over them.
+  conditions: Map<String, String>
+  /// The machine's load average before each repetition, where it was taken.
+  load: Array<Float>
+  /// By name, in name order.
+  metrics: Array<Metric>
+}
+
+/// A posted run.
+export struct Run {
+  id: String
+  repository: String
+  commit: String
+  /// Milliseconds since the Unix epoch.
+  measuredAt: Int
+  /// Where the numbers came from: a file, a script, a CI job.
+  source: String
+  note: String
+  /// The machine: CPU, memory, operating system. Two runs whose
+  /// environments differ are not comparable.
+  environment: Map<String, String>
+  /// Compilers and build settings: `rustc`, `go`, `profile`.
+  toolchain: Map<String, String>
+  /// How it was measured: workers, the load generator, open or closed loop.
+  conditions: Map<String, String>
+  results: Array<Measurement>
+}
+
+/// What is wrong with a posted run, and where.
+export struct Problem {
+  /// `results[2].metrics.p99.unit`, or `""` for the body as a whole.
+  path: String
+  message: String
+}
+
+/// The most results one run may hold, and the most repetitions one metric.
+fn maxResults() -> Int {
+  5000
+}
+
+fn maxValues() -> Int {
+  1000
+}
+
+/// Checks a posted body: the run, or every problem with it.
+export fn validate(body: String) -> Result<Run, Array<Problem>> {
+  let value = match json.parse(body) {
+    Ok(value) => value
+    Err(detail) => return Err([Problem(path: "", message: "the body is not JSON: {detail.message} (at byte {detail.column})")])
+  }
+  var problems = Vector.of()
+  let fields = match value {
+    Json.Fields(fields) => fields
+    _ => return Err([Problem(path: "", message: "a run is a JSON object")])
+  }
+  unknownFields(
+    fields,
+    "",
+    ["schema", "id", "repository", "commit", "measuredAt", "source", "note", "environment", "toolchain", "conditions", "results"],
+    var problems,
+  )
+  match fields.get("schema") {
+    Some(Json.Number(version)) => {
+      if version != 1.0 {
+        problems.push(Problem(path: "schema", message: "this ledger reads schema 1; leave `schema` out or write 1"))
+      }
+    }
+    Some(_) => problems.push(Problem(path: "schema", message: "`schema` is a number, 1"))
+    None => {}
+  }
+  let id = requiredText(fields, "id", "", 100, var problems)
+  if id != "" && !isName(id) {
+    problems.push(Problem(path: "id", message: "a run ID is letters, digits, `.`, `_` and `-` (it is part of a URL)"))
+  }
+  let repository = requiredText(fields, "repository", "", 200, var problems)
+  let commit = requiredText(fields, "commit", "", 100, var problems)
+  let measuredText = requiredText(fields, "measuredAt", "", 40, var problems)
+  var measuredAt = 0
+  if measuredText != "" {
+    match text.parseIso(measuredText) {
+      Some(millis) => {
+        if millis < 0 {
+          problems.push(Problem(path: "measuredAt", message: "a time before 1970 is not a measurement this ledger holds"))
+        }
+        measuredAt = millis
+      }
+      None => problems.push(
+        Problem(
+          path: "measuredAt",
+          message: "`{measuredText}` is not an ISO 8601 time with a zone, like `2026-10-05T03:13:54Z` or `2026-10-05T12:13:54+09:00`",
+        ),
+      )
+    }
+  }
+  let source = optionalText(fields, "source", "", 500, var problems)
+  let note = optionalText(fields, "note", "", 2000, var problems)
+  let environment = textMap(fields.get("environment"), "environment", true, var problems)
+  let toolchain = textMap(fields.get("toolchain"), "toolchain", false, var problems)
+  let conditions = textMap(fields.get("conditions"), "conditions", false, var problems)
+  var results = Vector.of()
+  match fields.get("results") {
+    Some(Json.Items(items)) => {
+      if items.length() == 0 {
+        problems.push(Problem(path: "results", message: "a run needs at least one result"))
+      }
+      if items.length() > maxResults() {
+        problems.push(Problem(path: "results", message: "a run holds at most {maxResults()} results; this one has {items.length()}"))
+      }
+      var index = 0
+      var seen: Map<String, Int> = Map.of()
+      for item in items.slice(0, maxResults()) {
+        match measurement(item, "results[{index}]", conditions, var problems) {
+          Some(result) => {
+            let key = "{result.case}\n{result.input}\n{result.backend}"
+            match seen.get(key) {
+              Some(first) => problems.push(
+                Problem(
+                  path: "results[{index}]",
+                  message: "case `{result.case}`{inputNote(result.input)} on `{result.backend}` is already results[{first}]; one run measures each once (put the repetitions in `values`)",
+                ),
+              )
+              None => {
+                seen = seen.inserted(key, index)
+                results.push(result)
+              }
+            }
+          }
+          None => {}
+        }
+        index += 1
+      }
+    }
+    Some(_) => problems.push(Problem(path: "results", message: "`results` is an array of measurements"))
+    None => problems.push(Problem(path: "results", message: "missing: a run needs `results`"))
+  }
+  if problems.length() > 0 {
+    return Err(problems.freeze())
+  }
+  Ok(
+    Run(
+      id: id,
+      repository: repository,
+      commit: commit,
+      measuredAt: measuredAt,
+      source: source,
+      note: note,
+      environment: environment,
+      toolchain: toolchain,
+      conditions: conditions,
+      results: results.freeze(),
+    ),
+  )
+}
+
+fn inputNote(input: String) -> String {
+  if input == "" { "" } else { " at `{input}`" }
+}
+
+/// One element of `results`, or `None` when it has problems (which are
+/// pushed).
+fn measurement(
+  value: Json,
+  path: String,
+  runConditions: Map<String, String>,
+  var problems: Vector<Problem>,
+) -> Option<Measurement> {
+  let before = problems.length()
+  let fields = match value {
+    Json.Fields(fields) => fields
+    _ => {
+      problems.push(Problem(path: path, message: "a result is a JSON object"))
+      return None
+    }
+  }
+  unknownFields(
+    fields,
+    path,
+    ["case", "input", "inputSize", "backend", "conditions", "load", "metrics"],
+    var problems,
+  )
+  let case = requiredText(fields, "case", path, 200, var problems)
+  let backend = requiredText(fields, "backend", path, 100, var problems)
+  let input = optionalText(fields, "input", path, 200, var problems)
+  var inputSize: Option<Float> = None
+  match fields.get("inputSize") {
+    Some(Json.Number(size)) => {
+      if size < 0.0 || !finite(size) {
+        problems.push(Problem(path: "{path}.inputSize", message: "an input size is a finite number, not negative"))
+      }
+      inputSize = Some(size)
+    }
+    Some(_) => problems.push(Problem(path: "{path}.inputSize", message: "an input size is a number; a label goes in `input`"))
+    None => {}
+  }
+  var conditions = runConditions
+  for entry in textMap(fields.get("conditions"), "{path}.conditions", false, var problems) {
+    conditions = conditions.inserted(entry.key, entry.value)
+  }
+  let load = numbers(fields.get("load"), "{path}.load", false, var problems)
+  var metrics = Vector.of()
+  match fields.get("metrics") {
+    Some(Json.Fields(named)) => {
+      if named.isEmpty() {
+        problems.push(Problem(path: "{path}.metrics", message: "a result needs at least one metric"))
+      }
+      for entry in named {
+        match metric(entry.key, entry.value, "{path}.metrics.{entry.key}", var problems) {
+          Some(one) => metrics.push(one)
+          None => {}
+        }
+      }
+    }
+    Some(_) => problems.push(Problem(path: "{path}.metrics", message: "`metrics` is an object of metrics by name"))
+    None => problems.push(Problem(path: "{path}.metrics", message: "missing: a result needs `metrics`"))
+  }
+  if problems.length() > before {
+    return None
+  }
+  Some(
+    Measurement(
+      case: case,
+      input: input,
+      inputSize: inputSize,
+      backend: backend,
+      conditions: conditions,
+      load: load,
+      metrics: metrics.freeze(),
+    ),
+  )
+}
+
+/// One metric, `{"unit": ..., "values": [...]}`, or `None` with problems
+/// pushed.
+fn metric(name: String, value: Json, path: String, var problems: Vector<Problem>) -> Option<Metric> {
+  let before = problems.length()
+  if !isMetricName(name) {
+    problems.push(Problem(path: path, message: "a metric's name starts with a letter and is letters, digits, `_`, `.` and `-`, at most 64"))
+  }
+  let fields = match value {
+    Json.Fields(fields) => fields
+    Json.Null => {
+      problems.push(Problem(path: path, message: "a metric that was not measured is left out, not written `null`"))
+      return None
+    }
+    _ => {
+      problems.push(Problem(path: path, message: "a metric is an object: \{\"unit\": \"ms\", \"values\": [1.2, 1.3]\}"))
+      return None
+    }
+  }
+  unknownFields(fields, path, ["unit", "values", "better"], var problems)
+  let unitName = requiredText(fields, "unit", path, 20, var problems)
+  var unit: Option<units.Scale> = None
+  if unitName != "" {
+    match units.find(unitName) {
+      Some(found) => {
+        unit = Some(found)
+      }
+      None => problems.push(Problem(path: "{path}.unit", message: "`{unitName}` is not a unit this ledger knows; it knows {units.allNames()}"))
+    }
+  }
+  let values = numbers(fields.get("values"), "{path}.values", true, var problems)
+  let better = optionalText(fields, "better", path, 10, var problems)
+  if better != "" && better != "higher" && better != "lower" {
+    problems.push(Problem(path: "{path}.better", message: "`better` is `higher` or `lower`"))
+  }
+  if problems.length() > before {
+    return None
+  }
+  let found = match unit {
+    Some(found) => found
+    None => return None
+  }
+  var canonical = Vector.of()
+  for one in values {
+    canonical.push(units.toCanonical(one, found))
+  }
+  Some(
+    Metric(
+      name: name,
+      unit: found.name,
+      values: values,
+      dimension: found.dimension,
+      canonicalUnit: units.canonical(found.dimension),
+      canonical: canonical.freeze(),
+      better: if better == "" { units.defaultBetter(found.dimension) } else { better },
+    ),
+  )
+}
+
+/// An array of finite, non-negative numbers. `required` says it must be
+/// there and hold at least one.
+fn numbers(value: Option<Json>, path: String, required: Bool, var problems: Vector<Problem>) -> Array<Float> {
+  var out = Vector.of()
+  match value {
+    Some(Json.Items(items)) => {
+      if required && items.length() == 0 {
+        problems.push(Problem(path: path, message: "no values: a metric that was not measured is left out rather than sent empty"))
+      }
+      if items.length() > maxValues() {
+        problems.push(Problem(path: path, message: "at most {maxValues()} repetitions; this has {items.length()}"))
+      }
+      var index = 0
+      for item in items.slice(0, maxValues()) {
+        match item {
+          Json.Number(number) => {
+            if !finite(number) {
+              problems.push(Problem(path: "{path}[{index}]", message: "not a finite number"))
+            } else if number < 0.0 {
+              problems.push(Problem(path: "{path}[{index}]", message: "{number} is negative; no metric this ledger knows can be"))
+            } else {
+              out.push(number)
+            }
+          }
+          Json.Null => problems.push(
+            Problem(path: "{path}[{index}]", message: "a repetition that was not measured is left out, not written `null` (and not 0)"),
+          )
+          _ => problems.push(Problem(path: "{path}[{index}]", message: "a value is a number"))
+        }
+        index += 1
+      }
+    }
+    Some(_) => problems.push(Problem(path: path, message: "an array of numbers, one per repetition"))
+    None => {
+      if required {
+        problems.push(Problem(path: path, message: "missing: one number per repetition"))
+      }
+    }
+  }
+  out.freeze()
+}
+
+/// An object of text values: `environment`, `toolchain`, `conditions`.
+fn textMap(value: Option<Json>, path: String, required: Bool, var problems: Vector<Problem>) -> Map<String, String> {
+  var out: Map<String, String> = Map.of()
+  match value {
+    Some(Json.Fields(fields)) => {
+      if required && fields.isEmpty() {
+        problems.push(Problem(path: path, message: "say at least what machine it ran on, e.g. \{\"cpu\": \"…\", \"os\": \"…\"\}"))
+      }
+      for entry in fields {
+        if entry.key == "" || entry.key.length() > 100 {
+          problems.push(Problem(path: path, message: "a name here is 1 to 100 characters"))
+        }
+        match entry.value {
+          Json.Text(text) => {
+            if text.length() > 500 {
+              problems.push(Problem(path: "{path}.{entry.key}", message: "at most 500 characters"))
+            }
+            out = out.inserted(entry.key, text)
+          }
+          Json.Number(_) => problems.push(
+            Problem(path: "{path}.{entry.key}", message: "write it as text (`\"4\"`): these are compared as written"),
+          )
+          _ => problems.push(Problem(path: "{path}.{entry.key}", message: "a value here is text"))
+        }
+      }
+    }
+    Some(_) => problems.push(Problem(path: path, message: "an object of text values"))
+    None => {
+      if required {
+        problems.push(Problem(path: path, message: "missing: say at least what machine it ran on, e.g. \{\"cpu\": \"…\", \"os\": \"…\"\}"))
+      }
+    }
+  }
+  out
+}
+
+/// The text field `name`, which must be there and not be empty.
+fn requiredText(
+  fields: Map<String, Json>,
+  name: String,
+  path: String,
+  most: Int,
+  var problems: Vector<Problem>,
+) -> String {
+  let at = joined(path, name)
+  match fields.get(name) {
+    Some(Json.Text(value)) => {
+      let trimmed = value.trim()
+      if trimmed == "" {
+        problems.push(Problem(path: at, message: "empty: `{name}` is required"))
+      } else if trimmed.length() > most {
+        problems.push(Problem(path: at, message: "at most {most} characters"))
+      }
+      trimmed
+    }
+    Some(_) => {
+      problems.push(Problem(path: at, message: "`{name}` is text"))
+      ""
+    }
+    None => {
+      problems.push(Problem(path: at, message: "missing: `{name}` is required"))
+      ""
+    }
+  }
+}
+
+/// The text field `name`, or `""` when it is not there.
+fn optionalText(
+  fields: Map<String, Json>,
+  name: String,
+  path: String,
+  most: Int,
+  var problems: Vector<Problem>,
+) -> String {
+  let at = joined(path, name)
+  match fields.get(name) {
+    Some(Json.Text(value)) => {
+      if value.length() > most {
+        problems.push(Problem(path: at, message: "at most {most} characters"))
+      }
+      value.trim()
+    }
+    Some(_) => {
+      problems.push(Problem(path: at, message: "`{name}` is text"))
+      ""
+    }
+    None => ""
+  }
+}
+
+/// A problem for every field of `fields` not in `known`.
+fn unknownFields(
+  fields: Map<String, Json>,
+  path: String,
+  known: Array<String>,
+  var problems: Vector<Problem>,
+) {
+  for entry in fields {
+    if !known.contains(entry.key) {
+      var names = Vector.of()
+      for name in known {
+        names.push("`{name}`")
+      }
+      problems.push(Problem(path: joined(path, entry.key), message: "unknown field; the fields here are {", ".join(names.freeze())}"))
+    }
+  }
+}
+
+fn joined(path: String, name: String) -> String {
+  if path == "" { name } else { "{path}.{name}" }
+}
+
+fn finite(value: Float) -> Bool {
+  value == value && value - value == 0.0
+}
+
+/// Whether `text` is 1–100 letters, digits, `.`, `_` and `-`.
+export fn isName(text: String) -> Bool {
+  let end = text.byteLength()
+  if end == 0 || end > 100 {
+    return false
+  }
+  var at = 0
+  while at < end {
+    let byte = text.byteAt(at)
+    let ok = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45 || byte == 46 || byte == 95
+    if !ok {
+      return false
+    }
+    at += 1
+  }
+  true
+}
+
+/// Whether `text` is a metric name: a letter, then letters, digits, `_`,
+/// `.` and `-`, at most 64.
+fn isMetricName(text: String) -> Bool {
+  if !isName(text) || text.byteLength() > 64 {
+    return false
+  }
+  let first = text.byteAt(0)
+  (first >= 65 && first <= 90) || (first >= 97 && first <= 122)
+}
+
+// ------------------------------------------------------------- stored form
+
+/// A run as the store keeps it: everything posted, with each metric's values
+/// as sent and in the canonical unit. The same run always renders the same
+/// bytes, which is how a repost is told from a conflicting one.
+export fn runJson(run: Run) -> Json {
+  var results = Vector.of()
+  for result in run.results {
+    results.push(measurementJson(result))
+  }
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "id", value: Json.Text(run.id)),
+      MapEntry(key: "repository", value: Json.Text(run.repository)),
+      MapEntry(key: "commit", value: Json.Text(run.commit)),
+      MapEntry(key: "measuredAt", value: Json.Text(text.isoTime(run.measuredAt))),
+      MapEntry(key: "measuredAtMs", value: Json.Number(run.measuredAt.toFloat())),
+      MapEntry(key: "source", value: Json.Text(run.source)),
+      MapEntry(key: "note", value: Json.Text(run.note)),
+      MapEntry(key: "environment", value: json.fromTextMap(run.environment)),
+      MapEntry(key: "toolchain", value: json.fromTextMap(run.toolchain)),
+      MapEntry(key: "conditions", value: json.fromTextMap(run.conditions)),
+      MapEntry(key: "results", value: Json.Items(results.freeze())),
+    ),
+  )
+}
+
+/// One measurement as stored.
+export fn measurementJson(result: Measurement) -> Json {
+  var metrics: Map<String, Json> = Map.of()
+  for one in result.metrics {
+    metrics = metrics.inserted(
+      one.name,
+      Json.Fields(
+        Map.of(
+          MapEntry(key: "unit", value: Json.Text(one.unit)),
+          MapEntry(key: "values", value: floats(one.values)),
+          MapEntry(key: "dimension", value: Json.Text(one.dimension)),
+          MapEntry(key: "canonicalUnit", value: Json.Text(one.canonicalUnit)),
+          MapEntry(key: "canonical", value: floats(one.canonical)),
+          MapEntry(key: "better", value: Json.Text(one.better)),
+        ),
+      ),
+    )
+  }
+  var fields = Map.of(
+    MapEntry(key: "case", value: Json.Text(result.case)),
+    MapEntry(key: "input", value: Json.Text(result.input)),
+    MapEntry(key: "backend", value: Json.Text(result.backend)),
+    MapEntry(key: "conditions", value: json.fromTextMap(result.conditions)),
+    MapEntry(key: "load", value: floats(result.load)),
+    MapEntry(key: "metrics", value: Json.Fields(metrics)),
+  )
+  match result.inputSize {
+    Some(size) => {
+      fields = fields.inserted("inputSize", Json.Number(size))
+    }
+    None => {}
+  }
+  Json.Fields(fields)
+}
+
+fn floats(values: Array<Float>) -> Json {
+  var items = Vector.of()
+  for one in values {
+    items.push(Json.Number(one))
+  }
+  Json.Items(items.freeze())
+}
+
+/// A stored run, read back.
+export fn runOf(value: Json) -> Run {
+  var results = Vector.of()
+  match json.field(value, "results") {
+    Some(Json.Items(items)) => {
+      for item in items {
+        results.push(measurementOf(item))
+      }
+    }
+    _ => {}
+  }
+  Run(
+    id: json.text(value, "id"),
+    repository: json.text(value, "repository"),
+    commit: json.text(value, "commit"),
+    measuredAt: json.int(value, "measuredAtMs", 0),
+    source: json.text(value, "source"),
+    note: json.text(value, "note"),
+    environment: json.textMap(value, "environment"),
+    toolchain: json.textMap(value, "toolchain"),
+    conditions: json.textMap(value, "conditions"),
+    results: results.freeze(),
+  )
+}
+
+/// A stored measurement, read back.
+export fn measurementOf(value: Json) -> Measurement {
+  var metrics = Vector.of()
+  match json.field(value, "metrics") {
+    Some(Json.Fields(named)) => {
+      for entry in named {
+        metrics.push(
+          Metric(
+            name: entry.key,
+            unit: json.text(entry.value, "unit"),
+            values: floatsOf(json.field(entry.value, "values")),
+            dimension: json.text(entry.value, "dimension"),
+            canonicalUnit: json.text(entry.value, "canonicalUnit"),
+            canonical: floatsOf(json.field(entry.value, "canonical")),
+            better: json.text(entry.value, "better"),
+          ),
+        )
+      }
+    }
+    _ => {}
+  }
+  Measurement(
+    case: json.text(value, "case"),
+    input: json.text(value, "input"),
+    inputSize: match json.field(value, "inputSize") {
+      Some(Json.Number(size)) => Some(size)
+      _ => None
+    },
+    backend: json.text(value, "backend"),
+    conditions: json.textMap(value, "conditions"),
+    load: floatsOf(json.field(value, "load")),
+    metrics: metrics.freeze(),
+  )
+}
+
+fn floatsOf(value: Option<Json>) -> Array<Float> {
+  var out = Vector.of()
+  match value {
+    Some(Json.Items(items)) => {
+      for item in items {
+        match item {
+          Json.Number(number) => out.push(number)
+          _ => {}
+        }
+      }
+    }
+    _ => {}
+  }
+  out.freeze()
+}
+
+/// The metric `name` of `result`, if it was measured.
+export fn metricOf(result: Measurement, name: String) -> Option<Metric> {
+  for one in result.metrics {
+    if one.name == name {
+      return Some(one)
+    }
+  }
+  None
+}
+
+/// The first way two runs under one ID differ, for the error a conflicting
+/// repost gets.
+export fn difference(stored: Run, posted: Run) -> String {
+  if stored.repository != posted.repository {
+    return "`repository` is `{stored.repository}`, not `{posted.repository}`"
+  }
+  if stored.commit != posted.commit {
+    return "`commit` is `{stored.commit}`, not `{posted.commit}`"
+  }
+  if stored.measuredAt != posted.measuredAt {
+    return "`measuredAt` is {text.isoTime(stored.measuredAt)}, not {text.isoTime(posted.measuredAt)}"
+  }
+  if stored.environment != posted.environment {
+    return "`environment` differs"
+  }
+  if stored.toolchain != posted.toolchain {
+    return "`toolchain` differs"
+  }
+  if stored.conditions != posted.conditions {
+    return "`conditions` differ"
+  }
+  if stored.results.length() != posted.results.length() {
+    return "it has {stored.results.length()} results, not {posted.results.length()}"
+  }
+  var index = 0
+  for result in stored.results {
+    match posted.results.get(index) {
+      Some(other) => {
+        if json.render(measurementJson(result)) != json.render(measurementJson(other)) {
+          return "results[{index}] (`{result.case}`{inputNote(result.input)} on `{result.backend}`) differs"
+        }
+      }
+      None => {}
+    }
+    index += 1
+  }
+  "`source` or `note` differs"
+}

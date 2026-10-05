@@ -1,0 +1,319 @@
+{
+ "schema": 1,
+ "id": "cove-589-waiting",
+ "repository": "myuon/cove",
+ "commit": "fcf64a9",
+ "measuredAt": "2026-10-04T22:29:20+09:00",
+ "source": "examples/edge/compare/results/waiting.jsonl",
+ "note": "#589's comparison of the edge server against the same service in Go. Measured on 2026-10-04 before this commit (the rows carry no time); the time is the commit's.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "aggregate-1s",
+   "input": "inflight=1000",
+   "inputSize": 1000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "no"
+   },
+   "load": [
+    4.06884765625,
+    3.6728515625,
+    4.2158203125
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      302.47,
+      301.81,
+      289.22
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3292.6329,
+      3294.2656,
+      3443.0229
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      3296.8068,
+      3302.0069,
+      3448.4117
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      3299.0901,
+      3305.3212,
+      3450.6114
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3299.802,
+      3305.9076,
+      3451.8178
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      0.14,
+      0.15000000000000002,
+      0.13
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      57064,
+      57632,
+      57852
+     ]
+    }
+   }
+  },
+  {
+   "case": "aggregate-1s",
+   "input": "inflight=1000",
+   "inputSize": 1000,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "no"
+   },
+   "load": [
+    3.5966796875,
+    4.158203125,
+    3.9833984375
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      330.85,
+      329.27,
+      330.09
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3001.3158,
+      3001.3097,
+      3001.6874
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      3003.728,
+      3002.8058,
+      3004.0479
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      3005.6218,
+      3004.3432,
+      3006.369
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3006.5955,
+      3005.7226,
+      3008.405
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      0.13,
+      0.16999999999999998,
+      0.15
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      27816,
+      27736,
+      27812
+     ]
+    }
+   }
+  },
+  {
+   "case": "aggregate-1s",
+   "input": "inflight=10000",
+   "inputSize": 10000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "no"
+   },
+   "load": [
+    4.02685546875,
+    3.59228515625,
+    3.60400390625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      2631.29,
+      2706.21,
+      2621.7
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3455.5991,
+      3299.1811,
+      3470.2415
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      3629.4598,
+      3433.2873,
+      3630.3404
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      3676.5363,
+      3492.9911,
+      3675.6654
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3681.1047,
+      3506.4754,
+      3683.5466
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      1.52,
+      1.4900000000000002,
+      1.48
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      306284,
+      310540,
+      321488
+     ]
+    }
+   }
+  },
+  {
+   "case": "aggregate-1s",
+   "input": "inflight=10000",
+   "inputSize": 10000,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "no"
+   },
+   "load": [
+    3.9775390625,
+    4.009765625,
+    3.75048828125
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      3012.97,
+      3056.3,
+      3007.66
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3002.2278,
+      3002.2242,
+      3002.355
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      3005.3861,
+      3005.867,
+      3005.5901
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      3012.8752,
+      3008.9428,
+      3009.7447
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3016.029,
+      3020.9486,
+      3039.7758
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      1.48,
+      1.43,
+      1.39
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      232924,
+      230392,
+      232668
+     ]
+    }
+   }
+  }
+ ]
+}
