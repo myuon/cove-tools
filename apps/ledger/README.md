@@ -12,6 +12,7 @@ HTML are Cove; the host supplies the store, the log and the credential check.
 | `GET /api/runs`, `GET /api/runs/<id>` | the run list's summaries, and a run as stored, as JSON | none |
 | `GET /` | the runs, newest measured first, 50 a page (`?before=`; `?format=json`) | none |
 | `GET /runs/<id>` | one run: where and how it was measured, and every result's median and spread (`?format=json`: as stored) | none |
+| `GET /compare?a=…&b=…` | two runs, or the runs of two commits (`commit:<sha>`), case by case: absolute and relative differences, the spread on each side, and whether the two may be compared at all (`metric=`, `all=1`, `format=json`) | none |
 
 Reading is open — a ledger of benchmark numbers is meant to be looked at;
 put the host behind something that asks for a login if yours is not.
@@ -175,6 +176,54 @@ and field order do not matter):
 Two posts of different content racing under one new ID are not detected:
 the store has no compare-and-set, and the last one wins.
 
+## Comparing
+
+`/compare` takes two sides, **A** (the baseline) and **B**, from the form or
+the query: a run ID, or `commit:<sha>` (a prefix of seven or more works) for
+every run of a commit — where two runs of the commit measured the same case,
+the one measured later counts. A run's page links to `/compare?a=<id>`.
+
+```console
+$ open 'http://127.0.0.1:8080/ledger/compare?a=cove-589-capacity&b=cove-593-capacity'
+$ curl -s 'http://127.0.0.1:8080/ledger/compare?a=commit:fcf64a9&b=commit:bb13e6f&format=json'
+```
+
+Cases are matched by `case`, `input` and `backend`. For each metric both
+sides measured the page shows:
+
+- **A and B**: the median in the canonical unit, with the least–most and the
+  number of repetitions under it;
+- **B − A** and **relative** (B − A over A). ▲ is a change for the better and
+  ▼ for the worse (by the metric's `better`), but only when the two ranges
+  do not overlap. A difference inside the repetitions' own spread is grey
+  and marked `~`.
+
+A metric only one side measured shows "not measured in A/B", with no
+difference: nothing is compared against a zero. A measured zero is compared
+(0 → 3 is +3), but it has no relative difference. Cases only one side
+measured are listed by name under the table.
+
+**Largest differences**, at the top: the ten metrics with the largest
+relative difference among the comparable measurements.
+
+### What may be compared
+
+Before any number, each pair of measurements gets a verdict:
+
+| verdict | when | shown |
+| --- | --- | --- |
+| **not comparable** | the `environment` differs (another machine, OS, CPU), or the conditions do — the run's, with the result's own over them (another server, worker count, slice, latency taken from the send against from the intended start) | hidden, counted as "N not comparable (hidden: show them)"; with `all=1` shown in red with the reason. Never among the largest differences |
+| **warning** | the `toolchain` differs, or the load average does — medians more than 1.5× and at least 1.0 apart — or a side did not record it | compared, in yellow with the reason |
+| comparable | neither | compared |
+
+The form lists, under the chosen A, every run measured on the same machine
+under the same run-wide conditions, linked to compare against it, and says
+how many others are not comparable with it. In the sample data,
+`cove-589-capacity` against `cove-593-capacity` is comparable (the same
+machine, server and generator). `cove-host-perf-2026-10-05` against
+`…-noslice` is not: its `slice` condition is `2 ms` against `0 ms`, and the
+page says so.
+
 ## What is stored
 
 | key | what |
@@ -213,15 +262,17 @@ with a `Content-Security-Policy` that allows no script.
 | file | what |
 | --- | --- |
 | `ledger.cove` | routing, the API, access |
+| `comparing.cove` | the comparison page and its JSON |
 | `store.cove` | the records in `kv` |
 | `pages.cove` | the HTML |
 | `schema/` | reading and checking a posted run; the stored form |
 | `units/` | the units, their dimensions and the canonical unit of each |
 | `stats/` | medians and spreads; numbers written for people |
+| `compare/` | matching two sides' measurements, the comparability verdict, differences, the largest ones |
 | `json/`, `text/` | the webhook lab's JSON and text helpers (the JSON parser here also refuses a field named twice; `text` also reads ISO 8601 times) |
 | `importer/ledger_import.py` | converts the existing results, and posts runs |
 | `samples/` | the converted runs |
 
-`cove-host test ledger` runs the Cove tests in `schema/`, `stats/`, `json/`
-and `text/`. The Rust tests in `crates/cove-host/tests/ledger.rs` drive the
+`cove-host test ledger` runs the Cove tests in `schema/`, `stats/`,
+`compare/`, `json/` and `text/`. The Rust tests in `crates/cove-host/tests/ledger.rs` drive the
 app over HTTP.

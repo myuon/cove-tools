@@ -1,0 +1,345 @@
+use schema
+use schema.Run
+use schema.Measurement
+use schema.Metric
+use stats
+use stats.Spread
+
+// Comparing two sides — two runs, or the runs of two commits — case by case.
+// Pure: the sides are handed in already loaded.
+//
+// Whether two measurements may be compared at all is decided before any
+// number is: a measurement made on another machine, or under other
+// conditions (another server, another worker count, latency taken from
+// another point), is **not comparable**, and is left out of the differences
+// unless asked for. A different toolchain, or a load average that was very
+// different, is a **warning**: compared, but marked.
+
+/// One measurement and the run it belongs to.
+export struct Entry {
+  run: Run
+  result: Measurement
+}
+
+/// Whether two measurements may be compared.
+export struct Verdict {
+  /// `ok`, `warn` or `no`.
+  level: String
+  reasons: Array<String>
+}
+
+/// One metric of one case on both sides.
+export struct MetricRow {
+  name: String
+  /// The canonical unit, from whichever side measured it.
+  unit: String
+  better: String
+  a: Option<Spread>
+  b: Option<Spread>
+  /// `b`'s median minus `a`'s, when both were measured.
+  delta: Option<Float>
+  /// `delta` over `a`'s median, when both were measured and `a`'s is not 0.
+  ratio: Option<Float>
+  /// Whether the two ranges (least to most) overlap: a difference inside the
+  /// repetitions' own spread.
+  overlap: Bool
+}
+
+/// One case, at one input, on one backend, on both sides.
+export struct Row {
+  case: String
+  input: String
+  backend: String
+  a: Option<Entry>
+  b: Option<Entry>
+  verdict: Verdict
+  metrics: Array<MetricRow>
+}
+
+/// The identity of a measurement across runs.
+fn keyOf(result: Measurement) -> String {
+  "{result.case}\n{result.input}\n{result.backend}"
+}
+
+/// Every measurement of `runs`, by key; where two runs measured the same
+/// key, the one measured later wins. `runs` may be in any order.
+export fn entries(runs: Array<Run>) -> Array<Entry> {
+  let ordered = runs.sorted(by: fn(x, y) { x.measuredAt < y.measuredAt })
+  var keys = Vector.of()
+  var byKey: Map<String, Entry> = Map.of()
+  for run in ordered {
+    for result in run.results {
+      let key = keyOf(result)
+      if !byKey.contains(key) {
+        keys.push(key)
+      }
+      byKey = byKey.inserted(key, Entry(run: run, result: result))
+    }
+  }
+  var out = Vector.of()
+  for key in keys {
+    match byKey.get(key) {
+      Some(entry) => out.push(entry)
+      None => {}
+    }
+  }
+  out.freeze()
+}
+
+/// Every case of either side, `a`'s first in its order, then the ones only
+/// `b` measured.
+export fn rows(a: Array<Entry>, b: Array<Entry>) -> Array<Row> {
+  var byKey: Map<String, Entry> = Map.of()
+  for entry in b {
+    byKey = byKey.inserted(keyOf(entry.result), entry)
+  }
+  var seen: Map<String, Bool> = Map.of()
+  var out = Vector.of()
+  for entry in a {
+    let key = keyOf(entry.result)
+    seen = seen.inserted(key, true)
+    out.push(row(Some(entry), byKey.get(key)))
+  }
+  for entry in b {
+    if !seen.contains(keyOf(entry.result)) {
+      out.push(row(None, Some(entry)))
+    }
+  }
+  out.freeze()
+}
+
+fn row(a: Option<Entry>, b: Option<Entry>) -> Row {
+  let first = match a {
+    Some(entry) => entry
+    None => b.unwrapOr(emptyEntry())
+  }
+  let verdict = match a {
+    Some(left) => match b {
+      Some(right) => comparable(left, right)
+      None => Verdict(level: "ok", reasons: [])
+    }
+    None => Verdict(level: "ok", reasons: [])
+  }
+  Row(
+    case: first.result.case,
+    input: first.result.input,
+    backend: first.result.backend,
+    a: a,
+    b: b,
+    verdict: verdict,
+    metrics: metricRows(a, b),
+  )
+}
+
+fn emptyEntry() -> Entry {
+  Entry(
+    run: Run(
+      id: "",
+      repository: "",
+      commit: "",
+      measuredAt: 0,
+      source: "",
+      note: "",
+      environment: Map.of(),
+      toolchain: Map.of(),
+      conditions: Map.of(),
+      results: [],
+    ),
+    result: Measurement(case: "", input: "", inputSize: None, backend: "", conditions: Map.of(), load: [], metrics: []),
+  )
+}
+
+/// Whether `a` and `b` may be compared, and why not.
+export fn comparable(a: Entry, b: Entry) -> Verdict {
+  var refused = Vector.of()
+  var warned = Vector.of()
+  for difference in differences(a.run.environment, b.run.environment) {
+    refused.push("environment: {difference}")
+  }
+  for difference in differences(a.result.conditions, b.result.conditions) {
+    refused.push("conditions: {difference}")
+  }
+  for difference in differences(a.run.toolchain, b.run.toolchain) {
+    warned.push("toolchain: {difference}")
+  }
+  match loadNote(a.result.load, b.result.load) {
+    Some(note) => warned.push(note)
+    None => {}
+  }
+  if refused.length() > 0 {
+    for note in warned {
+      refused.push(note)
+    }
+    return Verdict(level: "no", reasons: refused.freeze())
+  }
+  if warned.length() > 0 {
+    return Verdict(level: "warn", reasons: warned.freeze())
+  }
+  Verdict(level: "ok", reasons: [])
+}
+
+/// What differs between two text maps: `cpu A vs B`, `slice only in one`.
+fn differences(a: Map<String, String>, b: Map<String, String>) -> Array<String> {
+  var out = Vector.of()
+  for entry in a {
+    match b.get(entry.key) {
+      Some(other) => {
+        if other != entry.value {
+          out.push("{entry.key} `{entry.value}` vs `{other}`")
+        }
+      }
+      None => out.push("{entry.key} `{entry.value}` vs not recorded")
+    }
+  }
+  for entry in b {
+    if !a.contains(entry.key) {
+      out.push("{entry.key} not recorded vs `{entry.value}`")
+    }
+  }
+  out.freeze()
+}
+
+/// A warning when the machine's load differed enough to matter — the
+/// median load averages more than half again apart, and by at least one —
+/// or when a side did not record it.
+export fn loadNote(a: Array<Float>, b: Array<Float>) -> Option<String> {
+  let left = stats.spread(a)
+  let right = stats.spread(b)
+  match left {
+    Some(x) => match right {
+      Some(y) => {
+        let low = x.median.min(y.median)
+        let high = x.median.max(y.median)
+        if high - low >= 1.0 && high > low * 1.5 {
+          return Some("load average {x.median.format(1)} vs {y.median.format(1)}")
+        }
+        None
+      }
+      None => Some("load average {x.median.format(1)} vs not recorded")
+    }
+    None => match right {
+      Some(y) => Some("load average not recorded vs {y.median.format(1)}")
+      None => Some("load average not recorded on either side")
+    }
+  }
+}
+
+/// Every metric either side measured, in the order `a` lists them and then
+/// `b`'s.
+fn metricRows(a: Option<Entry>, b: Option<Entry>) -> Array<MetricRow> {
+  var names = Vector.of()
+  for side in [a, b] {
+    match side {
+      Some(entry) => {
+        for one in entry.result.metrics {
+          if !names.contains(one.name) {
+            names.push(one.name)
+          }
+        }
+      }
+      None => {}
+    }
+  }
+  var out = Vector.of()
+  for name in names {
+    let left = metricOf(a, name)
+    let right = metricOf(b, name)
+    out.push(metricRow(name, left, right))
+  }
+  out.freeze()
+}
+
+fn metricOf(side: Option<Entry>, name: String) -> Option<Metric> {
+  match side {
+    Some(entry) => schema.metricOf(entry.result, name)
+    None => None
+  }
+}
+
+/// One metric on both sides. A side that did not measure it has no spread,
+/// and then there is no difference: nothing is compared against a zero.
+export fn metricRow(name: String, a: Option<Metric>, b: Option<Metric>) -> MetricRow {
+  let known = match a {
+    Some(one) => one
+    None => b.unwrapOr(Metric(name: name, unit: "", values: [], dimension: "", canonicalUnit: "", canonical: [], better: "lower"))
+  }
+  let left: Option<Spread> = match a {
+    Some(one) => stats.spread(one.canonical)
+    None => None
+  }
+  let right: Option<Spread> = match b {
+    Some(one) => stats.spread(one.canonical)
+    None => None
+  }
+  var delta: Option<Float> = None
+  var ratio: Option<Float> = None
+  var overlap = false
+  match left {
+    Some(x) => match right {
+      Some(y) => {
+        delta = Some(y.median - x.median)
+        if x.median != 0.0 {
+          ratio = Some((y.median - x.median) / x.median)
+        }
+        overlap = x.least <= y.most && y.least <= x.most
+      }
+      None => {}
+    }
+    None => {}
+  }
+  MetricRow(
+    name: name,
+    unit: known.canonicalUnit,
+    better: known.better,
+    a: left,
+    b: right,
+    delta: delta,
+    ratio: ratio,
+    overlap: overlap,
+  )
+}
+
+/// Whether a difference is an improvement: `1`, a regression: `-1`, or
+/// neither (no difference, or none to speak of): `0`.
+export fn direction(metric: MetricRow) -> Int {
+  match metric.delta {
+    Some(delta) => {
+      if delta == 0.0 {
+        0
+      } else if (delta > 0.0) == (metric.better == "higher") {
+        1
+      } else {
+        -1
+      }
+    }
+    None => 0
+  }
+}
+
+/// One metric of one row, for the list of the largest differences.
+export struct Change {
+  row: Row
+  metric: MetricRow
+}
+
+/// The `limit` largest relative differences between comparable
+/// measurements (a warning is still comparable), largest first. A metric
+/// one side did not measure has none; nor does one whose baseline is 0.
+export fn largest(rows: Array<Row>, limit: Int) -> Array<Change> {
+  var changes = Vector.of()
+  for row in rows {
+    if row.verdict.level != "no" && row.a.isSome() && row.b.isSome() {
+      for metric in row.metrics {
+        if metric.ratio.isSome() {
+          changes.push(Change(row: row, metric: metric))
+        }
+      }
+    }
+  }
+  let ordered = changes.freeze().sorted(by: fn(x, y) { size(x) > size(y) })
+  ordered.slice(0, limit)
+}
+
+fn size(change: Change) -> Float {
+  change.metric.ratio.unwrapOr(0.0).abs()
+}

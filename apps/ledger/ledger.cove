@@ -15,6 +15,8 @@ use text
 /// - `GET /api/runs`, `GET /api/runs/<id>`: the same as JSON.
 /// - `GET /` lists the runs, newest measured first; `GET /runs/<id>` shows
 ///   one.
+/// - `GET /compare?a=…&b=…` compares two runs, or the runs of two commits
+///   (`commit:<sha>`), case by case.
 export fn handle(request: web.Request) -> web.Response {
   let parts = request.path.split("/")
   let first = parts.get(1).unwrapOr("")
@@ -38,6 +40,9 @@ export fn handle(request: web.Request) -> web.Response {
       ""
     }
     return htmlResponse(200, runsPage(at, runs, older))
+  }
+  if first == "compare" && get {
+    return comparePage(request)
   }
   if first == "runs" && get {
     let id = parts.get(2).unwrapOr("")
