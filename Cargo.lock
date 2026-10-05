@@ -204,7 +204,7 @@ source = "git+https://github.com/myuon/cove?rev=e221f63#e221f63c2d3fa90c168e3199
 
 [[package]]
 name = "cove-host"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "bytes",
