@@ -387,6 +387,8 @@ fn on_x86_64_unix_the_apps_run_on_the_native_tier_and_still_yield() {
 
 #[test]
 fn the_sample_apps_check_and_their_tests_pass() {
+    // The webhook lab's admin secret comes from the environment.
+    std::env::set_var("WEBHOOKS_ADMIN_TOKEN", "test");
     let modules = cove_host::HostModules::standard();
     let checked = cove_host::toolchain::check(&samples(), &[], &modules).unwrap();
     assert!(checked.ok, "{}{}", checked.out, checked.err);

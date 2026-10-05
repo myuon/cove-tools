@@ -99,6 +99,16 @@ pub fn apps(specs: &[AppSpec]) -> Apps {
                 let file = file.replacen(source_module, spec.name, 1);
                 let text = std::fs::read_to_string(&path).unwrap();
                 std::fs::write(dir.join(file), text).unwrap();
+            } else if path.is_dir() {
+                // A module of the app's own, copied as it is.
+                let module = dir.join(path.file_name().unwrap());
+                std::fs::create_dir_all(&module).unwrap();
+                for file in std::fs::read_dir(&path).unwrap() {
+                    let file = file.unwrap().path();
+                    if file.extension().is_some_and(|e| e == "cove") {
+                        std::fs::copy(&file, module.join(file.file_name().unwrap())).unwrap();
+                    }
+                }
             }
         }
         let config = match spec.config {
