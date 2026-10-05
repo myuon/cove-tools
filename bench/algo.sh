@@ -8,8 +8,9 @@
 # Starts its own host on port 18181 with --workers 4 (admin off, a scratch
 # data directory) over `hello` and `algo` as they ship. For each K in
 # HEAVY (default "0 4 8"), K connections ask for
-# `/algo/matching?example=large&algorithm=augmenting&part=result` as fast as
-# they are answered (`cove-host-load --mix algo`, closed loop) while a second
+# `/algo/matching?example=large&algorithm=augmenting&part=result` (or, with
+# MIX=algo-sat, `/algo/sat?example=hard&part=result`) as fast as they are
+# answered (`cove-host-load --mix algo`, closed loop) while a second
 # generator asks `hello` at RATE req/s (default 500) for REQUESTS requests
 # (default 5000), latency from the intended start. After each, the algo
 # app's yield counters, as /_host/stats has them, cumulative.
@@ -17,6 +18,8 @@ set -eu
 REPS=${1:-3}
 BACKEND=${2:-auto}
 HEAVY=${HEAVY:-0 4 8}
+# `algo` (matching) or `algo-sat` (DPLL on pigeonhole 8 7).
+MIX=${MIX:-algo}
 RATE=${RATE:-500}
 REQUESTS=${REQUESTS:-5000}
 BIN=${BIN:-./target/checked}
@@ -46,9 +49,9 @@ print("# algo: tier=%s served=%s yields=%s yield_requests=%s yields_declined=%s 
 for rep in $(seq 1 "$REPS"); do
   echo "# rep $rep"
   for k in $HEAVY; do
-    echo "## heavy=$k --mix hello --rate $RATE --connections 16 --requests $REQUESTS"
+    echo "## heavy=$k ($MIX) --mix hello --rate $RATE --connections 16 --requests $REQUESTS"
     if [ "$k" -gt 0 ]; then
-      "$BIN/cove-host-load" --addr "$ADDR" --mix algo --connections "$k" --requests 1000000 \
+      "$BIN/cove-host-load" --addr "$ADDR" --mix "$MIX" --connections "$k" --requests 1000000 \
         --warmup 0 > /dev/null 2>&1 &
       HEAVYPID=$!
       # Until the heavy runs hold the workers.

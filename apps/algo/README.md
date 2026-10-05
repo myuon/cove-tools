@@ -15,6 +15,7 @@ keep answering.
 | `GET /matching` | maximum bipartite matching: the form, with the first example |
 | `GET /matching?example=<name>[&algorithm=…]` | the form filled with an example; the page's script runs it at once |
 | `POST /matching` (`graph`, `algorithm`) | runs a graph; the page with the result (works without scripts) |
+| `GET /sat`, `GET /sat?example=<name>`, `POST /sat` (`formula`, `budget`) | satisfiability, the same way |
 | `…&part=result` (`GET` or `POST`) | the result alone, as HTML — what the page's script asks for |
 | `GET /app.js` | the page's script |
 
@@ -147,23 +148,104 @@ and the cover.
 | `large` | `random 2000 2000 12000 42` | 1,996 |
 | `heavy` | `random 5000 5000 50000 1`, with `both`: the simple algorithm runs out of fuel | — (stopped: fuel) |
 
+## Satisfiability (SAT)
+
+### Input
+
+DIMACS CNF, or one generator line:
+
+```text
+c a comment
+p cnf 3 2            variables and clauses (optional)
+1 -3 0               a clause: literals, ended by 0
+2 3 -1 0
+random 3 60 256 7    random k-SAT: k, variables, clauses, seed
+pigeonhole 6 5       pigeons, holes
+sudoku 53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79
+```
+
+A clause may span lines and the last may omit its `0`; `%` ends the input
+(as some benchmark files do). A repeated literal counts once and a clause
+holding a literal and its negation is dropped (the page notes it when the
+`p` line's count then differs). An empty clause is refused, as is a
+variable above the `p` line's count. The reader scans bytes — no string is
+compared — so on the native tier it has machine code (see below).
+
+Generators:
+
+- **`random k n m seed`**: `m` clauses of `k` distinct variables, each
+  negated with probability ½, from the playground's PRNG. Near 4.26 clauses
+  a variable, random 3-SAT is about as likely satisfiable as not: of
+  `random 3 60 256 s`, seed 1 is satisfiable and seeds 2 and 3 are not.
+- **`pigeonhole p h`**: every pigeon in a hole, no two pigeons in one
+  (`p · h` variables, `p + h·p(p−1)/2` clauses). Unsatisfiable exactly when
+  `p > h`, and exponentially hard for DPLL (it is resolution, and the
+  principle has no short resolution proof).
+- **`sudoku <81 cells>`**: variable `81r + 9c + d` is "cell (r, c) holds
+  d + 1"; each cell exactly one digit, each row, column and box each digit
+  exactly once (11,988 clauses), each given a unit clause.
+
+Bounds: **5,000 variables, 50,000 clauses, 200,000 literals.**
+
+### What runs
+
+DPLL (`sat.solve`): **unit propagation over two watched literals** per
+clause (a linked list of watch slots per literal, so a watch moves in
+O(1)); **pure literals** assigned once, at the root; a **static branching
+order** — the variable in the most clauses first, its more frequent sign
+first, by a counting sort; **chronological backtracking** and no clause
+learning. The page reports decisions, conflicts, propagations, the
+deepest decision level and the pure literals.
+
+A **decision budget** (the form's field, default 1,000,000) is the app's
+own stop: past it the answer is *Unknown: the search gave up*, said in the
+page. The host's fuel and deadline stop it otherwise — `heavy` (10 pigeons,
+9 holes) runs out of fuel, and the page says *Stopped: fuel*.
+
+**The check**: a satisfying assignment is evaluated against every clause
+(`sat.unsatisfied`) before the page says "Satisfiable". An unsatisfiable
+answer has no certificate here (DPLL without learning keeps no proof); it
+is checked in the tests instead, on formulas whose answer is known.
+
+### The picture
+
+A satisfying assignment is drawn as a grid of squares, variable 1 top left,
+forty a row: filled in the first categorical colour for true, hollow for
+false (so the two differ by more than colour), each with a tooltip; up to
+1,000 variables. A sudoku is drawn as its grid instead: the givens in bold
+ink, the digits the solver found in the secondary ink, a legend for the
+two. The table view is the DIMACS `v` line, and the formula as read (the
+first 200 clauses).
+
+### Examples
+
+| example | formula | answer | search (native) |
+| --- | --- | --- | --- |
+| `tiny` | 3 variables, 2 clauses | satisfiable | 2 decisions |
+| `contradiction` | all four clauses over two variables | unsatisfiable | 1 decision, 2 conflicts |
+| `pigeonhole` | 6 pigeons, 5 holes | unsatisfiable | 374 decisions, 1.6 ms |
+| `random` | `random 3 60 256 1` | satisfiable | 17 decisions |
+| `sudoku` | the classic puzzle (30 givens) | satisfiable, one solution | 0 decisions: propagation alone solves it |
+| `hard` | 8 pigeons, 7 holes | unsatisfiable | 32,780 decisions, ~170 ms |
+| `heavy` | 10 pigeons, 9 holes | — | stopped: fuel |
+
 ## Limits
 
 `app.toml`, per request:
 
 | limit | value | why |
 | --- | --- | --- |
-| `fuel` | 400,000,000 | `large` by the simple algorithm takes about 125 M (both algorithms and the check, native tier); `heavy` by it does not fit, on purpose |
+| `fuel` | 400,000,000 | `large` by the simple algorithm takes about 125 M (both algorithms and the check, native tier), SAT's `hard` about 160 M; matching's and SAT's `heavy` do not fit, on purpose |
 | `deadline` | 10 s | far above any run that fits its fuel, on the VM too; a run parked or queued past it is stopped |
-| `max_heap_words` | 2 Mi words (16 MiB) | a 5,000 × 5,000 graph with 50,000 edges and its working arrays is well inside it |
+| `max_heap_words` | 2 Mi words (16 MiB) | a 5,000 × 5,000 graph with 50,000 edges, or a formula at its bounds, and their working arrays are well inside it |
 | `max_in_flight` | 4 | at most four runs of this app at once, on any number of workers: a burst of heavy runs cannot take every worker of a larger host |
 | `max_queued` | 32 | past it, 429 for this app only |
-| `max_request_bytes` | 256 KiB | a written graph at the edge bound fits |
+| `max_request_bytes` | 256 KiB | a written graph at the edge bound fits; a DIMACS file larger than that is over the literal bound anyway |
 | `max_response_bytes` | 4 MiB | the largest page (500 table rows) is far inside it |
 | `max_host_calls` | 64 | the clock is read four times a run |
 
-The app's own bounds (vertices, edges) are checked before anything runs and
-answered in the page.
+The app's own bounds (vertices, edges; variables, clauses, literals; the
+decision budget) are checked before anything runs and answered in the page.
 
 ## Reproducibility: the PRNG
 
@@ -188,11 +270,21 @@ $ cargo test --profile checked --test algo              # the app on a host
   search; on larger ones they agree and are proved; a non-maximum matching
   and a matching with a non-edge are *not* proved; a seed is always the same
   graph with exactly the edges asked for; the input format and every refusal.
+- `sat_test.cove`: small formulas with known answers (and the unique model
+  of one); the pigeonhole principle for 1–5 holes, both ways; on 80 random
+  3-SAT formulas (3–10 variables, 35 of them satisfiable) the solver agrees
+  with trying all 2^n assignments, and every model it gives satisfies every
+  clause; a seed is always the same formula, with distinct variables per
+  clause; the sudoku's known first row, and a sudoku with two fives in a row
+  unsatisfiable; the decision budget; every refusal, with the line.
 - `rng_test.cove`: Marsaglia's sequence, seeds, ranges.
 - `crates/cove-host/tests/algo.rs`: the known answers through the page,
   for all three algorithm choices, with the proof; the meter headers; CSP,
   the script, escaping of hostile vertex names, refusals; a run out of fuel
-  answered `x-cove-stop: fuel`, one past its deadline `deadline`; a client
+  answered `x-cove-stop: fuel`, one past its deadline `deadline`; SAT's
+  known answers through the page, its models re-checked in Rust against the
+  formula as the page prints it, the sudoku's first row, the budget's
+  *Unknown*, SAT's `heavy` stopped by fuel; a client
   that goes away cancels its heavy run (`errors.cancelled`, nothing in
   flight after); and **the responsiveness test** below, on the VM and on the
   native tier; and that every function on the heavy path has machine code.
@@ -200,8 +292,9 @@ $ cargo test --profile checked --test algo              # the app on a host
 ## Responsiveness
 
 **Tested** (`algo.rs::the_other_apps_answer_while_algo_computes_on_*`, no
-duration asserted): a host with **two workers** and **four clients** asking
-for the simple algorithm on `large` again as soon as they are answered;
+duration asserted): a host with **two workers** and **four clients**, two
+asking for the simple matching algorithm on `large` and two for SAT's `hard`
+(DPLL refuting 8 pigeons in 7 holes), each again as soon as it is answered;
 while at least one heavy run is in flight, ten `hello` requests and ten
 webhooks posted to the webhook lab all complete, the heavy answers all agree,
 and the heavy runs yielded (`yields > 0`). On the VM and on the native tier.
@@ -224,17 +317,31 @@ Medians of three repetitions, 5,000 `hello` requests each; raw output in
 | VM | 4 | 2.84 ms | **4.65 ms** | ~64 | 227 | 0 | 0 |
 | VM | 8 | 2.66 ms | **4.40 ms** | ~66 | 220 | 0 | 0 |
 
+The same with SAT's `hard` as the heavy run (`MIX=algo-sat HEAVY="0 4" sh
+bench/algo.sh 3 <backend>`; `bench/results/algo-sat-2026-10-05-*.txt`):
+
+| tier | heavy clients | `hello` p50 | `hello` p99 | heavy runs answered in the 10 s | yields per heavy run | declined per run | overdue |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| native | 0 | 1.24 ms | 2.06 ms | — | — | — | — |
+| native | 4 | 2.70 ms | **4.52 ms** | ~250 | 57 | 0 | 0 |
+| VM | 0 | 1.15 ms | 2.03 ms | — | — | — | — |
+| VM | 4 | 2.65 ms | **4.45 ms** | ~48 | 302 | 0 | 0 |
+
 With every worker held by a heavy run, a `hello` waits for the next yield —
 at most one 2 ms slice plus a tick of the monitor — and its p99 goes from 2
 to under 5 ms. Eight heavy clients are no worse than four: the app's
 `max_in_flight = 4` keeps the other four queued in *its own* queue, where
-they cost `hello` nothing. The heavy run is about 6.5 times faster on the
-native tier (≈ 100 ms against ≈ 620 ms on a worker).
+they cost `hello` nothing. The heavy matching run is about 6.5 times faster on
+the native tier (≈ 100 ms against ≈ 620 ms on a worker), the DPLL run about
+5 times (≈ 180 ms against ≈ 940 ms). On the native tier the SAT runs decline
+no yield at all: everything from the entry to the solver's loop has machine
+code (the request is a `GET`, so no form is decoded).
 
 ```console
 $ cargo build --profile checked
 $ sh bench/algo.sh 3 native > bench/results/algo-$(date +%F)-native.txt
 $ sh bench/algo.sh 3 vm > bench/results/algo-$(date +%F)-vm.txt
+$ MIX=algo-sat HEAVY="0 4" sh bench/algo.sh 3 native > bench/results/algo-sat-$(date +%F)-native.txt
 ```
 
 ## Yields on the native tier
@@ -303,11 +410,79 @@ The ~290 declined yields per heavy run that remain are those leaves (the
 input's words, the form) being polled while they run: none is long enough
 to be overdue.
 
+**SAT met the third shape.** `sat.read` began `if generator != "" {` — and
+a `String` comparison is "an operand outside a bound" to the code
+generator, so the whole reader, the DIMACS byte scanner and the calls into
+the generators, was left on the encoded tier below compiled `satResult`.
+Comparing `byteLength()` instead (and `startsWith` for the generator's
+name) gave all of `sat` machine code; `algo.rs` holds that too.
+
+**A wrong answer, not only a held worker: a copy that is sliced.** The
+responsiveness test failed once in a full suite run, and the message it
+now prints said why: a heavy matching run on the native tier answered 500,
+
+```text
+error[cove::runtime]: `runCopy` writes 12000 element(s) to 0 of a destination of 0
+   --> algo/matching/matching.cove:384:14
+384 |   var from = values.toVector()
+```
+
+(and, in other runs, `… to 0 of a destination of 1`, `this run has no
+memory left`, and once from `counts.snapshot()` in `matching.build`:
+`writes 2001 element(s) to 0 of a destination of 4`). `Array.toVector` is
+lowered as `Len`, `Alloc(store, len)`, `RunCopy`: the store that came back
+from the allocation was not the size asked for. Under load — two workers,
+eight clients on `example=large&algorithm=augmenting` — it was **2 runs of
+400** (16,347 yields); with `--slice 0`, so that nothing yields, **0 of 800**;
+on the VM, **0 of 150** (41,641 yields). So it is the native tier resuming a
+sliced run, at or around an allocation with a length from a slot.
+
+`bench/repro/` reproduces it without the playground: one app of 70 lines in
+the generator's shape (draw into a vector, `freeze`, `toVector` in a callee,
+merge-sort, repeat), and `sh bench/repro/run.sh [native|vm] [slice]` asks it
+160 times, 16 at a time, on two workers: **13 of 160** failed on the native
+tier with the 2 ms slice, **0 of 160** with `--slice 0`, 0 on the VM (and 28
+of 160 with `toArray` in place of `freeze`, still always at `toVector`).
+
+**The workaround**, in the app: the three copies on the generator's path
+(`cells.toVector()` in `random`, the two in `distinctSorted`, and
+`counts.snapshot()` in `build`) push their elements one by one instead
+(`matching.copyOf`). After it: **0 of 600** matching runs (25,150 yields)
+and **0 of 400** SAT runs (53,193 yields) failed under the same load. The
+SAT solver makes no such copy.
+
 **For upstream (myuon/cove)**: (1) a function that makes any host call is
 left on the encoded tier by the template compiler, and so is any function
-that writes a lambda; (2) compiled code below such a frame cannot yield
+that writes a lambda or compares two `String`s; (2) compiled code below such a frame cannot yield
 (ADR 0085), so an algorithm whose caller reads the clock — the natural way to
 time it — holds its worker for its whole run, with nothing at the source
 level to say so. Either lowering `CallHost`/`FuncRef` (a call to a runtime
 helper), or letting a compiled callee of an encoded frame yield, removes the
 trap; until then a host's `native.refusals` report is how an app finds it.
+(3) **A sliced native run can resume with a wrong-sized allocation**
+(`Array.toVector`, `Vector.snapshot`): an incorrect answer, not a slow one,
+reproduced by `bench/repro/`. This is the one to fix first. (4) A compiled
+loop whose body is one `toVector()` of a 12,000-element array and a length
+check, 40,000 turns, was asked to yield 22 times and never did — 0 yields,
+0 declined, 22 overdue: such a loop does not appear to reach a safepoint the
+monitor's request is seen at.
+
+## Cove gaps met while writing it
+
+For upstream (myuon/cove), besides the native-tier shapes above:
+
+- **No `Float.exp`/`ln`** in the standard library (`sqrt` is there).
+- **An `if` in statement position must still have matching branch types**:
+  `if a { x += 1 } else { v.set(i, 0) }` is refused because `set` answers an
+  `Option`. Reordering the branch so it ends in a `Unit` statement is the
+  workaround everywhere in this app.
+- **An element type inferred only from later use can pass `check` and fail
+  lowering** with an empty diagnostic: `var levels = Vector.of()` used by
+  `pop()` before any `push` checked, then `cove-host check` reported "does
+  not lower:" and nothing else (the test runner said "the type of this
+  expression was never settled `_`" without a location). Writing
+  `Vector<Int>` on the binding fixes it.
+- **`freeze()` cannot see through a helper that returns a fresh vector**
+  (`var a = filled(n, -1)` … `a.freeze()` is refused), so the algorithms
+  answer with `toArray()`, an O(n) copy; and there is no
+  `Vector.filled(n, value)` to make one.

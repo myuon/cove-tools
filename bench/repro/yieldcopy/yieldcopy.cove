@@ -1,0 +1,79 @@
+use web
+
+/// The playground generator's shape (`apps/algo/matching`, before its
+/// workaround): draw cells, copy them into a vector, merge-sort and
+/// deduplicate, again, five times. Answers the cells drawn: 60000.
+export fn handle(request: web.Request) -> web.Response {
+  var total = 0
+  var turn = 0
+  while turn < 5 {
+    var state = 12345 + turn
+    var cells: Array<Int> = []
+    while cells.length() < 12000 {
+      var drawn = cells.toVector()
+      var more = 12000 - cells.length()
+      while more > 0 {
+        state = state.bitXor(state.shiftLeft(13))
+        state = state.bitXor(state.shiftRightLogical(7))
+        state = state.bitXor(state.shiftLeft(17))
+        drawn.push(state.shiftRightLogical(2) % 4000000)
+        more -= 1
+      }
+      cells = distinctSorted(drawn.freeze())
+    }
+    total += cells.length()
+    turn += 1
+  }
+  web.Response(status: 200, headers: Map.of(), body: "{total}\n")
+}
+
+/// The distinct values of `values`, ascending.
+///
+/// Sorted by a merge sort of its own rather than `sorted(by:)`: a function
+/// that writes a lambda stays on the encoded tier, and the generator's sort
+/// of fifty thousand cells is long enough that a run below it holding its
+/// worker would be seen by the other apps (ADR 0085's limit; see the README).
+fn distinctSorted(values: Array<Int>) -> Array<Int> {
+  let n = values.length()
+  var from = values.toVector()
+  var into = values.toVector()
+  var width = 1
+  while width < n {
+    var low = 0
+    while low < n {
+      let middle = (low + width).min(n)
+      let high = (low + 2 * width).min(n)
+      var i = low
+      var j = middle
+      var k = low
+      while k < high {
+        let a = from.get(i).unwrapOr(0)
+        let b = from.get(j).unwrapOr(0)
+        if i < middle && (j >= high || a <= b) {
+          into.set(k, a)
+          i += 1
+        } else {
+          into.set(k, b)
+          j += 1
+        }
+        k += 1
+      }
+      low = high
+    }
+    let swap = from
+    from = into
+    into = swap
+    width *= 2
+  }
+  var out = Vector.of()
+  var at = 0
+  while at < n {
+    let value = from.get(at).unwrapOr(0)
+    if at == 0 || value != from.get(at - 1).unwrapOr(0) {
+      out.push(value)
+    }
+    at += 1
+  }
+  out.freeze()
+}
+

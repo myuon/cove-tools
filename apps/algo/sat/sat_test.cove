@@ -1,0 +1,149 @@
+fn bounds() -> Bounds {
+  Bounds(variables: 5000, clauses: 50000, literals: 200000)
+}
+
+fn formulaOf(text: String) -> Result<Formula, Error> {
+  match read(text, bounds()) {
+    Read.Ok(formula) => Ok(formula)
+    Read.Invalid(why) => Err(Error(why))
+  }
+}
+
+/// `formula`'s satisfiability by the solver, with a model checked clause by
+/// clause.
+fn decide(formula: Formula) -> Result<Bool, Error> {
+  match solve(formula, 10000000).verdict {
+    Verdict.Satisfiable(values) => {
+      assertEqual(values.length(), formula.variables)?
+      assertEqual(unsatisfied(formula, values), 0)?
+      Ok(true)
+    }
+    Verdict.Unsatisfiable => Ok(false)
+    Verdict.GaveUp => Err(Error("gave up"))
+  }
+}
+
+test fn smallFormulasHaveTheirKnownAnswer() -> Result<Unit, Error> {
+  assert(decide(formulaOf("p cnf 3 2\n1 -3 0\n2 3 -1 0\n")?)?)?
+  // x and not x.
+  assert(!decide(formulaOf("1 0\n-1 0\n")?)?)?
+  // All four clauses over two variables: no assignment escapes them.
+  assert(!decide(formulaOf("1 2 0\n-1 2 0\n1 -2 0\n-1 -2 0\n")?)?)?
+  // Three of them: exactly one model, x1 = x2 = true.
+  match solve(formulaOf("1 2 0\n-1 2 0\n1 -2 0\n")?, 100).verdict {
+    Verdict.Satisfiable(values) => assertEqual(values, [true, true])?
+    _ => return Err(Error("not satisfied"))
+  }
+  // A clause may span lines and the last may omit its 0; a tautology is
+  // dropped and a repeated literal kept once.
+  let loose = formulaOf("c a comment\n1\n2 0 3 -3 0 -1 -1 -2\n")?
+  assertEqual(loose.clauses(), 2)?
+  assertEqual(loose.literals, [0, 2, 1, 3])?
+  assert(decide(loose)?)?
+  Ok(())
+}
+
+test fn thePigeonholePrincipleHolds() -> Result<Unit, Error> {
+  // n + 1 pigeons do not fit in n holes; n do.
+  for holes in [1, 2, 3, 4, 5] {
+    assert(!decide(pigeonhole(holes + 1, holes))?)?
+    assert(decide(pigeonhole(holes, holes))?)?
+  }
+  assertEqual(pigeonhole(6, 5).clauses(), 6 + 5 * 15)?
+  assertEqual(pigeonhole(6, 5).declaredClauses, 6 + 5 * 15)?
+  Ok(())
+}
+
+test fn agreesWithTryingEverythingOnRandomFormulas() -> Result<Unit, Error> {
+  var satisfiable = 0
+  var seed = 1
+  while seed <= 80 {
+    let variables = 3 + seed % 8
+    // Above the small-formula threshold, so both answers occur.
+    let clauses = variables * 6 + seed % 5 - 2
+    let formula = random(3, variables, clauses, seed)
+    let expected = bruteForce(formula)
+    assertEqual(decide(formula)?, expected)?
+    if expected {
+      satisfiable += 1
+    }
+    seed += 1
+  }
+  // Both answers occur: 35 of the 80 are satisfiable.
+  assertEqual(satisfiable, 35)?
+  Ok(())
+}
+
+test fn aRandomFormulaIsTheSameForTheSameSeed() -> Result<Unit, Error> {
+  let a = random(3, 50, 213, 7)
+  let b = random(3, 50, 213, 7)
+  assertEqual(a.literals, b.literals)?
+  assert(a.literals != random(3, 50, 213, 8).literals)?
+  assertEqual(a.clauses(), 213)?
+  // Three distinct variables in every clause.
+  var c = 0
+  while c < a.clauses() {
+    let x = a.literals.get(3 * c).unwrapOr(0) / 2
+    let y = a.literals.get(3 * c + 1).unwrapOr(0) / 2
+    let z = a.literals.get(3 * c + 2).unwrapOr(0) / 2
+    assert(x != y && y != z && x != z)?
+    c += 1
+  }
+  Ok(())
+}
+
+test fn aSudokuIsSolvedAndKeepsItsGivens() -> Result<Unit, Error> {
+  let puzzle = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+  let formula = formulaOf("sudoku {puzzle}")?
+  assertEqual(formula.variables, 729)?
+  match solve(formula, 1000000).verdict {
+    Verdict.Satisfiable(values) => {
+      assertEqual(unsatisfied(formula, values), 0)?
+      // The known solution's first row.
+      var row = Vector.of()
+      var column = 0
+      while column < 9 {
+        var digit = 0
+        while digit < 9 {
+          if values.get(9 * column + digit).unwrapOr(false) {
+            row.push(digit + 1)
+          }
+          digit += 1
+        }
+        column += 1
+      }
+      assertEqual(row.freeze(), [5, 3, 4, 6, 7, 8, 9, 1, 2])?
+    }
+    _ => return Err(Error("the sudoku was not solved"))
+  }
+  // Two fives in the first row: no solution.
+  assert(!decide(formulaOf("sudoku 55..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79")?)?)?
+  Ok(())
+}
+
+test fn theBudgetStopsTheSearch() -> Result<Unit, Error> {
+  let outcome = solve(pigeonhole(8, 7), 50)
+  match outcome.verdict {
+    Verdict.GaveUp => assertEqual(outcome.decisions, 50)?
+    _ => return Err(Error("pigeonhole 8 7 was decided in 50 decisions"))
+  }
+  Ok(())
+}
+
+test fn badInputIsRefusedWithTheLine() -> Result<Unit, Error> {
+  for text in ["1 x 0", "1 2 0\n0\n", "p cnf 2 1\n3 0", "-0", "p cnf 1\n", "random 3 2 5", "pigeonhole 3", "sudoku 123", "c only a comment\n"] {
+    match read(text, bounds()) {
+      Read.Ok(_) => return Err(Error("`{text}` was read"))
+      Read.Invalid(_) => {}
+    }
+  }
+  match read("1 2 0\n3 x 0", bounds()) {
+    Read.Ok(_) => return Err(Error("read"))
+    Read.Invalid(why) => assert(why.startsWith("line 2"))?
+  }
+  match read("1 2 3 0", Bounds(variables: 2, clauses: 10, literals: 10)) {
+    Read.Ok(_) => return Err(Error("read"))
+    Read.Invalid(why) => assert(why.contains("above 2"))?
+  }
+  Ok(())
+}

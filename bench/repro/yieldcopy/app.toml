@@ -1,0 +1,8 @@
+# The native-tier yield/copy reproduction: see run.sh.
+grant = []
+
+[limits]
+fuel = 2000000000
+deadline = "60s"
+max_in_flight = 16
+max_queued = 64

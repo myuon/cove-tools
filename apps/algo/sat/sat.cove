@@ -1,0 +1,855 @@
+use rng
+
+// Satisfiability of a formula in conjunctive normal form: the formula, a
+// DPLL solver, and a check of its answer.
+//
+// - `solve` is DPLL: unit propagation over two watched literals per clause,
+//   pure literals assigned once at the root, a static branching order (the
+//   variable in the most clauses first, its more frequent sign first), and
+//   chronological backtracking — no clause learning, so a hard formula
+//   stays hard, which is the point of the heavy examples.
+// - `check` evaluates every clause under an assignment, without trusting
+//   the solver.
+// - The generators — random k-SAT, the pigeonhole principle, sudoku — make
+//   formulas whose answers are known.
+//
+// A literal is `2 * variable + sign`, variables from 0, `sign` 1 for a
+// negated one; DIMACS numbers variables from 1. Nothing here writes a lambda
+// or calls the host, and the reader scans bytes rather than comparing
+// strings, so on the native tier all of it has machine code and a long
+// search yields like any other loop (see the README).
+
+/// A formula: clause `c` is `literals[start[c]..<start[c + 1]]`.
+export struct Formula {
+  variables: Int
+  start: Array<Int>
+  literals: Array<Int>
+  /// What the input said it would have, for the page: `p cnf V C`.
+  declaredClauses: Int
+  /// A one-line description of where the formula came from.
+  origin: String
+  /// For a sudoku: the 81 givens, 0 for an empty cell. Empty otherwise.
+  givens: Array<Int>
+}
+
+impl Formula {
+  /// How many clauses.
+  fn clauses(self) -> Int {
+    self.start.length() - 1
+  }
+}
+
+/// What a read came to.
+export enum Read {
+  Ok(Formula)
+  Invalid(String)
+}
+
+/// The largest formula the playground takes.
+export struct Bounds {
+  variables: Int
+  clauses: Int
+  literals: Int
+}
+
+/// The solver's verdict.
+export enum Verdict {
+  /// Satisfiable, with an assignment: `values[v]` for variable `v`.
+  Satisfiable(Array<Bool>)
+  Unsatisfiable
+  /// The solver stopped at its decision budget.
+  GaveUp
+}
+
+/// What a search came to and what it cost.
+export struct Outcome {
+  verdict: Verdict
+  decisions: Int
+  propagations: Int
+  conflicts: Int
+  /// Variables assigned as pure literals at the root.
+  pure: Int
+  /// The deepest the decision stack went.
+  depth: Int
+}
+
+// ------------------------------------------------------------------ input
+
+/// Reads a formula: DIMACS CNF, or one generator line.
+///
+/// ```text
+/// c a comment
+/// p cnf 3 2            optional: variables and clauses
+/// 1 -3 0               a clause: literals, ended by 0
+/// 2 3 -1 0
+/// random 3 60 256 7    random 3-SAT: k, variables, clauses, seed
+/// pigeonhole 6 5       6 pigeons in 5 holes (unsatisfiable when more pigeons)
+/// sudoku 53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79
+/// ```
+///
+/// A clause may span lines; the last may omit its `0`. A repeated literal
+/// counts once, and a clause holding a literal and its negation is always
+/// true and dropped. Without a `p` line the variables are the largest
+/// number used.
+export fn read(input: String, bounds: Bounds) -> Read {
+  let generator = generatorLine(input)
+  // Lengths, not `!=`: a `String` comparison keeps a function off the
+  // native tier, and this one runs the whole reader.
+  if generator.byteLength() > 0 {
+    return generate(generator, bounds)
+  }
+  var start = Vector.of(0)
+  var literals = Vector.of()
+  var current = Vector.of()
+  var declaredVariables = -1
+  var declaredClauses = -1
+  var largest = 0
+  var line = 1
+  let end = input.byteLength()
+  var at = 0
+  while at < end {
+    let byte = input.byteAt(at)
+    if byte == 10 {
+      line += 1
+      at += 1
+    } else if byte == 32 || byte == 9 || byte == 13 {
+      at += 1
+    } else if byte == 99 || byte == 37 {
+      // `c …`, a comment, and `%`, which some benchmark files end with:
+      // the rest of the line.
+      if byte == 37 {
+        at = end
+      }
+      while at < end && input.byteAt(at) != 10 {
+        at += 1
+      }
+    } else if byte == 112 {
+      // `p cnf V C`.
+      var numbers = Vector.of()
+      at += 1
+      while at < end && input.byteAt(at) != 10 {
+        let b = input.byteAt(at)
+        if b >= 48 && b <= 57 {
+          var value = 0
+          while at < end && input.byteAt(at) >= 48 && input.byteAt(at) <= 57 {
+            if value > 100000000 {
+              return Read.Invalid("line {line}: a number this large is not a formula the playground can take")
+            }
+            value = value * 10 + input.byteAt(at) - 48
+            at += 1
+          }
+          numbers.push(value)
+        } else {
+          at += 1
+        }
+      }
+      if numbers.length() != 2 {
+        return Read.Invalid("line {line}: the problem line is `p cnf <variables> <clauses>`")
+      }
+      declaredVariables = numbers.get(0).unwrapOr(0)
+      declaredClauses = numbers.get(1).unwrapOr(0)
+      if declaredVariables > bounds.variables {
+        return Read.Invalid("line {line}: at most {bounds.variables} variables")
+      }
+    } else if byte == 45 || (byte >= 48 && byte <= 57) {
+      var negative = false
+      if byte == 45 {
+        negative = true
+        at += 1
+      }
+      var value = 0
+      var digits = 0
+      while at < end && input.byteAt(at) >= 48 && input.byteAt(at) <= 57 {
+        if value > 100000000 {
+          return Read.Invalid("line {line}: a variable this large is not a formula the playground can take")
+        }
+        value = value * 10 + input.byteAt(at) - 48
+        digits += 1
+        at += 1
+      }
+      if digits == 0 {
+        return Read.Invalid("line {line}: `-` is not followed by a variable")
+      }
+      if at < end && !isSpace(input.byteAt(at)) {
+        return Read.Invalid("line {line}: a literal is a whole number, like `3` or `-12`")
+      }
+      if value == 0 {
+        if negative {
+          return Read.Invalid("line {line}: `-0` is not a literal")
+        }
+        if !closeClause(var current, var literals, var start) {
+          return Read.Invalid("line {line}: an empty clause can never be satisfied — remove it, or the formula is trivially unsatisfiable")
+        }
+        if start.length() - 1 > bounds.clauses {
+          return Read.Invalid("at most {bounds.clauses} clauses")
+        }
+      } else {
+        if value > bounds.variables || (declaredVariables >= 0 && value > declaredVariables) {
+          let limit = if declaredVariables >= 0 { declaredVariables.min(bounds.variables) } else { bounds.variables }
+          return Read.Invalid("line {line}: variable {value} is above {limit}")
+        }
+        largest = largest.max(value)
+        current.push(2 * (value - 1) + if negative { 1 } else { 0 })
+        if literals.length() + current.length() > bounds.literals {
+          return Read.Invalid("at most {bounds.literals} literals in all")
+        }
+      }
+    } else {
+      return Read.Invalid("line {line}: expected a literal, `0`, a `c` comment or the `p cnf` line")
+    }
+  }
+  if current.length() > 0 {
+    closeClause(var current, var literals, var start)
+  }
+  let variables = if declaredVariables >= 0 { declaredVariables } else { largest }
+  if start.length() == 1 {
+    return Read.Invalid("the formula has no clauses: write some, or pick an example")
+  }
+  Read.Ok(
+    Formula(
+      variables: variables,
+      start: start.toArray(),
+      literals: literals.toArray(),
+      declaredClauses: declaredClauses,
+      origin: "DIMACS",
+      givens: [],
+    ),
+  )
+}
+
+fn isSpace(byte: Int) -> Bool {
+  byte == 32 || byte == 9 || byte == 13 || byte == 10
+}
+
+/// Ends the clause in `current`: repeated literals once, a tautology
+/// dropped. Whether it was not empty.
+fn closeClause(var current: Vector<Int>, var literals: Vector<Int>, var start: Vector<Int>) -> Bool {
+  if current.length() == 0 {
+    return false
+  }
+  let first = literals.length()
+  var tautology = false
+  for literal in current {
+    var seen = false
+    var k = first
+    while k < literals.length() {
+      let other = literals.get(k).unwrapOr(-1)
+      if other == literal {
+        seen = true
+      }
+      if other == literal.bitXor(1) {
+        tautology = true
+      }
+      k += 1
+    }
+    if !seen {
+      literals.push(literal)
+    }
+  }
+  if tautology {
+    while literals.length() > first {
+      literals.pop()
+    }
+  } else {
+    start.push(literals.length())
+  }
+  var empty = Vector.of()
+  current = empty
+  true
+}
+
+/// The input's generator line, if its first line that is not a comment is
+/// one; `""` otherwise.
+fn generatorLine(input: String) -> String {
+  for raw in input.split("\n") {
+    let line = raw.trim()
+    if line == "" || line.startsWith("c ") || line == "c" {
+      continue
+    }
+    if line.startsWith("random ") || line.startsWith("pigeonhole ") || line.startsWith("sudoku ") {
+      return line
+    }
+    return ""
+  }
+  ""
+}
+
+/// A formula from a generator line.
+fn generate(line: String, bounds: Bounds) -> Read {
+  var words = Vector.of()
+  for word in line.split(" ") {
+    if word.byteLength() > 0 {
+      words.push(word)
+    }
+  }
+  let name = words.get(0).unwrapOr("")
+  if name.startsWith("sudoku") {
+    if words.length() != 2 {
+      return Read.Invalid("`sudoku` takes the 81 cells, row by row, digits and `.` for an empty cell")
+    }
+    return sudoku(words.get(1).unwrapOr(""))
+  }
+  var numbers = Vector.of()
+  for word in words.slice(1, words.length()) {
+    match Int.parse(word) {
+      Ok(value) => numbers.push(value)
+      Err(_) => return Read.Invalid("`{word}` is not a whole number")
+    }
+  }
+  if name.startsWith("pigeonhole") {
+    if numbers.length() != 2 {
+      return Read.Invalid("`pigeonhole` takes the pigeons and the holes: `pigeonhole 6 5`")
+    }
+    let pigeons = numbers.get(0).unwrapOr(0)
+    let holes = numbers.get(1).unwrapOr(0)
+    if pigeons < 1 || holes < 1 || pigeons > 40 || holes > 40 {
+      return Read.Invalid("`pigeonhole`: 1 to 40 pigeons and holes")
+    }
+    return Read.Ok(pigeonhole(pigeons, holes))
+  }
+  if numbers.length() < 3 || numbers.length() > 4 {
+    return Read.Invalid("`random` takes k, the variables, the clauses and an optional seed: `random 3 60 256 7`")
+  }
+  let k = numbers.get(0).unwrapOr(0)
+  let variables = numbers.get(1).unwrapOr(0)
+  let clauses = numbers.get(2).unwrapOr(0)
+  let seed = numbers.get(3).unwrapOr(1)
+  if k < 1 || k > 10 || k > variables {
+    return Read.Invalid("`random`: k is 1 to 10, and at most the variables")
+  }
+  if variables > bounds.variables || clauses < 1 || clauses > bounds.clauses || clauses * k > bounds.literals {
+    return Read.Invalid("`random`: at most {bounds.variables} variables, {bounds.clauses} clauses and {bounds.literals} literals")
+  }
+  Read.Ok(random(k, variables, clauses, seed))
+}
+
+/// `clauses` clauses of `k` distinct variables each, chosen uniformly, each
+/// negated with probability one half; the same for the same four numbers.
+/// Near 4.26 clauses a variable, random 3-SAT is about as likely
+/// satisfiable as not, and hardest for DPLL.
+export fn random(k: Int, variables: Int, clauses: Int, seed: Int) -> Formula {
+  var generator = rng.seeded(seed)
+  var start = Vector.of(0)
+  var literals = Vector.of()
+  var c = 0
+  while c < clauses {
+    let first = literals.length()
+    while literals.length() - first < k {
+      let v = generator.below(variables)
+      var fresh = true
+      var at = first
+      while at < literals.length() {
+        if literals.get(at).unwrapOr(0) / 2 == v {
+          fresh = false
+        }
+        at += 1
+      }
+      if fresh {
+        literals.push(2 * v + generator.below(2))
+      }
+    }
+    start.push(literals.length())
+    c += 1
+  }
+  Formula(
+    variables: variables,
+    start: start.freeze(),
+    literals: literals.freeze(),
+    declaredClauses: clauses,
+    origin: "random {k}-SAT, {variables} variables, {clauses} clauses, seed {seed}",
+    givens: [],
+  )
+}
+
+/// The pigeonhole principle: every pigeon in some hole, no two in one.
+/// Variable `p * holes + h` says pigeon `p` is in hole `h`. Unsatisfiable
+/// exactly when there are more pigeons than holes — and hard for DPLL,
+/// exponentially in the holes, without anything that can prove it short.
+export fn pigeonhole(pigeons: Int, holes: Int) -> Formula {
+  var start = Vector.of(0)
+  var literals = Vector.of()
+  var p = 0
+  while p < pigeons {
+    var h = 0
+    while h < holes {
+      literals.push(2 * (p * holes + h))
+      h += 1
+    }
+    start.push(literals.length())
+    p += 1
+  }
+  var h = 0
+  while h < holes {
+    var a = 0
+    while a < pigeons {
+      var b = a + 1
+      while b < pigeons {
+        literals.push(2 * (a * holes + h) + 1)
+        literals.push(2 * (b * holes + h) + 1)
+        start.push(literals.length())
+        b += 1
+      }
+      a += 1
+    }
+    h += 1
+  }
+  Formula(
+    variables: pigeons * holes,
+    start: start.freeze(),
+    literals: literals.freeze(),
+    declaredClauses: pigeons + holes * pigeons * (pigeons - 1) / 2,
+    origin: "pigeonhole: {pigeons} pigeons, {holes} holes",
+    givens: [],
+  )
+}
+
+/// A 9 × 9 sudoku as CNF: variable `81 r + 9 c + d` says the cell at row
+/// `r`, column `c` holds digit `d + 1`. Each cell holds exactly one digit,
+/// each row, column and box each digit exactly once, and each given is a
+/// unit clause.
+export fn sudoku(cells: String) -> Read {
+  if cells.byteLength() != 81 {
+    return Read.Invalid("a sudoku is 81 cells, row by row: digits 1–9, and `.` or `0` for an empty cell; this is {cells.byteLength()}")
+  }
+  var givens = Vector.of()
+  var at = 0
+  while at < 81 {
+    let byte = cells.byteAt(at)
+    if byte >= 49 && byte <= 57 {
+      givens.push(byte - 48)
+    } else if byte == 46 || byte == 48 {
+      givens.push(0)
+    } else {
+      return Read.Invalid("cell {at + 1} of the sudoku is not a digit or `.`")
+    }
+    at += 1
+  }
+  var start = Vector.of(0)
+  var literals = Vector.of()
+  // Every group of nine variables that must hold exactly one true: the
+  // digits of a cell, and a digit's cells in a row, a column and a box.
+  var kind = 0
+  while kind < 4 {
+    var outer = 0
+    while outer < 81 {
+      let a = outer / 9
+      let b = outer % 9
+      var members = Vector.of()
+      var inner = 0
+      while inner < 9 {
+        var v = 0
+        if kind == 0 {
+          v = 81 * a + 9 * b + inner
+        } else if kind == 1 {
+          v = 81 * a + 9 * inner + b
+        } else if kind == 2 {
+          v = 81 * inner + 9 * a + b
+        } else {
+          let row = 3 * (a / 3) + inner / 3
+          let column = 3 * (a % 3) + inner % 3
+          v = 81 * row + 9 * column + b
+        }
+        members.push(v)
+        inner += 1
+      }
+      for v in members {
+        literals.push(2 * v)
+      }
+      start.push(literals.length())
+      var i = 0
+      while i < 9 {
+        var j = i + 1
+        while j < 9 {
+          literals.push(2 * members.get(i).unwrapOr(0) + 1)
+          literals.push(2 * members.get(j).unwrapOr(0) + 1)
+          start.push(literals.length())
+          j += 1
+        }
+        i += 1
+      }
+      outer += 1
+    }
+    kind += 1
+  }
+  var cell = 0
+  while cell < 81 {
+    let digit = givens.get(cell).unwrapOr(0)
+    if digit > 0 {
+      literals.push(2 * (9 * cell + digit - 1))
+      start.push(literals.length())
+    }
+    cell += 1
+  }
+  let clauses = start.length() - 1
+  Read.Ok(
+    Formula(
+      variables: 729,
+      start: start.freeze(),
+      literals: literals.freeze(),
+      declaredClauses: clauses,
+      origin: "sudoku, {countGiven(givens.toArray())} givens",
+      givens: givens.freeze(),
+    ),
+  )
+}
+
+fn countGiven(givens: Array<Int>) -> Int {
+  var count = 0
+  for given in givens {
+    if given > 0 {
+      count += 1
+    }
+  }
+  count
+}
+
+/// The formula in DIMACS, for the page's "as DIMACS" view.
+export fn dimacs(formula: Formula, limit: Int) -> String {
+  var out = Vector.of()
+  out.push("p cnf {formula.variables} {formula.clauses()}\n")
+  var c = 0
+  while c < formula.clauses() && c < limit {
+    var e = formula.start.get(c).unwrapOr(0)
+    let end = formula.start.get(c + 1).unwrapOr(0)
+    while e < end {
+      let literal = formula.literals.get(e).unwrapOr(0)
+      let number = literal / 2 + 1
+      out.push(if literal % 2 == 1 { "-{number} " } else { "{number} " })
+      e += 1
+    }
+    out.push("0\n")
+    c += 1
+  }
+  if formula.clauses() > limit {
+    out.push("c … {formula.clauses() - limit} more clauses\n")
+  }
+  "".join(out.freeze())
+}
+
+// ------------------------------------------------------------------ solve
+
+/// `count` copies of `value`.
+fn filled(count: Int, value: Int) -> Vector<Int> {
+  var out = Vector.of()
+  var at = 0
+  while at < count {
+    out.push(value)
+    at += 1
+  }
+  out
+}
+
+/// Decides `formula` by DPLL, giving up after `budget` decisions.
+export fn solve(formula: Formula, budget: Int) -> Outcome {
+  let n = formula.variables
+  let clauses = formula.clauses()
+  let start = formula.start
+  let literals = formula.literals
+  // `value[v]`: -1 unassigned, 0 false, 1 true.
+  var value = filled(n, -1)
+  var trail: Vector<Int> = Vector.of()
+  // Two watched literals per clause of two or more: `watched[2c + k]`, and
+  // for each literal the clauses watching it as a linked list of watch
+  // slots, `head[literal]` then `next[slot]`.
+  var watched = filled(2 * clauses, -1)
+  var head = filled(2 * n, -1)
+  var next = filled(2 * clauses, -1)
+  var units: Vector<Int> = Vector.of()
+  var decisions = 0
+  var propagations = 0
+  var conflicts = 0
+  var pure = 0
+  var depth = 0
+  // Occurrences, for the order and the pure literals.
+  var occurs = filled(2 * n, 0)
+  var c = 0
+  while c < clauses {
+    let first = start.get(c).unwrapOr(0)
+    let end = start.get(c + 1).unwrapOr(0)
+    var e = first
+    while e < end {
+      let literal = literals.get(e).unwrapOr(0)
+      occurs.set(literal, occurs.get(literal).unwrapOr(0) + 1)
+      e += 1
+    }
+    if end - first == 1 {
+      units.push(literals.get(first).unwrapOr(0))
+    } else {
+      var k = 0
+      while k < 2 {
+        let literal = literals.get(first + k).unwrapOr(0)
+        let slot = 2 * c + k
+        watched.set(slot, literal)
+        next.set(slot, head.get(literal).unwrapOr(-1))
+        head.set(literal, slot)
+        k += 1
+      }
+    }
+    c += 1
+  }
+  // The branching order: most occurrences first, by a counting sort on the
+  // occurrence count so that no lambda is needed.
+  let order = byOccurrence(occurs, n)
+  // Root: unit clauses, then pure literals.
+  var conflict = false
+  for literal in units {
+    let v = literal / 2
+    let wanted = 1 - literal % 2
+    let current = value.get(v).unwrapOr(-1)
+    if current == -1 {
+      value.set(v, wanted)
+      trail.push(literal)
+    } else if current != wanted {
+      conflict = true
+    }
+  }
+  if !conflict {
+    var v = 0
+    while v < n {
+      if value.get(v).unwrapOr(-1) == -1 {
+        let positive = occurs.get(2 * v).unwrapOr(0)
+        let negative = occurs.get(2 * v + 1).unwrapOr(0)
+        if positive > 0 && negative == 0 {
+          value.set(v, 1)
+          trail.push(2 * v)
+          pure += 1
+        } else if negative > 0 && positive == 0 {
+          value.set(v, 0)
+          trail.push(2 * v + 1)
+          pure += 1
+        }
+      }
+      v += 1
+    }
+  }
+  // The decisions: the trail index each began at, the literal, and whether
+  // its other sign has been tried.
+  var levelStart: Vector<Int> = Vector.of()
+  var levelLiteral: Vector<Int> = Vector.of()
+  var levelFlipped: Vector<Bool> = Vector.of()
+  var queue = 0
+  var cursor = 0
+  var verdict = Verdict.GaveUp
+  var searching = !conflict
+  if conflict {
+    verdict = Verdict.Unsatisfiable
+  }
+  while searching {
+    // Propagate everything on the trail not yet propagated.
+    var failed = false
+    while queue < trail.length() && !failed {
+      let assigned = trail.get(queue).unwrapOr(0)
+      queue += 1
+      propagations += 1
+      // The literal that just became false.
+      let falsified = assigned.bitXor(1)
+      var previous = -1
+      var slot = head.get(falsified).unwrapOr(-1)
+      while slot != -1 && !failed {
+        let following = next.get(slot).unwrapOr(-1)
+        let clause = slot / 2
+        let other = watched.get(slot.bitXor(1)).unwrapOr(0)
+        let otherValue = literalValue(value, other)
+        var keep = true
+        if otherValue != 1 {
+          // Look for another literal that is not false.
+          let first = start.get(clause).unwrapOr(0)
+          let end = start.get(clause + 1).unwrapOr(0)
+          var e = first
+          var found = -1
+          while e < end && found == -1 {
+            let candidate = literals.get(e).unwrapOr(0)
+            if candidate != falsified && candidate != other && literalValue(value, candidate) != 0 {
+              found = candidate
+            }
+            e += 1
+          }
+          if found != -1 {
+            // Move the watch to it.
+            watched.set(slot, found)
+            if previous == -1 {
+              head.set(falsified, following)
+            } else {
+              next.set(previous, following)
+            }
+            next.set(slot, head.get(found).unwrapOr(-1))
+            head.set(found, slot)
+            keep = false
+          } else if otherValue == -1 {
+            // Unit: the other watch must be true.
+            value.set(other / 2, 1 - other % 2)
+            trail.push(other)
+          } else {
+            failed = true
+          }
+        }
+        if keep {
+          previous = slot
+        }
+        slot = following
+      }
+    }
+    if failed {
+      conflicts += 1
+      // Back to the latest decision whose other sign is untried.
+      var backed = false
+      while !backed && levelStart.length() > 0 {
+        let top = levelStart.length() - 1
+        let from = levelStart.get(top).unwrapOr(0)
+        let literal = levelLiteral.get(top).unwrapOr(0)
+        let flipped = levelFlipped.get(top).unwrapOr(true)
+        while trail.length() > from {
+          let undone = trail.pop().unwrapOr(0)
+          value.set(undone / 2, -1)
+        }
+        queue = from
+        if flipped {
+          levelStart.pop()
+          levelLiteral.pop()
+          levelFlipped.pop()
+          backed = false
+        } else {
+          let opposite = literal.bitXor(1)
+          levelFlipped.set(top, true)
+          levelLiteral.set(top, opposite)
+          value.set(opposite / 2, 1 - opposite % 2)
+          trail.push(opposite)
+          backed = true
+        }
+      }
+      if !backed {
+        verdict = Verdict.Unsatisfiable
+        searching = false
+      }
+      // The order is static, so the cursor goes back to the start; it
+      // skips assigned variables.
+      cursor = 0
+    } else {
+      // Decide the next unassigned variable in the order.
+      while cursor < n && value.get(order.get(cursor).unwrapOr(0)).unwrapOr(-1) != -1 {
+        cursor += 1
+      }
+      if cursor == n {
+        var values = Vector.of()
+        for one in value {
+          values.push(one == 1)
+        }
+        verdict = Verdict.Satisfiable(values.freeze())
+        searching = false
+      } else if decisions >= budget {
+        verdict = Verdict.GaveUp
+        searching = false
+      } else {
+        let v = order.get(cursor).unwrapOr(0)
+        // The more frequent sign first.
+        let literal = if occurs.get(2 * v).unwrapOr(0) >= occurs.get(2 * v + 1).unwrapOr(0) { 2 * v } else { 2 * v + 1 }
+        decisions += 1
+        levelStart.push(trail.length())
+        levelLiteral.push(literal)
+        levelFlipped.push(false)
+        depth = depth.max(levelStart.length())
+        value.set(v, 1 - literal % 2)
+        trail.push(literal)
+      }
+    }
+  }
+  Outcome(
+    verdict: verdict,
+    decisions: decisions,
+    propagations: propagations,
+    conflicts: conflicts,
+    pure: pure,
+    depth: depth,
+  )
+}
+
+/// A literal's value under `value`: -1 unassigned, 0 false, 1 true.
+fn literalValue(value: Vector<Int>, literal: Int) -> Int {
+  let assigned = value.get(literal / 2).unwrapOr(-1)
+  if assigned == -1 {
+    -1
+  } else {
+    assigned.bitXor(literal % 2)
+  }
+}
+
+/// The variables, most occurrences (both signs) first; ties by number.
+fn byOccurrence(occurs: Vector<Int>, n: Int) -> Array<Int> {
+  var most = 0
+  var v = 0
+  while v < n {
+    most = most.max(occurs.get(2 * v).unwrapOr(0) + occurs.get(2 * v + 1).unwrapOr(0))
+    v += 1
+  }
+  // Counting sort, descending.
+  var counts = filled(most + 2, 0)
+  v = 0
+  while v < n {
+    let key = most - (occurs.get(2 * v).unwrapOr(0) + occurs.get(2 * v + 1).unwrapOr(0))
+    counts.set(key + 1, counts.get(key + 1).unwrapOr(0) + 1)
+    v += 1
+  }
+  var k = 0
+  while k <= most {
+    counts.set(k + 1, counts.get(k + 1).unwrapOr(0) + counts.get(k).unwrapOr(0))
+    k += 1
+  }
+  var order = filled(n, 0)
+  v = 0
+  while v < n {
+    let key = most - (occurs.get(2 * v).unwrapOr(0) + occurs.get(2 * v + 1).unwrapOr(0))
+    let at = counts.get(key).unwrapOr(0)
+    order.set(at, v)
+    counts.set(key, at + 1)
+    v += 1
+  }
+  order.toArray()
+}
+
+// ------------------------------------------------------------------ check
+
+/// How many clauses of `formula` `values` leaves unsatisfied: zero means
+/// the assignment is a model, checked clause by clause.
+export fn unsatisfied(formula: Formula, values: Array<Bool>) -> Int {
+  var count = 0
+  var c = 0
+  while c < formula.clauses() {
+    var e = formula.start.get(c).unwrapOr(0)
+    let end = formula.start.get(c + 1).unwrapOr(0)
+    var satisfied = false
+    while e < end {
+      let literal = formula.literals.get(e).unwrapOr(0)
+      let truth = values.get(literal / 2).unwrapOr(false)
+      if truth == (literal % 2 == 0) {
+        satisfied = true
+      }
+      e += 1
+    }
+    if !satisfied {
+      count += 1
+    }
+    c += 1
+  }
+  count
+}
+
+/// Whether `formula` is satisfiable, by trying all 2^n assignments: for
+/// checking the solver on small formulas only.
+export fn bruteForce(formula: Formula) -> Bool {
+  let n = formula.variables
+  var mask = 0
+  let total = 1.shiftLeft(n)
+  while mask < total {
+    var values = Vector.of()
+    var v = 0
+    while v < n {
+      values.push(mask.shiftRight(v).bitAnd(1) == 1)
+      v += 1
+    }
+    if unsatisfied(formula, values.freeze()) == 0 {
+      return true
+    }
+    mask += 1
+  }
+  false
+}
