@@ -138,3 +138,8 @@ and the native-tier finding they led to are in
 $ sh bench/algo.sh 3 native > bench/results/algo-$(date +%F)-native.txt
 $ sh bench/algo.sh 3 vm > bench/results/algo-$(date +%F)-vm.txt
 ```
+
+`MIX=algo-sat` runs the same with SAT's heavy run (DPLL refuting 8 pigeons in
+7 holes) instead. `bench/repro/` is not a benchmark: it reproduces a
+native-tier fault the playground met (a sliced run's `toVector` copy into a
+store of the wrong size), for the Cove issue — `sh bench/repro/run.sh native`.

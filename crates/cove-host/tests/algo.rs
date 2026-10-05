@@ -65,6 +65,20 @@ fn number_after(text: &str, prefix: &str) -> u64 {
         .unwrap()
 }
 
+/// The number just before `suffix` in `text`, thousands separators and all.
+fn number_before(text: &str, suffix: &str) -> u64 {
+    let at = text
+        .find(suffix)
+        .unwrap_or_else(|| panic!("no `{suffix}` in {text}"));
+    let digits: String = text[..at]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(char::is_ascii_digit)
+        .collect();
+    digits.chars().rev().collect::<String>().parse().unwrap()
+}
+
 /// The matching size a result reports, after checking the page proved it.
 fn proved_size(answer: &Answer) -> u64 {
     assert_eq!(answer.status, 200, "{answer:?}");
@@ -74,6 +88,145 @@ fn proved_size(answer: &Answer) -> u64 {
         answer.body
     );
     number_after(&answer.body, "Maximum: ")
+}
+
+/// Runs `formula` with a decision `budget` (`""` for the default) and
+/// answers the result fragment.
+fn run_sat(addr: SocketAddr, formula: &str, budget: &str) -> Answer {
+    let body = format!(
+        "formula={}&budget={budget}&part=result",
+        form_value(formula)
+    );
+    send_raw(
+        addr,
+        format!(
+            "POST /algo/sat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+}
+
+/// A SAT result's verdict: `sat` (and then the page checked the
+/// assignment), `unsat` or `unknown`.
+fn verdict(answer: &Answer) -> &str {
+    assert_eq!(answer.status, 200, "{answer:?}");
+    let at = answer
+        .body
+        .find("data-verdict=")
+        .unwrap_or_else(|| panic!("no verdict: {}", answer.body));
+    let rest = &answer.body[at + "data-verdict=".len()..];
+    let verdict = &rest[..rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap()];
+    if verdict == "sat" {
+        assert!(rest.contains("data-checked=true"), "{}", answer.body);
+    }
+    verdict
+}
+
+/// The `v` line of a satisfiable result: each variable's value.
+fn assignment(answer: &Answer) -> Vec<i64> {
+    let marker = "<pre class=diag>v ";
+    let at = answer.body.find(marker).expect("a v line");
+    let line = &answer.body[at + marker.len()..];
+    line[..line.find("</pre>").unwrap()]
+        .split_whitespace()
+        .map(|n| n.parse::<i64>().unwrap())
+        .take_while(|n| *n != 0)
+        .collect()
+}
+
+#[test]
+fn sat_answers_known_formulas_and_checks_its_models() {
+    let apps = apps(&[sample("algo")]);
+    let host = start(&apps, 2);
+    let addr = host.addr;
+    for (formula, expected) in [
+        ("p cnf 3 2\n1 -3 0\n2 3 -1 0\n", "sat"),
+        ("1 2 0\n-1 2 0\n1 -2 0\n-1 -2 0\n", "unsat"),
+        ("1 0\n-1 0\n", "unsat"),
+        ("pigeonhole 6 5", "unsat"),
+        ("pigeonhole 5 5", "sat"),
+        ("random 3 60 256 1", "sat"),
+        ("random 3 60 256 2", "unsat"),
+        ("random 3 60 256 3", "unsat"),
+    ] {
+        assert_eq!(verdict(&run_sat(addr, formula, "")), expected, "{formula}");
+    }
+    // The unique model of three of the four two-variable clauses.
+    let one = run_sat(addr, "1 2 0\n-1 2 0\n1 -2 0\n", "");
+    assert_eq!(assignment(&one), vec![1, 2]);
+    // A model of a random formula satisfies it, checked here as well as in
+    // the page: every clause has a true literal.
+    let random = run_sat(addr, "random 3 60 256 1", "");
+    let model = assignment(&random);
+    assert_eq!(model.len(), 60);
+    let formula_start = random
+        .body
+        .find("p cnf 60 256")
+        .expect("the formula as read");
+    let clauses: Vec<Vec<i64>> = random.body[formula_start..]
+        .lines()
+        .skip(1)
+        .take_while(|line| line.ends_with(" 0"))
+        .map(|line| {
+            line.split_whitespace()
+                .map(|n| n.parse::<i64>().unwrap())
+                .take_while(|n| *n != 0)
+                .collect()
+        })
+        .collect();
+    // The page shows the first 200 of them.
+    assert_eq!(clauses.len(), 200);
+    for clause in &clauses {
+        assert!(
+            clause
+                .iter()
+                .any(|literal| model[literal.unsigned_abs() as usize - 1] == *literal),
+            "{clause:?} unsatisfied"
+        );
+    }
+    // The sudoku: solved, drawn as its grid, and its first row is the known
+    // one.
+    let sudoku = run_sat(
+        addr,
+        "sudoku 53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79",
+        "",
+    );
+    assert_eq!(verdict(&sudoku), "sat");
+    assert!(sudoku.body.contains("the solved sudoku"));
+    let model = assignment(&sudoku);
+    let first_row: Vec<i64> = (0..9)
+        .map(|column| (1..=9).find(|d| model[9 * column + d - 1] > 0).unwrap() as i64)
+        .collect();
+    assert_eq!(first_row, vec![5, 3, 4, 6, 7, 8, 9, 1, 2]);
+    // A budget the search runs past is the app's own stop, in the page.
+    let gave_up = run_sat(addr, "pigeonhole 8 7", "100");
+    assert_eq!(verdict(&gave_up), "unknown");
+    assert!(gave_up.body.contains("data-stop=app"));
+    assert!(gave_up.body.contains("budget of 100 decisions"));
+    // What it cannot read is answered with why, and names are escaped.
+    let bad = run_sat(addr, "1 2 0\n3 <x> 0\n", "");
+    assert!(bad.body.contains("data-stop=app"), "{}", bad.body);
+    assert!(bad.body.contains("line 2"));
+    assert!(!bad.body.contains("<x>"));
+    let page = get(addr, "/algo/sat?example=sudoku");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("data-autorun"));
+    assert!(page.body.contains("sudoku 53..7"));
+}
+
+#[test]
+fn a_sat_run_out_of_fuel_says_so() {
+    let apps = apps(&[sample("algo")]);
+    let host = start(&apps, 1);
+    let answer = send_raw(
+        host.addr,
+        b"GET /algo/sat?example=heavy&part=result HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(answer.status, 500, "{answer:?}");
+    assert_eq!(answer.header("x-cove-stop"), Some("fuel"));
+    assert!(answer.body.contains("fuel budget of 400000000 exhausted"));
 }
 
 #[test]
@@ -335,19 +488,21 @@ fn the_other_apps_answer_while_algo_computes(backend: &str) {
     // Four clients, two workers: each asks for the slow algorithm on the
     // large graph again as soon as it is answered.
     let stop = Arc::new(AtomicBool::new(false));
+    // Two of them ask for the matching, two for DPLL refuting 8 pigeons in
+    // 7 holes.
     let heavy: Vec<_> = (0..4)
-        .map(|_| {
+        .map(|client| {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
-                let mut sizes = Vec::new();
+                let mut answers = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
-                    sizes.push(proved_size(&run_matching(
-                        addr,
-                        "random 2000 2000 12000 42",
-                        "augmenting",
-                    )));
+                    answers.push(if client % 2 == 0 {
+                        run_matching(addr, "random 2000 2000 12000 42", "augmenting")
+                    } else {
+                        run_sat(addr, "pigeonhole 8 7", "")
+                    });
                 }
-                sizes
+                answers
             })
         })
         .collect();
@@ -376,10 +531,24 @@ fn the_other_apps_answer_while_algo_computes(backend: &str) {
     }
     stop.store(true, Ordering::Relaxed);
     let mut runs = 0;
-    for client in heavy {
-        let sizes = client.join().unwrap();
-        assert!(sizes.windows(2).all(|pair| pair[0] == pair[1]), "{sizes:?}");
-        runs += sizes.len();
+    for (client, answers) in heavy.into_iter().enumerate() {
+        // Every heavy answer is the right one: the same matching size, or
+        // the same refutation in the same number of decisions.
+        let mut seen = Vec::new();
+        for answer in answers.join().unwrap() {
+            assert_eq!(
+                answer.status, 200,
+                "a heavy run of client {client}: {answer:?}"
+            );
+            seen.push(if client % 2 == 0 {
+                proved_size(&answer)
+            } else {
+                assert_eq!(verdict(&answer), "unsat", "{answer:?}");
+                number_before(&answer.body, " decisions")
+            });
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] == pair[1]), "{seen:?}");
+        runs += seen.len();
     }
     assert_eq!(answered, 20);
     assert!(runs >= 1);
@@ -442,6 +611,15 @@ fn the_heavy_path_has_machine_code_on_the_native_tier() {
         "matching.hopcroftKarp",
         "matching.augmenting",
         "matching.certify",
+        "algo.satPage",
+        "algo.satResult",
+        "sat.read",
+        "sat.generate",
+        "sat.random",
+        "sat.pigeonhole",
+        "sat.sudoku",
+        "sat.solve",
+        "sat.unsatisfied",
     ] {
         assert!(
             !refused.contains(&function),
