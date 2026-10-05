@@ -43,6 +43,8 @@ struct Summary {
   loadLeast: Option<Float>
   loadMost: Option<Float>
   environment: Map<String, String>
+  toolchain: Map<String, String>
+  conditions: Map<String, String>
   source: String
 }
 
@@ -89,6 +91,8 @@ fn summaryOf(run: Run) -> Summary {
     loadLeast: least,
     loadMost: most,
     environment: run.environment,
+    toolchain: run.toolchain,
+    conditions: run.conditions,
     source: run.source,
   )
 }
@@ -107,6 +111,8 @@ fn summaryJson(summary: Summary) -> Json {
     MapEntry(key: "results", value: Json.Number(summary.results.toFloat())),
     MapEntry(key: "backends", value: Json.Items(backends.freeze())),
     MapEntry(key: "environment", value: json.fromTextMap(summary.environment)),
+    MapEntry(key: "toolchain", value: json.fromTextMap(summary.toolchain)),
+    MapEntry(key: "conditions", value: json.fromTextMap(summary.conditions)),
     MapEntry(key: "source", value: Json.Text(summary.source)),
   )
   match summary.loadLeast {
@@ -147,6 +153,8 @@ fn summaryFrom(value: Json) -> Summary {
     loadLeast: numberField(value, "loadLeast"),
     loadMost: numberField(value, "loadMost"),
     environment: json.textMap(value, "environment"),
+    toolchain: json.textMap(value, "toolchain"),
+    conditions: json.textMap(value, "conditions"),
     source: json.text(value, "source"),
   )
 }
@@ -387,4 +395,62 @@ fn listRuns(before: String, limit: Int) -> Array<Summary> {
 /// The index key of a summary: where the page after it starts.
 fn indexKey(summary: Summary) -> String {
   "index:{time16(summary.measuredAt)}:{summary.id}"
+}
+
+/// The runs of `commit` — every repository's — oldest measured first. A
+/// prefix of at least seven characters names a commit, as `git` abbreviates
+/// one.
+fn runsOfCommit(commit: String) -> Array<Run> {
+  var runs = Vector.of()
+  if commit.length() < 4 {
+    return runs.freeze()
+  }
+  var before = ""
+  var more = true
+  while more {
+    let page = listRuns(before, 500)
+    for summary in page {
+      if summary.commit == commit || (commit.length() >= 7 && summary.commit.startsWith(commit)) {
+        match loadRun(summary.id) {
+          Some(run) => runs.push(run)
+          None => {}
+        }
+      }
+      before = indexKey(summary)
+    }
+    more = page.length() == 500
+  }
+  runs.freeze().sorted(by: fn(x, y) { x.measuredAt < y.measuredAt })
+}
+
+/// Every run's summary, newest measured first.
+fn allRuns() -> Array<Summary> {
+  var runs = Vector.of()
+  var before = ""
+  var more = true
+  while more {
+    let page = listRuns(before, 500)
+    for summary in page {
+      runs.push(summary)
+      before = indexKey(summary)
+    }
+    more = page.length() == 500
+  }
+  runs.freeze()
+}
+
+/// The names of every metric posted so far, by name.
+fn metricNamesStored() -> Array<String> {
+  var names = Vector.of()
+  var after = ""
+  var more = true
+  while more {
+    let page = kv.list("metric:", after, 500)
+    for entry in page {
+      names.push(entry.key.slice("metric:".length(), entry.key.length()))
+      after = entry.key
+    }
+    more = page.length() == 500
+  }
+  names.freeze()
 }

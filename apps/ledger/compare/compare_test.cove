@@ -1,0 +1,73 @@
+fn metric(name: String, values: Array<Float>) -> Metric {
+  Metric(name: name, unit: "ms", values: values, dimension: "duration", canonicalUnit: "ms", canonical: values, better: "lower")
+}
+
+fn entry(environment: String, conditions: String, load: Array<Float>, metrics: Array<Metric>) -> Entry {
+  Entry(
+    run: Run(
+      id: "r",
+      repository: "x",
+      commit: "c",
+      measuredAt: 0,
+      source: "",
+      note: "",
+      environment: Map.of(MapEntry(key: "cpu", value: environment)),
+      toolchain: Map.of(),
+      conditions: Map.of(),
+      results: [],
+    ),
+    result: Measurement(
+      case: "hello",
+      input: "",
+      inputSize: None,
+      backend: "vm",
+      conditions: Map.of(MapEntry(key: "workers", value: conditions)),
+      load: load,
+      metrics: metrics,
+    ),
+  )
+}
+
+test fn sameMachineAndConditionsAreComparable() -> Result<Unit, Error> {
+  let a = entry("i7", "4", [2.0, 2.5], [])
+  assertEqual(comparable(a, entry("i7", "4", [2.2], [])).level, "ok")?
+  assertEqual(comparable(a, entry("m2", "4", [2.2], [])).level, "no")?
+  assertEqual(comparable(a, entry("i7", "8", [2.2], [])).level, "no")?
+  // A much busier machine is a warning, not a refusal.
+  let busy = comparable(a, entry("i7", "4", [6.0], []))
+  assertEqual(busy.level, "warn")?
+  assertEqual(busy.reasons, ["load average 2.2 vs 6.0"])?
+  assertEqual(comparable(a, entry("i7", "4", [], [])).level, "warn")?
+  Ok(())
+}
+
+test fn anUnmeasuredSideHasNoDifference() -> Result<Unit, Error> {
+  let both = metricRow("p99", Some(metric("p99", [2.0, 3.0])), Some(metric("p99", [3.0])))
+  assertEqual(both.delta, Some(0.5))?
+  assertEqual(both.ratio, Some(0.2))?
+  assert(both.overlap)?
+  let one = metricRow("p99", Some(metric("p99", [2.0])), None)
+  assert(one.delta.isNone())?
+  assert(one.ratio.isNone())?
+  assert(one.b.isNone())?
+  // A measured zero is a value; a ratio against it is not.
+  let zero = metricRow("p99", Some(metric("p99", [0.0])), Some(metric("p99", [1.0])))
+  assertEqual(zero.delta, Some(1.0))?
+  assert(zero.ratio.isNone())?
+  assertEqual(direction(zero), -1)?
+  Ok(())
+}
+
+test fn theLargestDifferencesComeFirstAndOnlyComparableOnes() -> Result<Unit, Error> {
+  let a = [entry("i7", "4", [1.0], [metric("p50", [1.0]), metric("p99", [10.0])])]
+  let b = [entry("i7", "4", [1.0], [metric("p50", [1.5]), metric("p99", [11.0])])]
+  var names = Vector.of()
+  for change in largest(rows(a, b), 10) {
+    names.push(change.metric.name)
+  }
+  assertEqual(names.freeze(), ["p50", "p99"])?
+  // Another machine: nothing is listed.
+  let elsewhere = [entry("m2", "4", [1.0], [metric("p50", [9.0])])]
+  assertEqual(largest(rows(a, elsewhere), 10).length(), 0)?
+  Ok(())
+}

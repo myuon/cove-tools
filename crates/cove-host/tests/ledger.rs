@@ -494,6 +494,21 @@ fn real_runs_survive_a_restart() {
     assert!(page(addr, "/ledger/runs/cove-593-capacity")
         .body
         .contains("2,783"));
+    // And they compare after the restart: #589's VM against #593's.
+    let compared = comparison(addr, "a=cove-589-capacity&b=cove-593-capacity");
+    let crunch = row(&compared, "crunch", "c=16", "vm");
+    assert_eq!(crunch["comparable"], "ok", "{crunch}");
+    let throughput = metric(crunch, "throughput");
+    assert!(
+        throughput["ratio"].as_f64().unwrap().abs() < 0.2,
+        "{throughput}"
+    );
+    assert!(page(
+        addr,
+        "/ledger/compare?a=cove-589-capacity&b=cove-593-capacity"
+    )
+    .body
+    .contains("Largest differences"));
     // Reposting after the restart is still a duplicate.
     let again = post_run(addr, &sample_run("cove-589-capacity"));
     assert_eq!(again.status, 200, "{again:?}");
@@ -519,7 +534,13 @@ fn everything_a_poster_controls_is_escaped() {
     run["results"][0]["backend"] = json!("\"><b>x</b>");
     let posted = post_run(addr, &run.to_string());
     assert_eq!(posted.status, 201, "{posted:?}");
-    for path in ["/ledger/", "/ledger/runs/escape"] {
+    assert_eq!(post_run(addr, &minimal("plain").to_string()).status, 201);
+    for path in [
+        "/ledger/",
+        "/ledger/runs/escape",
+        "/ledger/compare?a=escape&b=plain&all=1",
+        "/ledger/compare?a=plain&b=escape&all=1",
+    ] {
         let answer = page(addr, path);
         assert!(!answer.body.contains("<script>"), "{path}");
         assert!(!answer.body.contains("<img"), "{path}");
@@ -533,6 +554,205 @@ fn everything_a_poster_controls_is_escaped() {
             "{path}"
         );
     }
+}
+
+/// `GET /ledger/compare?<query>&format=json`.
+fn comparison(addr: SocketAddr, query: &str) -> Json {
+    let answer = page(addr, &format!("/ledger/compare?{query}&format=json"));
+    serde_json::from_str(&answer.body).unwrap()
+}
+
+/// The row of a comparison for one case, input and backend.
+fn row<'a>(comparison: &'a Json, case: &str, input: &str, backend: &str) -> &'a Json {
+    comparison["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["case"] == case && r["input"] == input && r["backend"] == backend)
+        .unwrap_or_else(|| panic!("no row {case} {input} {backend}: {comparison}"))
+}
+
+/// One metric of a comparison's row.
+fn metric<'a>(row: &'a Json, name: &str) -> &'a Json {
+    row["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == name)
+        .unwrap_or_else(|| panic!("no metric {name}: {row}"))
+}
+
+/// A run of one result, `hello` on `vm`, with `p99` as `values` (in ms),
+/// measured at `at`, on `cpu`, under `workers`, with `rustc` and `load`.
+fn variant(id: &str, commit: &str, at: &str, change: impl FnOnce(&mut Json)) -> String {
+    let mut run = minimal(id);
+    run["commit"] = json!(commit);
+    run["measuredAt"] = json!(at);
+    change(&mut run);
+    run.to_string()
+}
+
+#[test]
+fn a_comparison_marks_measurements_that_are_not_comparable() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let runs = [
+        variant("base", "aaa1111", "2026-10-01T00:00:00Z", |_| {}),
+        // The same machine and conditions, a slower p99.
+        variant("same", "bbb2222", "2026-10-02T00:00:00Z", |r| {
+            r["results"][0]["metrics"]["p99"]["values"] = json!([4.0, 4.5]);
+        }),
+        variant("elsewhere", "ccc3333", "2026-10-03T00:00:00Z", |r| {
+            r["environment"]["cpu"] = json!("another cpu");
+            r["results"][0]["metrics"]["p99"]["values"] = json!([40.0]);
+        }),
+        variant("otherwise", "ddd4444", "2026-10-04T00:00:00Z", |r| {
+            r["results"][0]["conditions"] = json!({"workers": "8"});
+        }),
+        variant("newer", "eee5555", "2026-10-05T00:00:00Z", |r| {
+            r["toolchain"]["rustc"] = json!("1.99.0");
+        }),
+        variant("busy", "fff6666", "2026-10-06T00:00:00Z", |r| {
+            r["results"][0]["load"] = json!([7.5, 8.0]);
+        }),
+    ];
+    for run in &runs {
+        assert_eq!(post_run(addr, run).status, 201);
+    }
+    let same = comparison(addr, "a=base&b=same");
+    let hello = row(&same, "hello", "c=64", "vm");
+    assert_eq!(hello["comparable"], "ok");
+    let p99 = metric(hello, "p99");
+    // Medians 2.75 and 4.25 ms: +1.5 ms, +54.5%, the ranges apart.
+    assert_eq!(p99["delta"].as_f64(), Some(1.5));
+    assert!((p99["ratio"].as_f64().unwrap() - 1.5 / 2.75).abs() < 1e-9);
+    assert_eq!(p99["overlap"], false);
+    assert_eq!(same["largest"][0]["metric"], "p99");
+    let html = page(addr, "/ledger/compare?a=base&b=same").body;
+    assert!(html.contains("+54.5% ▼"), "{html}");
+    for (other, level, reason) in [
+        (
+            "elsewhere",
+            "no",
+            "environment: cpu `test cpu` vs `another cpu`",
+        ),
+        ("otherwise", "no", "conditions: workers `4` vs `8`"),
+        ("newer", "warn", "toolchain: rustc `1.98.1` vs `1.99.0`"),
+        ("busy", "warn", "load average 1.8 vs 7.8"),
+    ] {
+        let compared = comparison(addr, &format!("a=base&b={other}"));
+        let hello = row(&compared, "hello", "c=64", "vm");
+        assert_eq!(hello["comparable"], level, "{other}: {hello}");
+        assert!(
+            hello["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == reason),
+            "{other}: {hello}"
+        );
+        // A measurement that is not comparable has no place among the
+        // largest differences; a warning does.
+        let listed = !compared["largest"].as_array().unwrap().is_empty();
+        assert_eq!(listed, level == "warn", "{other}: {compared}");
+    }
+    // On the page it is hidden unless asked for, and then marked.
+    let hidden = page(addr, "/ledger/compare?a=base&b=elsewhere").body;
+    assert!(hidden.contains("1 not comparable (hidden"), "{hidden}");
+    assert!(!hidden.contains("another cpu"), "{hidden}");
+    let shown = page(addr, "/ledger/compare?a=base&b=elsewhere&all=1").body;
+    assert!(
+        shown.contains("not comparable: environment: cpu"),
+        "{shown}"
+    );
+    // The runs a comparison with `base` means something against are offered.
+    let offered = page(addr, "/ledger/compare?a=base").body;
+    for (id, listed) in [
+        ("same", true),
+        ("newer", true),
+        ("busy", true),
+        ("elsewhere", false),
+        ("otherwise", true),
+    ] {
+        assert_eq!(
+            offered.contains(&format!("b={id}\"")),
+            listed,
+            "{id}: {offered}"
+        );
+    }
+    // A side that does not exist.
+    assert_eq!(
+        request(addr, "GET", "/ledger/compare?a=base&b=nothing", &[], "").status,
+        404
+    );
+}
+
+#[test]
+fn a_metric_one_side_did_not_measure_is_not_compared_with_zero() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let a = variant("a", "aaa1111", "2026-10-01T00:00:00Z", |r| {
+        r["results"][0]["metrics"]["errors"] = json!({"unit": "count", "values": [0]});
+    });
+    let b = variant("b", "bbb2222", "2026-10-02T00:00:00Z", |r| {
+        let metrics = r["results"][0]["metrics"].as_object_mut().unwrap();
+        metrics.remove("p99");
+        metrics.insert("errors".into(), json!({"unit": "count", "values": [3]}));
+    });
+    assert_eq!(post_run(addr, &a).status, 201);
+    assert_eq!(post_run(addr, &b).status, 201);
+    let compared = comparison(addr, "a=a&b=b");
+    let hello = row(&compared, "hello", "c=64", "vm");
+    let p99 = metric(hello, "p99");
+    assert!(
+        p99["b"].is_null() && p99["delta"].is_null() && p99["ratio"].is_null(),
+        "{p99}"
+    );
+    // A measured zero is compared — 0 to 3 is +3 — but has no ratio.
+    let errors = metric(hello, "errors");
+    assert_eq!(errors["delta"].as_f64(), Some(3.0));
+    assert!(errors["ratio"].is_null(), "{errors}");
+    let html = page(addr, "/ledger/compare?a=a&b=b").body;
+    assert!(html.contains("not measured in B"), "{html}");
+}
+
+#[test]
+fn a_commit_is_compared_by_all_its_runs() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let one = |id: &str, commit: &str, at: &str, case: &str, p99: f64| {
+        variant(id, commit, at, |r| {
+            r["results"][0]["case"] = json!(case);
+            r["results"][0]["metrics"]["p99"]["values"] = json!([p99]);
+        })
+    };
+    for run in [
+        one("x1", "1111111aaaa", "2026-10-01T00:00:00Z", "hello", 2.0),
+        one("x2", "1111111aaaa", "2026-10-02T00:00:00Z", "crunch", 5.0),
+        // Measured again later on the same commit: the later one counts.
+        one("x3", "1111111aaaa", "2026-10-03T00:00:00Z", "hello", 3.0),
+        one("y1", "2222222bbbb", "2026-10-04T00:00:00Z", "hello", 6.0),
+    ] {
+        assert_eq!(post_run(addr, &run).status, 201);
+    }
+    let compared = comparison(addr, "a=commit:1111111&b=commit:2222222bbbb");
+    assert_eq!(compared["a"], "commit 1111111 (3 runs)");
+    let hello = row(&compared, "hello", "c=64", "vm");
+    assert_eq!(hello["a"], "x3");
+    assert_eq!(hello["b"], "y1");
+    assert_eq!(metric(hello, "p99")["delta"].as_f64(), Some(3.0));
+    let crunch = row(&compared, "crunch", "c=64", "vm");
+    assert_eq!(crunch["a"], "x2");
+    assert!(crunch["b"].is_null());
+    assert!(page(
+        addr,
+        "/ledger/compare?a=commit:1111111&b=commit:2222222bbbb"
+    )
+    .body
+    .contains("Only in A (1)"));
 }
 
 /// A JSON array of numbers, as numbers (`2` and `2.0` alike).

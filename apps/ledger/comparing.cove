@@ -1,0 +1,444 @@
+use web
+use json
+use json.Json
+use schema.Run
+use compare
+use compare.Row
+use compare.MetricRow
+use compare.Change
+use stats
+use stats.Spread
+use text
+
+// `GET /compare?a=…&b=…`: two sides, case by case. A side is a run ID, or
+// `commit:<sha>` for every run of a commit (where two of its runs measured
+// the same case, the later one). `metric=` keeps one metric, `all=1` shows
+// the measurements that are not comparable too, and `format=json` answers
+// the comparison as JSON.
+
+/// One side of a comparison, resolved.
+struct Side {
+  /// What the user asked for: a run ID or `commit:<sha>`.
+  spec: String
+  /// How the page names it.
+  label: String
+  runs: Array<Run>
+}
+
+/// The side `spec` names, or why it names none.
+fn resolveSide(spec: String) -> Result<Side, String> {
+  if spec.startsWith("commit:") {
+    let commit = spec.slice("commit:".length(), spec.length())
+    let runs = runsOfCommit(commit)
+    if runs.length() == 0 {
+      return Err("no run of commit `{commit}`")
+    }
+    return Ok(Side(spec: spec, label: "commit {commit} ({runs.length()} runs)", runs: runs))
+  }
+  match loadRun(spec) {
+    Some(run) => Ok(Side(spec: spec, label: "{run.id} ({run.commit})", runs: [run]))
+    None => Err("no run `{spec}`")
+  }
+}
+
+/// How many differences the page lists first.
+fn largestCount() -> Int {
+  10
+}
+
+fn comparePage(request: web.Request) -> web.Response {
+  let at = base(request)
+  let aSpec = request.query.get("a").unwrapOr("").trim()
+  let bSpec = request.query.get("b").unwrapOr("").trim()
+  let metric = request.query.get("metric").unwrapOr("").trim()
+  let all = request.query.get("all").unwrapOr("") != ""
+  let wantsJson = request.query.get("format").unwrapOr("") == "json"
+  let summaries = allRuns()
+  if aSpec == "" || bSpec == "" {
+    if wantsJson {
+      return problem(400, "a comparison needs `a` and `b`: run IDs, or `commit:<sha>`")
+    }
+    return htmlResponse(200, compareLayout(at, summaries, aSpec, bSpec, metric, all, "", sideNote(at, summaries, aSpec)))
+  }
+  let a = match resolveSide(aSpec) {
+    Ok(side) => side
+    Err(why) => return compareRefused(request, summaries, aSpec, bSpec, metric, all, why)
+  }
+  let b = match resolveSide(bSpec) {
+    Ok(side) => side
+    Err(why) => return compareRefused(request, summaries, aSpec, bSpec, metric, all, why)
+  }
+  let rows = compare.rows(compare.entries(a.runs), compare.entries(b.runs))
+  let largest = compare.largest(filtered(rows, metric), largestCount())
+  if wantsJson {
+    return jsonResponse(200, json.renderPretty(comparisonJson(a, b, rows, largest)))
+  }
+  htmlResponse(
+    200,
+    compareLayout(at, summaries, aSpec, bSpec, metric, all, comparison(at, a, b, rows, largest, metric, all), sideNote(at, summaries, aSpec)),
+  )
+}
+
+fn compareRefused(
+  request: web.Request,
+  summaries: Array<Summary>,
+  aSpec: String,
+  bSpec: String,
+  metric: String,
+  all: Bool,
+  why: String,
+) -> web.Response {
+  if request.query.get("format").unwrapOr("") == "json" {
+    return problem(404, why)
+  }
+  let at = base(request)
+  htmlResponse(
+    404,
+    compareLayout(at, summaries, aSpec, bSpec, metric, all, "<p class=bad>{h(why)}</p>", ""),
+  )
+}
+
+/// `rows` with only the metric `metric` (all of them for `""`).
+fn filtered(rows: Array<Row>, metric: String) -> Array<Row> {
+  if metric == "" {
+    return rows
+  }
+  var out = Vector.of()
+  for row in rows {
+    var kept = Vector.of()
+    for one in row.metrics {
+      if one.name == metric {
+        kept.push(one)
+      }
+    }
+    if kept.length() > 0 {
+      out.push(
+        Row(
+          case: row.case,
+          input: row.input,
+          backend: row.backend,
+          a: row.a,
+          b: row.b,
+          verdict: row.verdict,
+          metrics: kept.freeze(),
+        ),
+      )
+    }
+  }
+  out.freeze()
+}
+
+// ---------------------------------------------------------------------- HTML
+
+/// The page: the form that picks the two sides, then `content`.
+fn compareLayout(
+  at: String,
+  summaries: Array<Summary>,
+  aSpec: String,
+  bSpec: String,
+  metric: String,
+  all: Bool,
+  content: String,
+  note: String,
+) -> String {
+  let form = "<form method=get action=\"{h(at)}/compare\" class=pick><label>A (baseline) {sideSelect("a", summaries, aSpec)}</label><label>B {sideSelect("b", summaries, bSpec)}</label><label>metric {metricSelect(metric)}</label><label><input type=checkbox name=all value=1{if all { " checked" } else { "" }}> include measurements that are not comparable</label><button>Compare</button></form>"
+  layout(at, "compare", "<h1>Compare</h1>{form}{note}{content}")
+}
+
+fn sideSelect(name: String, summaries: Array<Summary>, chosen: String) -> String {
+  var runs = Vector.of()
+  var commits = Vector.of()
+  var seen = Vector.of()
+  for summary in summaries {
+    let selected = if summary.id == chosen { " selected" } else { "" }
+    runs.push("<option value=\"{h(summary.id)}\"{selected}>{h(summary.id)} · {h(summary.commit)} · {when(summary.measuredAt)}</option>")
+    if !seen.contains(summary.commit) {
+      seen.push(summary.commit)
+      let spec = "commit:{summary.commit}"
+      let picked = if spec == chosen { " selected" } else { "" }
+      commits.push("<option value=\"{h(spec)}\"{picked}>{h(summary.commit)} · {h(summary.repository)}</option>")
+    }
+  }
+  "<select name={name}><option value=\"\">choose…</option><optgroup label=runs>{"".join(runs.freeze())}</optgroup><optgroup label=\"commits (all their runs)\">{"".join(commits.freeze())}</optgroup></select>"
+}
+
+fn metricSelect(chosen: String) -> String {
+  var options = Vector.of()
+  options.push("<option value=\"\">all</option>")
+  for name in metricNamesStored() {
+    let selected = if name == chosen { " selected" } else { "" }
+    options.push("<option value=\"{h(name)}\"{selected}>{h(name)}</option>")
+  }
+  "<select name=metric>{"".join(options.freeze())}</select>"
+}
+
+/// The runs measured on the same machine under the same conditions as the
+/// run `aSpec`: the ones a comparison with it means something against.
+fn sideNote(at: String, summaries: Array<Summary>, aSpec: String) -> String {
+  let a = match loadRun(aSpec) {
+    Some(run) => run
+    None => return ""
+  }
+  var same = Vector.of()
+  var other = 0
+  for summary in summaries {
+    if summary.id != a.id {
+      if summary.environment == a.environment && summary.conditions == a.conditions {
+        let warn = if summary.toolchain == a.toolchain { "" } else { " <span class=muted title=\"another toolchain\">(toolchain differs)</span>" }
+        same.push("<li><a href=\"{h(at)}/compare?a={h(text.urlEncode(a.id))}&amp;b={h(text.urlEncode(summary.id))}\">{h(summary.id)}</a> <code>{h(summary.commit)}</code> {when(summary.measuredAt)}{warn}</li>")
+      } else {
+        other += 1
+      }
+    }
+  }
+  if same.length() == 0 {
+    return "<p class=note>No other run was measured on the same machine under the same conditions as <code>{h(a.id)}</code>.</p>"
+  }
+  "<details class=note{if aSpec != "" { "" } else { " open" }}><summary>{same.length()} runs measured on the same machine under the same conditions as <code>{h(a.id)}</code> ({other} others are not comparable with it)</summary><ul>{"".join(same.freeze())}</ul></details>"
+}
+
+/// A spread as a cell: the median, and the range with the count under it.
+fn spreadCell(spread: Option<Spread>) -> String {
+  match spread {
+    Some(one) => {
+      let range = if one.count > 1 { "<br><span class=range>{stats.show(one.least)}–{stats.show(one.most)} ×{one.count}</span>" } else { "<br><span class=range>×1</span>" }
+      "<td class=num>{stats.show(one.median)}{range}</td>"
+    }
+    None => "<td class=\"num absent\" title=\"not measured\">–</td>"
+  }
+}
+
+/// The difference cells: absolute, then relative, coloured by which way is
+/// better unless the two ranges overlap.
+fn differenceCells(metric: MetricRow) -> String {
+  match metric.delta {
+    Some(delta) => {
+      let sign = if delta > 0.0 { "+" } else { "" }
+      let way = compare.direction(metric)
+      let class = if metric.overlap || way == 0 { "num muted" } else if way > 0 { "num better" } else { "num worse" }
+      let note = if metric.overlap { " title=\"within the repetitions' spread\"" } else { "" }
+      let relative = match metric.ratio {
+        Some(ratio) => stats.percent(ratio)
+        None => "–"
+      }
+      let mark = if metric.overlap { " ~" } else if way > 0 { " ▲" } else if way < 0 { " ▼" } else { "" }
+      "<td class=\"{class}\"{note}>{sign}{stats.show(delta)}</td><td class=\"{class}\"{note}>{relative}{mark}</td>"
+    }
+    None => {
+      let why = if metric.a.isNone() { "not measured in A" } else { "not measured in B" }
+      "<td class=\"num absent\" colspan=2>{why}</td>"
+    }
+  }
+}
+
+fn verdictCell(row: Row) -> String {
+  if row.a.isNone() {
+    return "<td class=muted>only in B</td>"
+  }
+  if row.b.isNone() {
+    return "<td class=muted>only in A</td>"
+  }
+  let reasons = h("; ".join(row.verdict.reasons))
+  if row.verdict.level == "no" {
+    "<td class=bad title=\"{reasons}\">not comparable: {reasons}</td>"
+  } else if row.verdict.level == "warn" {
+    "<td class=warn title=\"{reasons}\">⚠ {reasons}</td>"
+  } else {
+    "<td class=muted>comparable</td>"
+  }
+}
+
+fn rowClass(row: Row) -> String {
+  if row.verdict.level == "no" { " class=bad" } else if row.verdict.level == "warn" { " class=warn" } else { "" }
+}
+
+fn caseCells(row: Row) -> String {
+  "<td>{h(row.case)}</td><td>{h(row.input)}</td><td>{h(row.backend)}</td>"
+}
+
+fn metricHead(metric: MetricRow) -> String {
+  "{h(metric.name)} <span class=unit>{h(metric.unit)}</span>"
+}
+
+/// The comparison under the form.
+fn comparison(
+  at: String,
+  a: Side,
+  b: Side,
+  rows: Array<Row>,
+  largest: Array<Change>,
+  metric: String,
+  all: Bool,
+) -> String {
+  var compared = 0
+  var refused = 0
+  var onlyA = 0
+  var onlyB = 0
+  for row in rows {
+    if row.a.isNone() {
+      onlyB += 1
+    } else if row.b.isNone() {
+      onlyA += 1
+    } else if row.verdict.level == "no" {
+      refused += 1
+    } else {
+      compared += 1
+    }
+  }
+  let toggle = if refused == 0 {
+    ""
+  } else if all {
+    " (shown, marked)"
+  } else {
+    " (hidden: <a href=\"{h(at)}/compare?a={h(text.urlEncode(a.spec))}&amp;b={h(text.urlEncode(b.spec))}&amp;metric={h(text.urlEncode(metric))}&amp;all=1\">show them</a>)"
+  }
+  let counts = "<p><b>A</b> {sideLink(at, a)} · <b>B</b> {sideLink(at, b)}</p><p class=note>{compared} cases compared · {refused} not comparable{toggle} · {onlyA} only in A · {onlyB} only in B. Medians in canonical units, the least–most and the repetitions under them; differences are B − A, and ▲ / ▼ mark a change for the better or the worse when the two ranges do not overlap (~ when they do).</p>"
+  var top = Vector.of()
+  for change in largest {
+    top.push("<tr{rowClass(change.row)}>{caseCells(change.row)}<td>{metricHead(change.metric)}</td>{spreadCell(change.metric.a)}{spreadCell(change.metric.b)}{differenceCells(change.metric)}</tr>")
+  }
+  let largestTable = if top.length() == 0 {
+    "<p class=muted>No measurement both sides made can be compared.</p>"
+  } else {
+    "<h2>Largest differences</h2><table><tr><th>case</th><th>input</th><th>backend</th><th>metric</th><th class=num>A</th><th class=num>B</th><th class=num>B − A</th><th class=num>relative</th></tr>{"".join(top.freeze())}</table>"
+  }
+  var body = Vector.of()
+  var onlyHere = Vector.of()
+  var onlyThere = Vector.of()
+  let shown = filtered(rows, metric)
+  // Both sides first, the comparable before the rest; then the cases one
+  // side alone measured, by name only: they have nothing to compare.
+  for pass in [0, 1] {
+    for row in shown {
+      let both = row.a.isSome() && row.b.isSome()
+      let refusedRow = row.verdict.level == "no"
+      if both && ((pass == 0 && !refusedRow) || (pass == 1 && refusedRow && all)) {
+        var first = true
+        let span = row.metrics.length()
+        for one in row.metrics {
+          let lead = if first { "<td rowspan={span}>{h(row.case)}</td><td rowspan={span}>{h(row.input)}</td><td rowspan={span}>{h(row.backend)}</td>" } else { "" }
+          let tail = if first { verdictCell(row).replace("<td", "<td rowspan={span}") } else { "" }
+          body.push("<tr{rowClass(row)}>{lead}<td>{metricHead(one)}</td>{spreadCell(one.a)}{spreadCell(one.b)}{differenceCells(one)}{tail}</tr>")
+          first = false
+        }
+      }
+      if pass == 0 && !both {
+        let name = "<li>{h(row.case)} <span class=muted>{h(row.input)} · {h(row.backend)}</span></li>"
+        if row.a.isSome() { onlyHere.push(name) } else { onlyThere.push(name) }
+      }
+    }
+  }
+  let full = if body.length() == 0 { "" } else { "<h2>Every case both measured</h2><table><tr><th>case</th><th>input</th><th>backend</th><th>metric</th><th class=num>A</th><th class=num>B</th><th class=num>B − A</th><th class=num>relative</th><th>conditions</th></tr>{"".join(body.freeze())}</table>" }
+  let lonely = "{onlyList("Only in A", onlyHere.freeze())}{onlyList("Only in B", onlyThere.freeze())}"
+  "{counts}{largestTable}{full}{lonely}"
+}
+
+fn onlyList(title: String, items: Array<String>) -> String {
+  if items.length() == 0 {
+    return ""
+  }
+  "<h2>{h(title)} ({items.length()})</h2><ul class=only>{"".join(items)}</ul>"
+}
+
+fn sideLink(at: String, side: Side) -> String {
+  if side.runs.length() == 1 && !side.spec.startsWith("commit:") {
+    "<a href=\"{h(at)}/runs/{h(side.spec)}\">{h(side.label)}</a>"
+  } else {
+    h(side.label)
+  }
+}
+
+// ---------------------------------------------------------------------- JSON
+
+fn spreadJson(spread: Option<Spread>) -> Json {
+  match spread {
+    Some(one) => Json.Fields(
+      Map.of(
+        MapEntry(key: "median", value: Json.Number(one.median)),
+        MapEntry(key: "least", value: Json.Number(one.least)),
+        MapEntry(key: "most", value: Json.Number(one.most)),
+        MapEntry(key: "count", value: Json.Number(one.count.toFloat())),
+      ),
+    )
+    None => Json.Null
+  }
+}
+
+fn optionalNumber(value: Option<Float>) -> Json {
+  match value {
+    Some(number) => Json.Number(number)
+    None => Json.Null
+  }
+}
+
+fn rowJson(row: Row) -> Json {
+  var metrics = Vector.of()
+  for one in row.metrics {
+    metrics.push(
+      Json.Fields(
+        Map.of(
+          MapEntry(key: "name", value: Json.Text(one.name)),
+          MapEntry(key: "unit", value: Json.Text(one.unit)),
+          MapEntry(key: "better", value: Json.Text(one.better)),
+          MapEntry(key: "a", value: spreadJson(one.a)),
+          MapEntry(key: "b", value: spreadJson(one.b)),
+          MapEntry(key: "delta", value: optionalNumber(one.delta)),
+          MapEntry(key: "ratio", value: optionalNumber(one.ratio)),
+          MapEntry(key: "overlap", value: Json.Bool(one.overlap)),
+        ),
+      ),
+    )
+  }
+  var reasons = Vector.of()
+  for reason in row.verdict.reasons {
+    reasons.push(Json.Text(reason))
+  }
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "case", value: Json.Text(row.case)),
+      MapEntry(key: "input", value: Json.Text(row.input)),
+      MapEntry(key: "backend", value: Json.Text(row.backend)),
+      MapEntry(key: "a", value: sideId(row.a)),
+      MapEntry(key: "b", value: sideId(row.b)),
+      MapEntry(key: "comparable", value: Json.Text(row.verdict.level)),
+      MapEntry(key: "reasons", value: Json.Items(reasons.freeze())),
+      MapEntry(key: "metrics", value: Json.Items(metrics.freeze())),
+    ),
+  )
+}
+
+fn sideId(entry: Option<compare.Entry>) -> Json {
+  match entry {
+    Some(one) => Json.Text(one.run.id)
+    None => Json.Null
+  }
+}
+
+fn comparisonJson(a: Side, b: Side, rows: Array<Row>, largest: Array<Change>) -> Json {
+  var items = Vector.of()
+  for row in rows {
+    items.push(rowJson(row))
+  }
+  var top = Vector.of()
+  for change in largest {
+    top.push(
+      Json.Fields(
+        Map.of(
+          MapEntry(key: "case", value: Json.Text(change.row.case)),
+          MapEntry(key: "input", value: Json.Text(change.row.input)),
+          MapEntry(key: "backend", value: Json.Text(change.row.backend)),
+          MapEntry(key: "metric", value: Json.Text(change.metric.name)),
+          MapEntry(key: "ratio", value: optionalNumber(change.metric.ratio)),
+        ),
+      ),
+    )
+  }
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "a", value: Json.Text(a.label)),
+      MapEntry(key: "b", value: Json.Text(b.label)),
+      MapEntry(key: "rows", value: Json.Items(items.freeze())),
+      MapEntry(key: "largest", value: Json.Items(top.freeze())),
+    ),
+  )
+}
