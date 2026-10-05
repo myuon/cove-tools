@@ -1,0 +1,33 @@
+use web
+use fetch
+use log
+
+/// Forwards the request — its method, its body, its `content-type` and its
+/// `x-*` headers — to `?url=`, and answers what came back.
+///
+/// The run parks while the fetch is out. A URL off the allowlist is the
+/// host's `Err`, answered 502 here, and nothing is sent.
+export fn handle(request: web.Request) -> web.Response {
+  let url = request.query.get("url").unwrapOr("")
+  if url == "" {
+    return web.Response(status: 400, headers: Map.of(), body: "?url= is required\n")
+  }
+  var forwarded: Map<String, String> = Map.of()
+  for name in request.headers.keys() {
+    if name.startsWith("x-") || name == "content-type" {
+      forwarded = forwarded.inserted(name, request.headers.get(name).unwrapOr(""))
+    }
+  }
+  match fetch.request(request.method, url, forwarded, request.body) {
+    Ok(answer) => {
+      log.info("{request.method} {url} -> {answer.status}")
+      let kind = answer.headers.get("content-type").unwrapOr("text/plain")
+      web.Response(
+        status: answer.status,
+        headers: Map.of(MapEntry(key: "content-type", value: kind)),
+        body: answer.body,
+      )
+    }
+    Err(error) => web.Response(status: 502, headers: Map.of(), body: "{error.message}\n")
+  }
+}

@@ -1,0 +1,15 @@
+use web
+
+fn ask(method: String, path: String, body: String) -> web.Response {
+  handle(web.Request(method: method, path: path, query: Map.of(), headers: Map.of(), body: body))
+}
+
+test fn storesListsAndDeletes() -> Result<Unit, Error> {
+  assertEqual(ask("PUT", "/a", "first").status, 201)?
+  assertEqual(ask("PUT", "/b", "second").status, 201)?
+  assertEqual(ask("GET", "/a", "").body, "first")?
+  assertEqual(ask("GET", "/", "").body, "a\nb\n")?
+  assertEqual(ask("DELETE", "/a", "").status, 200)?
+  assertEqual(ask("GET", "/a", "").status, 404)?
+  Ok(())
+}

@@ -25,11 +25,15 @@ pub fn fixtures() -> PathBuf {
 /// A temporary apps directory, removed when dropped.
 pub struct Apps {
     pub root: PathBuf,
+    /// The data directory hosts over these apps keep their state in; it
+    /// outlives a host, so a second host over the same apps sees it.
+    pub data: PathBuf,
 }
 
 impl Drop for Apps {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.data);
     }
 }
 
@@ -100,7 +104,9 @@ pub fn apps(specs: &[AppSpec]) -> Apps {
         };
         std::fs::write(dir.join("app.toml"), config).unwrap();
     }
-    Apps { root }
+    let data = root.with_extension("data");
+    let _ = std::fs::remove_dir_all(&data);
+    Apps { root, data }
 }
 
 /// The options a test host starts with: a free port, `workers` workers, the
@@ -110,6 +116,7 @@ pub fn options(apps: &Apps, workers: usize) -> ServeOptions {
     options.addr = "127.0.0.1:0".to_string();
     options.workers = workers;
     options.quiet = true;
+    options.data = Some(apps.data.clone());
     // `COVE_HOST_TEST_BACKEND=vm` runs the suite on the encoded VM where the
     // native tier would otherwise be chosen.
     if let Ok(backend) = std::env::var("COVE_HOST_TEST_BACKEND") {

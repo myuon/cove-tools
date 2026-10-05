@@ -393,3 +393,31 @@ fn the_sample_apps_check_and_their_tests_pass() {
     let tested = cove_host::toolchain::test(&samples(), &[], None, &modules).unwrap();
     assert!(tested.ok, "{}{}", tested.out, tested.err);
 }
+
+/// What a park costs end to end, printed, against which `kv`'s
+/// answer-at-once is weighed: `cargo t --test host -- --ignored park_cost
+/// --nocapture`. A request of sixteen zero-length sleeps against one, the
+/// difference per park.
+#[test]
+#[ignore]
+fn park_cost() {
+    let apps = apps(&[sample_with(
+        "slow",
+        "grant = [\"timer\", \"log\"]\n[limits]\nmax_host_calls = 32\n",
+    )]);
+    let host = start(&apps, 2);
+    let time = |path: &str| {
+        let started = std::time::Instant::now();
+        for _ in 0..300 {
+            assert_eq!(get(host.addr, path).status, 200);
+        }
+        started.elapsed() / 300
+    };
+    time("/slow/?ms=0&times=1");
+    let one = time("/slow/?ms=0&times=1");
+    let sixteen = time("/slow/?ms=0&times=16");
+    println!(
+        "a request with 1 park {one:?}, with 16 {sixteen:?}: {:?} per park",
+        (sixteen - one) / 15
+    );
+}

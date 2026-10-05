@@ -1,0 +1,8 @@
+# Notes kept in the app's own persistent key-value store, which survives a
+# restart and which no other app can read. `log` for a line per write.
+grant = ["kv", "log"]
+
+[kv]
+max_value_bytes = 65536
+max_keys = 10000
+max_bytes = 16777216
