@@ -47,6 +47,7 @@ jobs:
         env:
           WEBHOOKS_ADMIN_TOKEN: ci
           LEDGER_TOKEN: ci
+          ADMIN_UI_TOKEN: ci
         run: |
           ./target/release/cove-host check --apps apps
           ./target/release/cove-host test --apps apps

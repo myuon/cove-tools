@@ -1,0 +1,293 @@
+use web
+use host
+use text
+
+// The pages. Every value that came from the host — an app's name, a reason,
+// an error message, a history entry — and every value echoed from a form
+// goes through `h` before it is part of a page; the page's own markup is
+// the only markup in it. There is no script at all.
+
+/// `value`, escaped for HTML.
+fn h(value: String) -> String {
+  text.escapeHtml(value)
+}
+
+/// The headers every answer carries: no script, nothing but this site's
+/// forms, no framing, no sniffing, no caching, no referrer.
+fn pageHeaders(contentType: String) -> Map<String, String> {
+  Map.of(
+    MapEntry(key: "content-type", value: contentType),
+    MapEntry(
+      key: "content-security-policy",
+      value: "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    ),
+    MapEntry(key: "x-content-type-options", value: "nosniff"),
+    MapEntry(key: "x-frame-options", value: "DENY"),
+    MapEntry(key: "referrer-policy", value: "no-referrer"),
+    MapEntry(key: "cache-control", value: "no-store"),
+  )
+}
+
+fn htmlResponse(status: Int, page: String) -> web.Response {
+  web.Response(status: status, headers: pageHeaders("text/html; charset=utf-8"), body: page)
+}
+
+fn textResponse(status: Int, body: String) -> web.Response {
+  web.Response(status: status, headers: pageHeaders("text/plain; charset=utf-8"), body: body)
+}
+
+/// A `303 See Other` to `location`.
+fn redirect(location: String) -> web.Response {
+  web.Response(
+    status: 303,
+    headers: Map.of(
+      MapEntry(key: "location", value: location),
+      MapEntry(key: "cache-control", value: "no-store"),
+    ),
+    body: "",
+  )
+}
+
+fn css() -> String {
+  "body\{font:14px/1.45 system-ui,sans-serif;margin:0;color:#1d1d1f;background:#fafafa\}header\{background:#3b2d4f;padding:.6em 1.2em;display:flex;gap:1.4em;align-items:baseline\}header a\{color:#fff;text-decoration:none\}header a.home\{font-weight:600\}main\{padding:1em 1.2em;max-width:80em\}table\{border-collapse:collapse;margin:.4em 0 1.2em;background:#fff\}td,th\{border:1px solid #d0d7de;padding:.25em .6em;text-align:left;vertical-align:top\}th\{background:#f3f4f6\}code,pre,textarea\{font:12px/1.4 ui-monospace,monospace\}pre\{background:#fff;border:1px solid #d0d7de;padding:.6em;white-space:pre-wrap;word-break:break-word;max-height:24em;overflow:auto\}button\{font:inherit;padding:.2em .8em\}input\{font:inherit\}input[type=number]\{width:12em\}.muted\{color:#6e7781\}.state\{display:inline-block;padding:0 .5em;border-radius:.6em;font-size:12px;font-weight:600;color:#fff\}.serving\{background:#1a7f37\}.disabled\{background:#6e7781\}.refused\{background:#b42318\}.removed\{background:#9a6700\}.added\{color:#1a7f37\}.taken\{color:#b42318;text-decoration:line-through\}.notice\{border:1px solid #1a7f37;background:#dafbe1;padding:.5em .8em;margin:.6em 0\}.problem\{border:1px solid #b42318;background:#ffebe9;padding:.5em .8em;margin:.6em 0\}.problem pre\{margin:.4em 0 0\}fieldset\{border:1px solid #d0d7de;background:#fff;margin:.6em 0;padding:.5em .9em\}legend\{font-weight:600\}label.cap\{display:inline-block;min-width:9em;margin:.15em 0\}"
+}
+
+/// The page around `content`.
+fn layout(base: String, title: String, content: String) -> String {
+  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · cove-tools admin</title><style>{css()}</style></head><body><header><a class=home href=\"{h(base)}/\">cove-tools admin</a><a href=\"{h(base)}/\">apps</a><a href=\"{h(base)}/history\">history</a></header><main>{content}</main></body></html>"
+}
+
+fn badge(state: String) -> String {
+  "<span class=\"state {h(state)}\">{h(state)}</span>"
+}
+
+/// A list of names, or a dash.
+fn names(items: Array<String>) -> String {
+  if items.length() == 0 {
+    return "<span class=muted>–</span>"
+  }
+  var out = Vector.of()
+  for item in items {
+    out.push("<code>{h(item)}</code>")
+  }
+  " ".join(out.freeze())
+}
+
+/// The grant, with what the admin added and what it took away marked.
+fn grantList(app: host.App) -> String {
+  var out = Vector.of()
+  for capability in app.granted {
+    if app.grantAdded.contains(capability) {
+      out.push("<code class=added title=\"granted here, not in app.toml\">+{h(capability)}</code>")
+    } else {
+      out.push("<code>{h(capability)}</code>")
+    }
+  }
+  for capability in app.grantRemoved {
+    out.push("<code class=taken title=\"in app.toml, taken away here\">{h(capability)}</code>")
+  }
+  if out.length() == 0 {
+    return "<span class=muted>–</span>"
+  }
+  " ".join(out.freeze())
+}
+
+/// The first line of `reason`.
+fn firstLine(reason: String) -> String {
+  reason.split("\n").get(0).unwrapOr("")
+}
+
+/// Every app, one row each.
+fn overviewPage(base: String, apps: Array<host.App>) -> String {
+  var rows = Vector.of()
+  for app in apps {
+    let reason = if app.reason == "" {
+      ""
+    } else {
+      "<div class=muted>{h(firstLine(app.reason))}</div>"
+    }
+    let reached = if app.hosts.length() > 0 {
+      "{names(app.hosts)}"
+    } else {
+      "<code>/{h(app.name)}/</code>"
+    }
+    let required = if app.requiredOpen { "{names(app.required)} <span class=muted>(at least)</span>" } else { names(app.required) }
+    let store = if app.kvKeys < 0 { "–" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
+    rows.push(
+      "<tr><td><a href=\"{h(base)}/apps/{h(app.name)}\"><b>{h(app.name)}</b></a>{if app.isAdmin { " <span class=muted>(this app)</span>" } else { "" }}</td><td>{badge(app.state)}{reason}</td><td><code>{h(app.version)}</code> <span class=muted>{h(app.tier)}</span></td><td>{reached}</td><td>{required}</td><td>{grantList(app)}</td><td>{app.served} / {app.ok} / {app.errors} / {app.rejected}</td><td>{app.inFlight} / {app.queued}</td><td>{store}</td></tr>",
+    )
+  }
+  let table = "<table><tr><th>app</th><th>state</th><th>version</th><th>reached</th><th>code requires</th><th>granted</th><th>served / ok / errors / rejected</th><th>in flight / queued</th><th>store</th></tr>{"".join(rows.freeze())}</table>"
+  let about = "<p class=muted>A change to an app is a re-check: the host loads the app again with it and serves the new version only if it loads. Taking away a capability the code needs leaves that app refused — and no other. Changes are kept in the host's data directory and survive restarts and releases.</p>"
+  layout(base, "apps", "<h1>Apps</h1>{table}{about}")
+}
+
+/// One app: what it is, the forms that change it, its recent errors.
+/// `notice` is said above everything; `posted` is a form to show again as it
+/// was posted, instead of the app's current settings.
+fn appPage(
+  base: String,
+  app: host.App,
+  capabilities: Array<String>,
+  notice: String,
+  posted: Option<Map<String, String>>,
+) -> String {
+  let at = "{base}/apps/{app.name}"
+  let reason = if app.reason == "" { "" } else { "<pre>{h(app.reason)}</pre>" }
+  var limitRows = Vector.of()
+  for field in limitFields() {
+    let changed = if app.limitsChanged.contains(limitKey(field.name)) { " <span class=added title=\"set here, not in app.toml\">(changed)</span>" } else { "" }
+    limitRows.push("<tr><th>{h(field.label)}</th><td>{limitValue(app.limits, field.name)}{changed}</td></tr>")
+  }
+  let store = if app.kvKeys < 0 { "–" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
+  let facts = "<table><tr><th>state</th><td>{badge(app.state)}</td></tr><tr><th>version</th><td><code>{h(app.version)}</code> {h(app.tier)}</td></tr><tr><th>entry</th><td><code>{h(app.entry)}</code></td></tr><tr><th>reached</th><td>{if app.hosts.length() > 0 { "by hostname {names(app.hosts)} only" } else { "<code>/{h(app.name)}/</code>" }}</td></tr><tr><th>code requires</th><td>{names(app.required)}{if app.requiredOpen { " <span class=muted>(at least: it makes a call the checker cannot follow)</span>" } else { "" }}</td></tr><tr><th>granted</th><td>{grantList(app)}</td></tr><tr><th>fetch allowlist</th><td>{names(app.fetchAllow)}</td></tr><tr><th>requests</th><td>{app.served} served, {app.ok} ok, {app.errors} errors, {app.rejected} rejected; {app.inFlight} in flight, {app.queued} queued</td></tr><tr><th>store</th><td>{store}</td></tr></table><h2>Limits</h2><table>{"".join(limitRows.freeze())}</table>"
+  layout(
+    base,
+    app.name,
+    "<h1>{h(app.name)} {badge(app.state)}</h1>{notice}{reason}{facts}{enableForm(at, app)}{configureForm(at, app, capabilities, posted)}{resetForm(at)}{errorsTable(app.recentErrors)}",
+  )
+}
+
+/// The `[limits]` key a form field changes, as the host names it.
+fn limitKey(field: String) -> String {
+  if field == "fuel" {
+    "fuel"
+  } else if field == "maxHostCalls" {
+    "max_host_calls"
+  } else if field == "deadlineMs" {
+    "deadline"
+  } else if field == "maxHeapWords" {
+    "max_heap_words"
+  } else if field == "maxInFlight" {
+    "max_in_flight"
+  } else if field == "maxQueued" {
+    "max_queued"
+  } else if field == "maxRequestBytes" {
+    "max_request_bytes"
+  } else {
+    "max_response_bytes"
+  }
+}
+
+fn enableForm(at: String, app: host.App) -> String {
+  if app.isAdmin {
+    return "<h2>Routing</h2><p class=muted>The admin app cannot disable itself. On the machine, <code>cove-host disable admin</code> can.</p>"
+  }
+  if app.state == "disabled" {
+    return "<h2>Routing</h2><form method=post action=\"{h(at)}/enable\"><p>Disabled: requests are answered 503, and its data is kept. <button>Enable</button></p></form>"
+  }
+  if app.state == "removed" {
+    return ""
+  }
+  "<h2>Routing</h2><form method=post action=\"{h(at)}/disable\"><p>Disabling stops routing to it — requests are answered 503 — and keeps its data; requests in flight finish. <button>Disable</button></p></form>"
+}
+
+/// The grant, the allowlist and the limits, as a form: the app's current
+/// settings, or `posted` as it was posted.
+fn configureForm(
+  at: String,
+  app: host.App,
+  capabilities: Array<String>,
+  posted: Option<Map<String, String>>,
+) -> String {
+  if app.state == "removed" {
+    return ""
+  }
+  var boxes = Vector.of()
+  for capability in capabilities {
+    let checked = match posted {
+      Some(form) => form.contains("cap.{capability}")
+      None => app.granted.contains(capability)
+    }
+    let needed = if app.required.contains(capability) { " <span class=muted>(the code uses it)</span>" } else { "" }
+    if !app.isAdmin && capability == "admin" {
+      // Only the admin app may hold it; the host refuses it to any other.
+      continue
+    }
+    if app.isAdmin && capability == "admin" {
+      // Not the admin app's to give up: sent whatever the box says.
+      boxes.push("<label class=cap><input type=hidden name=\"cap.admin\" value=on><input type=checkbox checked disabled> <code>admin</code></label>{needed}<br>")
+    } else {
+      boxes.push(
+        "<label class=cap><input type=checkbox name=\"cap.{h(capability)}\"{if checked { " checked" } else { "" }}> <code>{h(capability)}</code></label>{needed}<br>",
+      )
+    }
+  }
+  let allow = match posted {
+    Some(form) => form.get("allow").unwrapOr("")
+    None => "\n".join(app.fetchAllow)
+  }
+  var inputs = Vector.of()
+  for field in limitFields() {
+    let value = match posted {
+      Some(form) => form.get(field.name).unwrapOr("")
+      None => "{limitValue(app.limits, field.name)}"
+    }
+    inputs.push(
+      "<tr><th><label for=\"{h(field.name)}\">{h(field.label)}</label></th><td><input id=\"{h(field.name)}\" name=\"{h(field.name)}\" value=\"{h(value)}\" inputmode=numeric required></td></tr>",
+    )
+  }
+  "<h2>Configuration</h2><form method=post action=\"{h(at)}/configure\"><fieldset><legend>Grant</legend>{"".join(boxes.freeze())}</fieldset><fieldset><legend>Fetch allowlist</legend><p class=muted>One per line: <code>https://host</code>, <code>http://host:port</code> or <code>http://host:*</code>.</p><textarea name=allow rows=5 cols=60>{h(allow)}</textarea></fieldset><fieldset><legend>Limits</legend><table>{"".join(inputs.freeze())}</table></fieldset><p><button>Check and apply</button> <span class=muted>The host reloads the app with these settings; a change that does not work is not kept.</span></p></form>"
+}
+
+fn resetForm(at: String) -> String {
+  "<form method=post action=\"{h(at)}/reset\"><p><button>Reset to app.toml</button> <span class=muted>Drops every change made here to the grant, the allowlist and the limits.</span></p></form>"
+}
+
+fn errorsTable(errors: Array<host.Failure>) -> String {
+  if errors.length() == 0 {
+    return "<h2>Recent errors</h2><p class=muted>None.</p>"
+  }
+  var rows = Vector.of()
+  for error in errors {
+    rows.push(
+      "<tr><td>{text.isoTime(error.atMs)}</td><td><code>{h(error.kind)}</code></td><td>{error.status}</td><td><code>{h(error.version)}</code></td><td><pre>{h(error.message)}</pre></td></tr>",
+    )
+  }
+  "<h2>Recent errors</h2><table><tr><th>at (UTC)</th><th>kind</th><th>status</th><th>version</th><th>message</th></tr>{"".join(rows.freeze())}</table>"
+}
+
+/// What a `?done=` says after a change went through.
+fn notice(request: web.Request) -> String {
+  let done = request.query.get("done").unwrapOr("")
+  let said = if done == "enable" {
+    "Enabled: requests are routed to it again."
+  } else if done == "disable" {
+    "Disabled: new requests are answered 503; its data is kept."
+  } else if done == "configure" {
+    "Applied. The host reloaded the app with the new configuration; its state is below."
+  } else if done == "reset" {
+    "Reset: the app is loaded from its app.toml again."
+  } else {
+    ""
+  }
+  if said == "" { "" } else { "<div class=notice>{h(said)} <a href=\"{h(base(request))}/history\">history</a></div>" }
+}
+
+fn problemsNotice(problems: Array<String>) -> String {
+  var items = Vector.of()
+  for problem in problems {
+    items.push("<li>{h(problem)}</li>")
+  }
+  "<div class=problem><b>Nothing was changed.</b> The form has problems:<ul>{"".join(items.freeze())}</ul></div>"
+}
+
+fn refusedNotice(action: String, message: String) -> String {
+  "<div class=problem><b>Refused: nothing was changed.</b> The host said, of <code>{h(action)}</code>:<pre>{h(message)}</pre></div>"
+}
+
+/// The change history.
+fn historyPage(base: String, changes: Array<host.Change>) -> String {
+  var rows = Vector.of()
+  for change in changes {
+    rows.push(
+      "<tr><td>{text.isoTime(change.atMs)}</td><td>{h(change.who)}</td><td><a href=\"{h(base)}/apps/{h(change.app)}\">{h(change.app)}</a></td><td><code>{h(change.action)}</code></td><td>{h(change.detail)}</td><td>{h(change.outcome)}</td></tr>",
+    )
+  }
+  let table = if rows.length() == 0 {
+    "<p class=muted>No changes yet.</p>"
+  } else {
+    "<table><tr><th>at (UTC)</th><th>who</th><th>app</th><th>action</th><th>asked for</th><th>outcome</th></tr>{"".join(rows.freeze())}</table>"
+  }
+  layout(base, "history", "<h1>History</h1><p class=muted>Every change, made here or with <code>cove-host update|remove|enable|disable|reset</code> on the machine, refused ones included; newest first.</p>{table}")
+}

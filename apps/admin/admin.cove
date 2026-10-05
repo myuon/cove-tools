@@ -1,0 +1,263 @@
+use web
+use auth
+use host
+use text
+
+/// The admin app: what the host runs, and the forms that change it.
+///
+/// - `GET /` lists every app: its state and why, its version, what its code
+///   requires and what it is granted, its counters.
+/// - `GET /apps/<app>` is one app in full — hostnames, fetch allowlist,
+///   limits, recent errors — with the forms: enable or disable, change the
+///   grant, the allowlist and the limits, reset to `app.toml`.
+/// - `GET /history` is the change history.
+/// - `POST /apps/<app>/enable|disable|configure|reset` make the changes.
+///
+/// Everything is behind the `admin` secret (and, deployed, behind Cloudflare
+/// Access as well); a change posted from another site is refused. The host
+/// re-checks every change by reloading the app, keeps it only if it makes
+/// sense, and refuses the admin app anything that would lock it out.
+export fn handle(request: web.Request) -> web.Response {
+  if !auth.check("admin", request.headers.get("authorization").unwrapOr("")) {
+    return web.Response(
+      status: 401,
+      headers: pageHeaders("text/plain; charset=utf-8").inserted("www-authenticate", "Basic realm=\"cove-tools admin\""),
+      body: "the admin pages need the admin secret\n",
+    )
+  }
+  let get = request.method == "GET" || request.method == "HEAD"
+  if !get {
+    if request.method != "POST" {
+      return textResponse(405, "only GET and POST\n")
+    }
+    if !sameOrigin(request) {
+      return textResponse(403, "a cross-site form cannot change the host\n")
+    }
+  }
+  let at = base(request)
+  let parts = request.path.split("/")
+  let section = parts.get(1).unwrapOr("")
+  let name = parts.get(2).unwrapOr("")
+  let action = parts.get(3).unwrapOr("")
+  if request.path == "/" && get {
+    return htmlResponse(200, overviewPage(at, host.apps()))
+  }
+  if section == "history" && name == "" && get {
+    return htmlResponse(200, historyPage(at, host.history(200)))
+  }
+  if section != "apps" || name == "" {
+    return textResponse(404, "no such page\n")
+  }
+  let app = match find(name) {
+    Some(app) => app
+    None => return textResponse(404, "no app `{name}`\n")
+  }
+  if action == "" && get {
+    return htmlResponse(200, appPage(at, app, host.capabilities(), notice(request), None))
+  }
+  if get || parts.length() > 4 {
+    return textResponse(404, "no such page\n")
+  }
+  let who = user(request)
+  let form = text.parseForm(request.body)
+  if action == "enable" || action == "disable" {
+    return finish(at, app, action, host.setEnabled(app.name, action == "enable", who), form)
+  }
+  if action == "reset" {
+    return finish(at, app, action, host.reset(app.name, who), form)
+  }
+  if action == "configure" {
+    let capabilities = host.capabilities()
+    let read = settingsFrom(form, capabilities)
+    if read.problems.length() > 0 {
+      return htmlResponse(
+        422,
+        appPage(at, app, capabilities, problemsNotice(read.problems), Some(form)),
+      )
+    }
+    return finish(at, app, action, host.configure(app.name, read.settings, who), form)
+  }
+  textResponse(404, "no such page\n")
+}
+
+/// After a change: back to the app's page, saying what happened; or the
+/// page again with the host's reasons, the form as it was posted.
+fn finish(
+  at: String,
+  app: host.App,
+  action: String,
+  result: Result<String, Error>,
+  form: Map<String, String>,
+) -> web.Response {
+  match result {
+    Ok(_) => redirect("{at}/apps/{app.name}?done={action}")
+    Err(error) => {
+      // The app as it is now, which the refused change left alone.
+      let now = find(app.name).unwrapOr(app)
+      htmlResponse(
+        422,
+        appPage(at, now, host.capabilities(), refusedNotice(action, error.message), Some(form)),
+      )
+    }
+  }
+}
+
+/// The app named `name`, if the host has it.
+fn find(name: String) -> Option<host.App> {
+  for app in host.apps() {
+    if app.name == name {
+      return Some(app)
+    }
+  }
+  None
+}
+
+/// Who is asking, as far as this app can tell: the email Cloudflare Access
+/// says it let in, when there is one. The history keeps it as said.
+fn user(request: web.Request) -> String {
+  request.headers.get("cf-access-authenticated-user-email").unwrapOr("").trim()
+}
+
+/// Where the host mounted the app: "" when it is reached by hostname.
+fn base(request: web.Request) -> String {
+  request.headers.get("x-forwarded-prefix").unwrapOr("")
+}
+
+/// Whether a request that changes something came from these pages: a
+/// browser says where a form was submitted from (`Sec-Fetch-Site`,
+/// `Origin`), and a form on another site must not be able to use the
+/// browser's stored login. A client that says neither — curl — is not a
+/// browser, and holds the secret itself.
+fn sameOrigin(request: web.Request) -> Bool {
+  match request.headers.get("sec-fetch-site") {
+    Some(site) => {
+      if site != "same-origin" && site != "none" {
+        return false
+      }
+    }
+    None => {}
+  }
+  match request.headers.get("origin") {
+    Some(from) => {
+      let scheme = request.headers.get("x-forwarded-proto").unwrapOr("http")
+      from == "{scheme}://{request.headers.get("host").unwrapOr("")}"
+    }
+    None => true
+  }
+}
+
+// ------------------------------------------------------------- the form
+
+/// What a configure form came to: the settings, and what was wrong with
+/// it. The host checks again — this is so that a typo is answered with the
+/// field's name rather than the host's reload.
+struct Read {
+  settings: host.Settings
+  problems: Array<String>
+}
+
+/// The limits' form fields, in the order the form shows them: name, label,
+/// the least value it may have.
+struct LimitField {
+  name: String
+  label: String
+  least: Int
+}
+
+fn limitFields() -> Array<LimitField> {
+  Vector.of(
+    LimitField(name: "fuel", label: "fuel per request", least: 1),
+    LimitField(name: "maxHostCalls", label: "host calls per request", least: 0),
+    LimitField(name: "deadlineMs", label: "deadline per request (ms)", least: 1),
+    LimitField(name: "maxHeapWords", label: "heap per request (words; 0 = the runtime's 4194304)", least: 0),
+    LimitField(name: "maxInFlight", label: "runs in flight", least: 1),
+    LimitField(name: "maxQueued", label: "requests queued", least: 0),
+    LimitField(name: "maxRequestBytes", label: "request body (bytes)", least: 0),
+    LimitField(name: "maxResponseBytes", label: "response body (bytes)", least: 0),
+  )
+    .freeze()
+}
+
+/// The value of a limit in `limits`, by its field name.
+fn limitValue(limits: host.Limits, name: String) -> Int {
+  if name == "fuel" {
+    limits.fuel
+  } else if name == "maxHostCalls" {
+    limits.maxHostCalls
+  } else if name == "deadlineMs" {
+    limits.deadlineMs
+  } else if name == "maxHeapWords" {
+    limits.maxHeapWords
+  } else if name == "maxInFlight" {
+    limits.maxInFlight
+  } else if name == "maxQueued" {
+    limits.maxQueued
+  } else if name == "maxRequestBytes" {
+    limits.maxRequestBytes
+  } else {
+    limits.maxResponseBytes
+  }
+}
+
+/// Reads a configure form: `cap.<name>` for each capability granted, `allow`
+/// (one allowlist entry per line), and one field per limit.
+fn settingsFrom(form: Map<String, String>, capabilities: Array<String>) -> Read {
+  var problems = Vector.of()
+  var grant = Vector.of()
+  for capability in capabilities {
+    if form.contains("cap.{capability}") {
+      grant.push(capability)
+    }
+  }
+  for entry in form {
+    if entry.key.startsWith("cap.") {
+      let named = entry.key.sliceBytes(4, entry.key.byteLength()).unwrapOr("")
+      if !capabilities.contains(named) {
+        problems.push("`{named}` is not a capability this host has")
+      }
+    }
+  }
+  var allow = Vector.of()
+  for line in form.get("allow").unwrapOr("").split("\n") {
+    let entry = line.trim()
+    if entry != "" {
+      if !(entry.startsWith("http://") || entry.startsWith("https://")) {
+        problems.push("allowlist: `{entry}` is not `http://host[:port]` or `https://host[:port]`")
+      } else {
+        allow.push(entry)
+      }
+    }
+  }
+  var values: Map<String, Int> = Map.of()
+  for field in limitFields() {
+    let written = form.get(field.name).unwrapOr("").trim()
+    match Int.parse(written) {
+      Ok(value) => {
+        if value < field.least {
+          problems.push("{field.label}: {value} is less than {field.least}")
+        }
+        values = values.inserted(field.name, value)
+      }
+      Err(_) => {
+        problems.push("{field.label}: `{written}` is not a whole number")
+      }
+    }
+  }
+  Read(
+    settings: host.Settings(
+      grant: grant.freeze(),
+      fetchAllow: allow.freeze(),
+      limits: host.Limits(
+        fuel: values.get("fuel").unwrapOr(0),
+        maxHostCalls: values.get("maxHostCalls").unwrapOr(0),
+        deadlineMs: values.get("deadlineMs").unwrapOr(0),
+        maxHeapWords: values.get("maxHeapWords").unwrapOr(0),
+        maxInFlight: values.get("maxInFlight").unwrapOr(0),
+        maxQueued: values.get("maxQueued").unwrapOr(0),
+        maxRequestBytes: values.get("maxRequestBytes").unwrapOr(0),
+        maxResponseBytes: values.get("maxResponseBytes").unwrapOr(0),
+      ),
+    ),
+    problems: problems.freeze(),
+  )
+}

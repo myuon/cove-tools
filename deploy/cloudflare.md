@@ -8,6 +8,7 @@ Access** sits in front of every path but the few that callers outside need.
 
 ```
 browser ──https──▶ Cloudflare edge ──(Access: owner's login, or a bypass)──▶ tunnel ──▶ cloudflared ──http──▶ 127.0.0.1:8790 (cove-host, public)
+  covtools.ramda.io, covtools-admin.ramda.io: one tunnel, one port; the host routes by Host header
                                                                                           127.0.0.1:8791 (cove-host, admin) ◀── ssh -L only
 ```
 
@@ -134,7 +135,93 @@ So:
   and every run's JSON become public, read-only. Decide whether that is
   acceptable for the benchmark data you post.
 
-## 4. Check it from outside
+## 4. The admin UI: `covtools-admin.ramda.io`
+
+`apps/admin` is reached by hostname only (`[route] hosts` in its
+`app.toml`): a request with `Host: covtools-admin.ramda.io` reaches it with the
+whole path, and `https://covtools.ramda.io/admin/` is a 404 from the host. It
+has its own hostname, its own Access application and its own secret, so the
+main hostname's bypass paths (`/webhooks/in`, `/ledger/api/runs`) never apply
+to it.
+
+**Order matters, as in section 1: create the Access application first, then
+the public hostname** (or save the hostname with the service pointed at
+`http_status:404` and switch it once Access is in place).
+
+### Access: the owner, and nothing else
+
+Zero Trust → **Access → Applications** → **Add an application** →
+**Self-hosted**:
+
+- Application name: `cove-tools admin` (a separate application from
+  `cove-tools`)
+- Session duration: short, `1 hour` or `2 hours`
+- Application domain: subdomain `covtools-admin`, domain `ramda.io`, path
+  *empty* (the whole hostname)
+- Identity providers: the one you log in with; optionally allow only a
+  specific login method
+- Policy: name `owner`, action **Allow**, *Include* → **Emails** → the
+  owner's address (only that one)
+
+**No Bypass, no service token, no other policy, and no application on a path
+under this hostname.**
+
+### The public hostname
+
+Zero Trust → **Networks → Tunnels** → the tunnel → **Public Hostname** →
+**Add a public hostname**:
+
+| field | value |
+| --- | --- |
+| Subdomain | `covtools-admin` |
+| Domain | `ramda.io` |
+| Path | *(empty)* |
+| Service type | `HTTP` |
+| URL | `localhost:8790` |
+
+The same public listener as section 1: the host picks the app by the `Host`
+header. Leave *HTTP Host Header* empty, so that cloudflared forwards
+`Host: covtools-admin.ramda.io`; that is what routes to the admin app. Never
+`localhost:8791`.
+
+### The second lock
+
+The app itself demands `ADMIN_UI_TOKEN`: a browser login prompt (any user
+name, the token as the password), or `Authorization: Bearer <token>`. Without
+it every page is a 401. Read it on the machine:
+
+```console
+$ grep ADMIN_UI_TOKEN ~/cove-tools/env
+```
+
+### Check it
+
+```console
+$ curl -sI https://covtools-admin.ramda.io/ | head -3   # 302 to <team>.cloudflareaccess.com
+$ curl -sI https://covtools.ramda.io/admin/ | head -3   # 302 (Access); and 404 behind it: the admin app is not on this hostname
+```
+
+and on the machine:
+
+```console
+$ curl -s -o /dev/null -w '%{http_code}' -H 'Host: covtools-admin.ramda.io' http://127.0.0.1:8790/   # 401
+```
+
+### Emergency exits
+
+If the UI breaks or locks itself out (an app disabled by mistake, the admin
+app itself), the changes it made are in `~/cove-tools/data/_host/overrides.json`
+(history in `changes.jsonl`). On the machine:
+
+```console
+$ ~/cove-tools/current/cove-host enable|disable|reset <app> \
+    --token-file ~/cove-tools/data/admin.token --admin 127.0.0.1:8791
+```
+
+or edit (or delete) `~/cove-tools/data/_host/overrides.json` and
+`sudo systemctl restart cove-tools`.
+
+## 5. Check it from outside
 
 From a machine that is not logged in:
 

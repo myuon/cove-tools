@@ -1,0 +1,73 @@
+# The admin app
+
+What the host runs, and the forms that change it (issue #17): enable or
+disable an app, change its grant, its fetch allowlist and its limits, reset
+it to its `app.toml`, and read the change history. Pages, form reading,
+validation and rendering are Cove; everything it learns of the host and every
+change it makes go through one host module, `host`, whose capability is
+`admin` — and **only this app may be granted `admin`**. The startup banner
+and `/_host/stats` say so like any other grant:
+
+```text
+  admin      v1-…  requires [admin, auth]  granted [admin, auth]  ok: …
+```
+
+The host side — what a change means, what is refused, where it is kept — is
+in the main README, [Administering apps at run time](../../README.md#administering-apps-at-run-time).
+
+| request | does |
+| --- | --- |
+| `GET /` | every app: state (`serving`, `disabled`, `refused`, `removed`) and why, version and tier, how it is reached, what its code requires and what it is granted (changes marked), its counters and store |
+| `GET /apps/<app>` | one app in full, its limits and recent errors, and the forms below |
+| `POST /apps/<app>/enable`, `/disable` | routes to the app again, or stops (503; its data stays) |
+| `POST /apps/<app>/configure` | the grant (`cap.<name>` checkboxes), the allowlist (`allow`, one per line) and every limit (`fuel`, `maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) |
+| `POST /apps/<app>/reset` | drops the changes made here, back to `app.toml` |
+| `GET /history` | every change, made here or by `cove-host` on the machine, refused ones included |
+
+A change that went through redirects back to the app's page (`?done=`); one
+that did not answers 422 with the reasons — the form's own (a field that is
+not a whole number, below its least value, an allowlist line that is not
+`http(s)://…`), or the host's (the reload's) — and the form as posted.
+
+## Getting in
+
+- **Only by hostname**: `[route] hosts = ["covtools-admin.ramda.io",
+  "admin.localhost"]`. `https://covtools.ramda.io/admin/` is a 404, so the
+  main hostname's Access policy and its bypass paths are never a way in. On
+  the machine, a browser reaches `http://admin.localhost:8790/` (`*.localhost`
+  is loopback).
+- **Cloudflare Access** in front of `covtools-admin.ramda.io`, owner only, no
+  bypass ([deploy/cloudflare.md](../../deploy/cloudflare.md)).
+- **And its own secret**: `[secrets] admin = { env = "ADMIN_UI_TOKEN" }`,
+  checked with `auth.check` on every request — `Authorization: Bearer
+  <token>`, or the browser's login prompt with the token as the password.
+- **A change from another site is refused** (403): a POST whose
+  `Sec-Fetch-Site` is not `same-origin`, or whose `Origin` is not the app's
+  own. The host tells the app its origin is the hostname it was routed by
+  (`https://covtools-admin.ramda.io` under `--public-origin
+  https://covtools.ramda.io`), so the main hostname's pages cannot post here
+  either.
+- Every value shown is HTML-escaped; the pages carry a CSP of `default-src
+  'none'` with inline styles only — **no script at all** — `form-action
+  'self'`, `frame-ancestors 'none'`, and `no-store`.
+- Who made a change is what Cloudflare Access says
+  (`Cf-Access-Authenticated-User-Email`), recorded as told.
+
+Isolation between apps in one process is a fault and resource boundary, not a
+security boundary against malicious code (main README, *Security*): `admin`
+is a capability to give to code you trust, which is why one app holds it.
+
+## If it breaks
+
+The admin app is an app like the others: if it is refused or broken, the host
+and every other app run on. It cannot disable itself, take `admin` away from
+itself, or make any change that would leave it refused. On the machine, the
+admin listener still can — `cove-host enable|disable|reset <app>` — and the
+changes are plain JSON in `<data>/_host/overrides.json`, which can be edited
+or deleted before a restart.
+
+```console
+$ ADMIN_UI_TOKEN=secret ./target/checked/cove-host serve --apps apps
+$ curl -s -u x:secret http://admin.localhost:8080/ | head
+$ open http://admin.localhost:8080/
+```

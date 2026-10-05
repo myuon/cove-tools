@@ -7,10 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The webhook lab's admin secret and the ledger's post secret, which
-  # `cove-host check` resolves.
+  # The webhook lab's admin secret, the ledger's post secret and the admin
+  # UI's secret, which `cove-host check` resolves.
   WEBHOOKS_ADMIN_TOKEN: ci
   LEDGER_TOKEN: ci
+  ADMIN_UI_TOKEN: ci
 
 jobs:
   test:
