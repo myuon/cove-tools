@@ -11,11 +11,6 @@ use rng
 //   records the tour length — current and best — at evenly spaced
 //   iterations, for the chart.
 // - `exp` is here because the standard library has none.
-//
-// Like the other algorithms it writes no lambda, calls no host, compares
-// no strings and copies no vector with `toVector`/`snapshot`, so on the
-// native tier all of it has machine code and a long run yields (see the
-// README).
 
 /// A problem: `n` points, `xs[i]`, `ys[i]` in [0, 1).
 export struct Problem {

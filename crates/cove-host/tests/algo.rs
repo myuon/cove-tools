@@ -662,12 +662,14 @@ fn the_other_apps_answer_while_algo_computes_on_the_native_tier() {
 }
 
 /// What keeps the heavy runs yielding on the native tier, held without a
-/// clock: every function between the entry and the algorithms' loops has
-/// machine code. One of them left on the encoded tier — a host call or a
-/// lambda written in it is enough — puts the loops below an encoded frame,
-/// where a compiled run cannot yield (ADR 0085), and the host's other apps
-/// wait for the whole run (`apps/algo/README.md`, "Yields on the native
-/// tier").
+/// clock: every function of the app has machine code. A function left on
+/// the encoded tier above an algorithm's loop puts the loop below an encoded
+/// frame, where a compiled run cannot yield (ADR 0085), and the host's other
+/// apps wait for the whole run (`apps/algo/README.md`, "Yields on the native
+/// tier"). Since Cove 2ca1c94 host calls, closures and `String` comparisons
+/// are all compiled (cove#605), so the app is written plainly and nothing in
+/// it is refused; a refusal here is a regression of the code generator or a
+/// new shape it does not lower, and either is worth knowing about.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
 fn the_heavy_path_has_machine_code_on_the_native_tier() {
@@ -678,49 +680,9 @@ fn the_heavy_path_has_machine_code_on_the_native_tier() {
     let detail = get(host.addr, "/_host/apps/algo");
     assert_eq!(detail.status, 200);
     let detail: serde_json::Value = serde_json::from_str(&detail.body).unwrap();
-    let refused: Vec<&str> = detail["native"]["refusals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["function"].as_str().unwrap())
-        .collect();
-    for function in [
-        "algo.handle",
-        "algo.matchingPage",
-        "algo.matchingResult",
-        "algo.timed",
-        "matching.parse",
-        "matching.random",
-        "matching.distinctSorted",
-        "matching.build",
-        "matching.hopcroftKarp",
-        "matching.augmenting",
-        "matching.certify",
-        "algo.satPage",
-        "algo.satResult",
-        "sat.read",
-        "sat.generate",
-        "sat.random",
-        "sat.pigeonhole",
-        "sat.sudoku",
-        "sat.solve",
-        "sat.unsatisfied",
-        "algo.annealPage",
-        "algo.annealResult",
-        "algo.timedRun",
-        "anneal.points",
-        "anneal.circle",
-        "anneal.run",
-        "anneal.exp",
-        "anneal.ln",
-        "anneal.tourLength",
-        "anneal.nearestNeighbour",
-    ] {
-        assert!(
-            !refused.contains(&function),
-            "{function} is on the encoded tier: {refused:?}"
-        );
-    }
-    // The one host call is a leaf of its own.
-    assert!(refused.contains(&"algo.now"), "{refused:?}");
+    let refusals = detail["native"]["refusals"].as_array().unwrap();
+    assert!(
+        refusals.is_empty(),
+        "functions on the encoded tier: {refusals:?}"
+    );
 }

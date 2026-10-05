@@ -6,6 +6,7 @@ use anneal.Annealed
 use anneal.Sample
 use anneal.Schedule
 use draw
+use time
 
 // The annealing page: one problem, two runs of it with their own settings,
 // side by side — the trajectory of both on one chart, both tours, and the
@@ -99,9 +100,7 @@ fn annealPage(base: String, given: Map<String, String>, post: Bool) -> web.Respo
     }
   }
   for entry in given {
-    // `!(a == b)` rather than `a != b`: the native tier lowers a `String`
-    // `==` and not a `!=`, and this function is above every run.
-    if !(entry.key == "example") && !(entry.key == "part") {
+    if entry.key != "example" && entry.key != "part" {
       fields = fields.inserted(entry.key, entry.value)
       chosen = true
     }
@@ -178,9 +177,9 @@ struct TimedRun {
 }
 
 fn timedRun(problem: Problem, name: String, settings: Settings) -> TimedRun {
-  let started = now()
+  let started = time.nowMicros()
   let done = anneal.run(problem, settings)
-  TimedRun(name: name, settings: settings, done: done, micros: now() - started)
+  TimedRun(name: name, settings: settings, done: done, micros: time.nowMicros() - started)
 }
 
 fn annealResult(fields: Map<String, String>) -> String {

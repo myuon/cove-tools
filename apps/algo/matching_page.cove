@@ -3,6 +3,7 @@ use matching.Graph
 use matching.Matching
 use matching.Certificate
 use draw
+use time
 
 // The matching page: the form, the examples, and the result — the summary,
 // the graph drawn with the matching over it, and the table view.
@@ -134,19 +135,19 @@ struct Timed {
 }
 
 fn timed(key: String, graph: Graph) -> Timed {
-  let started = now()
+  let started = time.nowMicros()
   let found = if key == "augmenting" { matching.augmenting(graph) } else { matching.hopcroftKarp(graph) }
-  Timed(key: key, found: found, micros: now() - started)
+  Timed(key: key, found: found, micros: time.nowMicros() - started)
 }
 
 fn matchingResult(input: String, algorithm: String) -> String {
-  let started = now()
+  let started = time.nowMicros()
   let parsed = matching.parse(input, matchingBounds())
   let graph = match parsed {
     matching.Parsed.Ok(graph) => graph
     matching.Parsed.Invalid(why) => return stopNote("Not run:", why)
   }
-  let readMicros = now() - started
+  let readMicros = time.nowMicros() - started
   var runs = Vector.of()
   if algorithm == "both" {
     runs.push(timed("hopcroft-karp", graph))

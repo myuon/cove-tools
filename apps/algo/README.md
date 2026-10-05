@@ -359,7 +359,8 @@ $ cargo test --profile checked --test algo              # the app on a host
   stopped by fuel; a client
   that goes away cancels its heavy run (`errors.cancelled`, nothing in
   flight after); and **the responsiveness test** below, on the VM and on the
-  native tier; and that every function on the heavy path has machine code.
+  native tier; and that every function of the app has machine code on the
+  native tier.
 
 ## Responsiveness
 
@@ -410,8 +411,27 @@ And with annealing's `cooling` as the heavy run (`MIX=algo-anneal`;
 | VM | 0 | 1.76 ms | 2.58 ms | — | — | — | — |
 | VM | 4 | 2.54 ms | **4.29 ms** | ~48 | 302 | 0 | 0 |
 
-(The few declined yields per annealing run are polls while the clock's
-encoded leaf, `now()`, runs.)
+(The few declined yields per annealing run were polls while the clock's
+encoded leaf, `now()`, ran; that leaf is gone since Cove 2ca1c94, below.)
+
+**Re-measured at Cove 2ca1c94 with the workarounds removed** (the same
+commands, native, three repetitions; `bench/results/*-2026-10-05-native-2ca1c94.txt`,
+and the control — 2ca1c94 with the workarounds still in —
+`algo-2026-10-05-native-2ca1c94-with-workarounds.txt`; load average 3–6):
+
+| heavy run | heavy clients | `hello` p99, control | `hello` p99, workarounds removed | heavy runs in the 10 s | yields per run | declined per run | overdue |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| matching | 0 | 2.56 ms | 2.47 ms | — | — | — | — |
+| matching | 4 | 4.71 ms | **4.90 ms** | ~424 (control ~452) | 33 | 0 | 0 |
+| matching | 8 | 4.34 ms | **4.81 ms** | ~426 | 33 | 0 | 0 |
+| SAT `hard` | 4 | — | **5.00 ms** | ~266 | 53 | 0 | 0 |
+| annealing `cooling` | 4 | — | **4.11 ms** | ~280 | 51 | 0 | 0 |
+
+`hello`'s p99 stays under 5 ms beside every heavy mix, and no yield is
+declined or overdue: with nothing on the encoded tier there is no frame left
+to decline one. The matching run is about 6% slower than with the
+hand-written merge sort (~424 runs in the 10 s against ~452, the same worker
+time): `sorted(by:)` calls its closure for every comparison.
 
 With every worker held by a heavy run, a `hello` waits for the next yield —
 at most one 2 ms slice plus a tick of the monitor — and its p99 goes from 2
@@ -433,136 +453,69 @@ $ MIX=algo-anneal HEAVY="0 4" sh bench/algo.sh 3 native > bench/results/algo-ann
 
 ## Yields on the native tier
 
-**A shape of Cove code that stops a compiled run from yielding**, found
-here, measured, and worked around in the app. It is ADR 0085's remaining
-limit — *a run below an encoded callee of compiled code cannot yield* — met
-by an ordinary program, and it goes to Cove upstream.
+**Fixed upstream; the workarounds are gone.** Writing this app found three
+shapes of Cove code that stopped a compiled run from yielding, one that
+made a sliced compiled run answer wrongly, and a loop that never yielded.
+All were reported to Cove (cove#604, cove#605) and fixed there, and since
+cove-tools pins Cove 2ca1c94 the app is written the plain way again. What was found, briefly — the
+measurements are in this file's history:
 
-**The shape.** The first version timed each algorithm the obvious way:
+- **A host call above a heavy loop.** The template code generator did not
+  lower `CallHost`, so `timed`, which read `time.nowMicros()` around an
+  algorithm, stayed on the encoded tier with compiled code above and below
+  it; compiled code below an encoded frame cannot yield (ADR 0085), and the
+  heavy run held its worker to the end. Measured with four heavy clients on
+  four workers: `hello`'s p99 **10.2 s** (against 2 ms), 624 of 625 yield
+  requests overdue, 72 million declined
+  (`bench/results/algo-2026-10-05-native-before-leaf-clock.txt`). The
+  workaround was a leaf `now()` in `pages.cove`. **Fixed** by Cove #610 (ADR
+  0087): compiled code calls the host, and may park there. The pages call
+  `time.nowMicros()` in place.
+- **A lambda** (`FuncRef`) did the same, so the graph generator's sort was a
+  hand-written merge sort (`matching.distinctSorted`). **Fixed** by Cove
+  #609: closures are made and called in machine code. It is
+  `sorted(by:)` again.
+- **A `String` `!=` or `<`** (only `==` was lowered) did the same, so the
+  annealing page wrote `!(a == b)` and the SAT reader compared
+  `byteLength() > 0` and used `startsWith` for the generator's name.
+  **Fixed** by Cove #608: every `String` comparison runs as machine code. They
+  are `!=`, `!= ""` and `==` again.
+- **A wrong answer: a copy that was sliced.** A native run sliced while it
+  copied an array into a vector (`Array.toVector`, `Vector.snapshot`) could
+  resume with a store of the wrong size — `runCopy writes 12000 element(s)
+  to 0 of a destination of 0`, or `this run has no memory left` — in 2 of 400
+  heavy matching runs under load, and 10 to 28 of 160 in `bench/repro/`'s
+  70-line reproduction (0 with `--slice 0`, 0 on the VM). The workaround
+  copied element by element (`matching.copyOf`, the `drawn` loop). **Fixed**
+  by Cove #607 (ADR 0086): resumed allocation reads its frame, and a yield
+  request makes compiled code poll. The generator uses `toVector()` and
+  `snapshot()` again. The same ADR covers the fifth finding, a compiled loop
+  of one `toVector()` and a length check that was asked to yield 22 times
+  and neither yielded nor declined: a yield request now makes compiled code's
+  next poll due.
 
-```cove
-fn timed(key: String, graph: Graph) -> Timed {
-  let started = time.nowMicros()
-  let found = if key == "augmenting" { matching.augmenting(graph) } else { matching.hopcroftKarp(graph) }
-  Timed(key: key, found: found, micros: time.nowMicros() - started)
-}
-```
+**Held now**: `algo.rs::the_heavy_path_has_machine_code_on_the_native_tier`
+asserts that `/_host/apps/algo` reports **no** native refusal at all, so a
+function that falls back to the encoded tier above a heavy loop — a
+regression upstream, or a new shape — fails a test rather than a latency
+percentile. `bench/repro/run.sh native` is kept as the copy fault's
+regression check: at 2ca1c94 it answers **160 of 160** right (three runs,
+about 3,150 yields each), and it exits non-zero otherwise; CI runs it on the
+native tier.
 
-The template code generator does not lower a host call (`CallHost`), so
-`timed` — and `matchingResult`, which reads the clock the same way — stayed
-on the encoded tier, while `handle` and `matchingPage` above them and
-`augmenting` below them were compiled. Every heavy loop therefore ran below
-an encoded frame that compiled code had called, where a yield request is
-declined. `/_host/apps/algo` now says so directly:
+**What remains, upstream:**
 
-```json
-{"function": "algo.timed", "instruction": "CallHost", "reason": "an instruction is not lowered",
- "at": "algo/matching_page.cove:135:17", "source": "let started = time.nowMicros()"}
-```
-
-**The effect**, `bench/algo.sh` on the native tier with that version
-(`bench/results/algo-2026-10-05-native-before-leaf-clock.txt`, one
-repetition): with four heavy clients on four workers, **`hello`'s p99 was
-10.2 s** (p50 5.0 s; 142 ms from the send — each `hello` waited for a whole
-heavy run, and the open loop's queue compounded it), against 2.0 ms alone;
-with eight, 76 s. The host's counters for those runs: 663 heavy runs, 625
-yield requests, **624 `overdue_yields`** (asked and still holding the worker
-20 ms later — every one), **72,205,050 `yields_declined`** (every safepoint
-poll below the encoded frame), and the 623 yields that did happen were each
-at the end of a run's encoded stretch. The in-process test showed the same:
-2,547,643 declined and 22 overdue of 22 requests, against 0 and 0 on the
-VM.
-
-**The workaround**, in the app: the clock is read in a leaf of its own,
-`now()` (`pages.cove`), so the only encoded frame is that one and it returns
-at once; `timed` and `matchingResult` have machine code again. The same
-limit applies to a function that writes a lambda (`FuncRef` is not lowered
-either), so the graph generator's sort no longer uses `sorted(by:)`: a merge
-sort of its own (`matching.distinctSorted`) keeps the generator compiled.
-After: 0 overdue in the table above, and `hello`'s p99 4.7 ms.
-`algo.rs::the_heavy_path_has_machine_code_on_the_native_tier` holds this
-without a clock, by asserting that every function from `handle` to the
-loops is compiled and that `algo.now` is the encoded one.
-
-**What is still encoded**, from `/_host/apps/algo` (11 functions before the workaround, 9 after):
-
-| function | instruction | why it is encoded | heavy? |
-| --- | --- | --- | --- |
-| `algo.now` | `CallHost` | the clock | no: a leaf, returns at once |
-| `algo.drawMatching`, `algo.matchingTable` | `FuncRef` | they write a closure | no: at most 40 × 40 vertices / 500 rows, and no algorithm below them |
-| `matching.Names.of` (and its two lambdas) | `FuncRef`, `Cmp` on `String` | sorts names with `sorted(by:)`, compares strings | short; a written graph at the bounds is tens of ms here, which declines |
-| `matching.Names.indexOf`, `matching.wordsOf`, `text.parseForm` | `CmpBranch` on `String` | a `String` comparison is "an operand outside a bound" | short leaves |
-
-The ~290 declined yields per heavy run that remain are those leaves (the
-input's words, the form) being polled while they run: none is long enough
-to be overdue.
-
-**Annealing met the second shape again, as `!=`.** `annealPage` laid the
-request's fields over the defaults with `if entry.key != "example"` — and a
-`String` `!=` is not lowered where `==` is, so the page function above every
-run was encoded. `!(entry.key == "example")` gives it machine code. 
-
-**SAT met the third shape.** `sat.read` began `if generator != "" {` — and
-a `String` comparison is "an operand outside a bound" to the code
-generator, so the whole reader, the DIMACS byte scanner and the calls into
-the generators, was left on the encoded tier below compiled `satResult`.
-Comparing `byteLength()` instead (and `startsWith` for the generator's
-name) gave all of `sat` machine code; `algo.rs` holds that too.
-
-**A wrong answer, not only a held worker: a copy that is sliced.** The
-responsiveness test failed once in a full suite run, and the message it
-now prints said why: a heavy matching run on the native tier answered 500,
-
-```text
-error[cove::runtime]: `runCopy` writes 12000 element(s) to 0 of a destination of 0
-   --> algo/matching/matching.cove:384:14
-384 |   var from = values.toVector()
-```
-
-(and, in other runs, `… to 0 of a destination of 1`, `this run has no
-memory left`, and once from `counts.snapshot()` in `matching.build`:
-`writes 2001 element(s) to 0 of a destination of 4`). `Array.toVector` is
-lowered as `Len`, `Alloc(store, len)`, `RunCopy`: the store that came back
-from the allocation was not the size asked for. Under load — two workers,
-eight clients on `example=large&algorithm=augmenting` — it was **2 runs of
-400** (16,347 yields); with `--slice 0`, so that nothing yields, **0 of 800**;
-on the VM, **0 of 150** (41,641 yields). So it is the native tier resuming a
-sliced run, at or around an allocation with a length from a slot.
-
-`bench/repro/` reproduces it without the playground: one app of 70 lines in
-the generator's shape (draw into a vector, `freeze`, `toVector` in a callee,
-merge-sort, repeat), and `sh bench/repro/run.sh [native|vm] [slice]` asks it
-160 times, 16 at a time, on two workers: **13 of 160** failed on the native
-tier with the 2 ms slice, **0 of 160** with `--slice 0`, 0 on the VM (and 28
-of 160 with `toArray` in place of `freeze`, still always at `toVector`).
-
-**The workaround**, in the app: the three copies on the generator's path
-(`cells.toVector()` in `random`, the two in `distinctSorted`, and
-`counts.snapshot()` in `build`) push their elements one by one instead
-(`matching.copyOf`). After it: **0 of 600** matching runs (25,150 yields)
-and **0 of 400** SAT runs (53,193 yields) failed under the same load. The
-SAT solver makes no such copy.
-
-**For upstream (myuon/cove)**: (1) a function that makes any host call is
-left on the encoded tier by the template compiler, and so is any function
-that writes a lambda or compares two `String`s with `!=` or `<` (`==` is
-lowered); (2) compiled code below such a frame cannot yield
-(ADR 0085), so an algorithm whose caller reads the clock — the natural way to
-time it — holds its worker for its whole run, with nothing at the source
-level to say so. Either lowering `CallHost`/`FuncRef` (a call to a runtime
-helper), or letting a compiled callee of an encoded frame yield, removes the
-trap; until then a host's `native.refusals` report is how an app finds it.
-(3) **A sliced native run can resume with a wrong-sized allocation**
-(`Array.toVector`, `Vector.snapshot`): an incorrect answer, not a slow one,
-reproduced by `bench/repro/`. This is the one to fix first. (4) A compiled
-loop whose body is one `toVector()` of a 12,000-element array and a length
-check, 40,000 turns, was asked to yield 22 times and never did — 0 yields,
-0 declined, 22 overdue: such a loop does not appear to reach a safepoint the
-monitor's request is seen at.
+- **ADR 0085's limit itself**: compiled code below an encoded frame that
+  compiled code called — a nested encoded segment — still cannot yield. Nothing
+  in this app is encoded any more, so it does not arise here, but a function
+  the code generator refuses for any other reason would bring it back, which
+  is what the test above is for.
+- **cove#606**: starvation on the VM tier. Not met by this app's
+  measurements (VM rows above), but it is open.
 
 ## Cove gaps met while writing it
 
-For upstream (myuon/cove), besides the native-tier shapes above:
+For upstream (myuon/cove), besides the native-tier shapes above (now fixed):
 
 - **No `Float.exp`/`ln`/`sin`/`cos`** in the standard library (`sqrt` is
   there): the annealing's are written in Cove (`anneal.exp`, `anneal.ln`,
@@ -591,4 +544,4 @@ For upstream (myuon/cove), besides the native-tier shapes above:
 | cancellation works | `algo.rs::a_client_that_goes_away_cancels_its_run` (the connection closed mid-run: `errors.cancelled`, nothing in flight after); the page's Cancel button aborts the fetch, which is that |
 | the webhook lab and a light app answer while it computes | `algo.rs::the_other_apps_answer_while_algo_computes_on_the_vm` / `_on_the_native_tier` (two workers, four heavy clients of all three algorithms, twenty requests to `hello` and `webhooks` all answered, the heavy runs yielded); [Responsiveness](#responsiveness): `hello`'s p99 4.3–5.0 ms beside them on both tiers |
 | input examples and reproduction steps | every page's examples (seeded generators, so each is the same input everywhere); [Running it](#running-it), the input formats above, `bench/algo.sh`, `bench/repro/run.sh` |
-| shapes that stop park/yield on the native tier recorded and returned as runtime issues | [Yields on the native tier](#yields-on-the-native-tier): a host call (`CallHost`) or a lambda (`FuncRef`) or a `String` `!=`/`<` in a function above a heavy loop keeps that loop from yielding (measured: `hello` p99 10.2 s, 624 overdue yields); a sliced native run's `toVector`/`snapshot` can resume with a wrong-sized store (`bench/repro/`); a `toVector` loop that never yields. `/_host/apps/<app>`'s `native.refusals` names such functions; `algo.rs::the_heavy_path_has_machine_code_on_the_native_tier` holds the app to it |
+| shapes that stop park/yield on the native tier recorded and returned as runtime issues | [Yields on the native tier](#yields-on-the-native-tier): a host call (`CallHost`), a lambda (`FuncRef`) or a `String` `!=`/`<` in a function above a heavy loop kept that loop from yielding (measured: `hello` p99 10.2 s, 624 overdue yields), and a sliced native run's `toVector`/`snapshot` could resume with a wrong-sized store (`bench/repro/`); reported as cove#604/#605 and fixed in Cove 2ca1c94, so the app's workarounds are removed. `/_host/apps/<app>`'s `native.refusals` names such functions; `algo.rs::the_heavy_path_has_machine_code_on_the_native_tier` asserts there are none; `bench/repro/run.sh` runs in CI |
