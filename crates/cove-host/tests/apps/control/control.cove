@@ -1,0 +1,107 @@
+use web
+use host
+
+/// Each path is one operation of the `host` module (capability `admin`),
+/// its arguments in the query, its answer as text: `/apps`,
+/// `/capabilities`, `/history?n=`, `/enable?app=&on=`,
+/// `/configure?app=&grant=&allow=&fuel=&…` and `/reset?app=`; and `/origin`,
+/// what the app is told of how it was reached.
+export fn handle(request: web.Request) -> web.Response {
+  let query = request.query
+  let app = query.get("app").unwrapOr("")
+  let who = query.get("who").unwrapOr("test")
+  if request.path == "/apps" {
+    var lines = Vector.of()
+    for info in host.apps() {
+      lines.push(describe(info))
+    }
+    return answer(200, "\n".join(lines.freeze()))
+  }
+  if request.path == "/origin" {
+    let scheme = request.headers.get("x-forwarded-proto").unwrapOr("")
+    let host = request.headers.get("host").unwrapOr("")
+    return answer(200, "{scheme}://{host} prefix={request.headers.get("x-forwarded-prefix").unwrapOr("")} path={request.path}")
+  }
+  if request.path == "/capabilities" {
+    return answer(200, ",".join(host.capabilities()))
+  }
+  if request.path == "/history" {
+    var lines = Vector.of()
+    for change in host.history(Int.parse(query.get("n").unwrapOr("50")).unwrapOr(50)) {
+      lines.push("{change.who} | {change.app} | {change.action} | {change.outcome}")
+    }
+    return answer(200, "\n".join(lines.freeze()))
+  }
+  if request.path == "/enable" {
+    return changed(host.setEnabled(app, query.get("on").unwrapOr("true") == "true", who))
+  }
+  if request.path == "/reset" {
+    return changed(host.reset(app, who))
+  }
+  if request.path == "/configure" {
+    return match find(app) {
+      Some(info) => changed(host.configure(app, settings(query, info), who))
+      None => answer(404, "no app `{app}`")
+    }
+  }
+  answer(404, "no such operation")
+}
+
+fn describe(info: host.App) -> String {
+  let reason = info.reason.split("\n").get(0).unwrapOr("")
+  "{info.name} {info.state} version={info.version} granted=[{",".join(info.granted)}] required=[{",".join(info.required)}] added=[{",".join(info.grantAdded)}] removed=[{",".join(info.grantRemoved)}] allow=[{",".join(info.fetchAllow)}] fuel={info.limits.fuel} deadline={info.limits.deadlineMs} inflight={info.limits.maxInFlight} changed=[{",".join(info.limitsChanged)}] admin={info.isAdmin} hosts=[{",".join(info.hosts)}] kv={info.kvKeys} reason={reason}"
+}
+
+fn find(name: String) -> Option<host.App> {
+  for info in host.apps() {
+    if info.name == name {
+      return Some(info)
+    }
+  }
+  None
+}
+
+/// The app's settings with what the query changes.
+fn settings(query: Map<String, String>, info: host.App) -> host.Settings {
+  let limits = info.limits
+  host.Settings(
+    grant: list(query, "grant", info.granted),
+    fetchAllow: list(query, "allow", info.fetchAllow),
+    limits: host.Limits(
+      fuel: number(query, "fuel", limits.fuel),
+      maxHostCalls: number(query, "hostcalls", limits.maxHostCalls),
+      deadlineMs: number(query, "deadline", limits.deadlineMs),
+      maxHeapWords: number(query, "heap", limits.maxHeapWords),
+      maxInFlight: number(query, "inflight", limits.maxInFlight),
+      maxQueued: number(query, "queued", limits.maxQueued),
+      maxRequestBytes: number(query, "request", limits.maxRequestBytes),
+      maxResponseBytes: number(query, "response", limits.maxResponseBytes),
+    ),
+  )
+}
+
+fn list(query: Map<String, String>, key: String, current: Array<String>) -> Array<String> {
+  match query.get(key) {
+    Some("") => Vector.of().freeze()
+    Some(text) => text.split(",")
+    None => current
+  }
+}
+
+fn number(query: Map<String, String>, key: String, current: Int) -> Int {
+  match query.get(key) {
+    Some(text) => Int.parse(text).unwrapOr(current)
+    None => current
+  }
+}
+
+fn changed(result: Result<String, Error>) -> web.Response {
+  match result {
+    Ok(message) => answer(200, message)
+    Err(error) => answer(422, error.message)
+  }
+}
+
+fn answer(status: Int, body: String) -> web.Response {
+  web.Response(status: status, headers: Map.of(), body: "{body}\n")
+}

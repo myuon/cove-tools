@@ -1,0 +1,7 @@
+# A plain-text window on the `admin` module, for the host's tests (the real
+# admin app is apps/admin). The tests copy it in as the app `admin`, the one
+# app that may be granted `admin`.
+grant = ["admin"]
+
+[limits]
+deadline = "60s"

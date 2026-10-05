@@ -21,6 +21,7 @@
 //! in-process on a free port.
 
 pub mod admin;
+pub mod admin_module;
 pub mod apps;
 pub mod config;
 pub mod convert;
@@ -28,7 +29,9 @@ pub mod fetch;
 pub mod hosts;
 pub mod kv;
 pub mod logs;
+pub mod manage;
 pub mod ops;
+pub mod overrides;
 pub mod proxy;
 pub mod router;
 pub mod sched;

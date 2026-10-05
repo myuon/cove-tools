@@ -94,12 +94,16 @@ pub fn app_json(context: &OpsContext, slot: &Slot) -> Json {
                 AppState::Ready(ready) => ("ready", Json::from(ready.tier), Json::Null),
                 AppState::Refused(why) => ("refused", Json::Null, Json::from(why.as_str())),
             };
+            // Disabled is the admin's, over whatever the version is.
+            let state = if slot.enabled() { state } else { "disabled" };
             object.insert("state".into(), json!(state));
             object.insert("version".into(), json!(app.version));
             object.insert("tier".into(), tier);
             object.insert("refused".into(), reason);
             object.insert("required".into(), json!(list(&app.required)));
             object.insert("granted".into(), json!(list(&app.granted)));
+            object.insert("hosts".into(), json!(app.hosts));
+            object.insert("overridden".into(), json!(app.overridden.is_some()));
             object.insert(
                 "limits".into(),
                 json!({
