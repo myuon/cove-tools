@@ -1,0 +1,776 @@
+use rng
+
+// Maximum bipartite matching: the graph, two algorithms, and a certificate.
+//
+// - `hopcroftKarp` finds a maximum matching in O(E √V): rounds of one
+//   breadth-first search that layers the graph from the free left vertices,
+//   then depth-first searches that augment along vertex-disjoint shortest
+//   paths in those layers.
+// - `augmenting` is the textbook algorithm (Kuhn's): one search for an
+//   augmenting path from each left vertex in turn, O(V E). It is here to
+//   compare against, and because it is the heavy one.
+// - `certify` checks an answer without trusting the algorithm that produced
+//   it: the pairs are edges and disjoint, and König's theorem gives a vertex
+//   cover of the same size — every edge has an end in it — which no matching
+//   can be larger than. A matching and a cover of equal size prove each
+//   other optimal.
+//
+// Both searches are iterative, with an explicit stack, so a long augmenting
+// path is not a deep Cove call stack.
+
+/// A bipartite graph: left vertices `0..<left.length()`, right vertices
+/// `0..<right.length()`, and the edges as adjacency lists of the left
+/// vertices, `adjacent[start[u]..<start[u + 1]]` being `u`'s right
+/// neighbours.
+export struct Graph {
+  left: Array<String>
+  right: Array<String>
+  start: Array<Int>
+  adjacent: Array<Int>
+}
+
+impl Graph {
+  /// How many edges.
+  fn edges(self) -> Int {
+    self.adjacent.length()
+  }
+}
+
+/// What a parse came to: a graph, or what is wrong with the text.
+export enum Parsed {
+  Ok(Graph)
+  Invalid(String)
+}
+
+/// The largest graph the playground takes: per side, and edges.
+export struct Bounds {
+  vertices: Int
+  edges: Int
+}
+
+/// A matching, and what finding it cost.
+export struct Matching {
+  /// For each left vertex, its right partner or -1.
+  partnerOfLeft: Array<Int>
+  /// For each right vertex, its left partner or -1.
+  partnerOfRight: Array<Int>
+  size: Int
+  /// Adjacency entries examined: the work, counted the same way by both
+  /// algorithms.
+  scans: Int
+  /// Hopcroft–Karp's breadth-first rounds, or the augmenting algorithm's
+  /// searches.
+  rounds: Int
+}
+
+/// Why a matching is maximum, or what is wrong with it.
+export struct Certificate {
+  /// Whether the matching is valid and the cover proves it maximum.
+  proved: Bool
+  /// König's vertex cover, by side.
+  coverLeft: Array<Bool>
+  coverRight: Array<Bool>
+  coverSize: Int
+  problems: Array<String>
+}
+
+// ------------------------------------------------------------------ input
+
+/// Reads a graph.
+///
+/// ```text
+/// # a comment
+/// left: a b c          the left vertices, in order (optional)
+/// right: x y z         the right vertices, in order (optional)
+/// a x                  an edge
+/// b: x y z             edges from b
+/// random 40 40 120 7   a generated graph: left, right, edges, seed
+/// ```
+///
+/// A vertex an edge names is added to its side if it is not there yet, so
+/// the declarations are only needed for an isolated vertex or an order. The
+/// two sides are separate namespaces: `a x` and `x a` are different edges.
+/// A repeated edge counts once. `random` must be the only line that is not a
+/// comment.
+export fn parse(input: String, bounds: Bounds) -> Parsed {
+  var lefts: Vector<String> = Vector.of()
+  var rights: Vector<String> = Vector.of()
+  var edgeLefts: Vector<String> = Vector.of()
+  var edgeRights: Vector<String> = Vector.of()
+  var generated: Option<Graph> = None
+  var other = 0
+  var number = 0
+  for raw in input.split("\n") {
+    number += 1
+    let line = withoutComment(raw).trim()
+    if line == "" {
+      continue
+    }
+    let words = wordsOf(line)
+    let head = words.get(0).unwrapOr("")
+    if head == "random" {
+      if words.length() < 4 || words.length() > 5 {
+        return Parsed.Invalid("line {number}: `random` takes the left and right vertex counts, the edge count and an optional seed: `random 40 40 120 7`")
+      }
+      var values = Vector.of()
+      for word in words.slice(1, words.length()) {
+        match Int.parse(word) {
+          Ok(value) => values.push(value)
+          Err(_) => return Parsed.Invalid("line {number}: `{word}` is not a whole number")
+        }
+      }
+      let left = values.get(0).unwrapOr(0)
+      let right = values.get(1).unwrapOr(0)
+      let edges = values.get(2).unwrapOr(0)
+      let seed = values.get(3).unwrapOr(1)
+      if left < 1 || right < 1 || left > bounds.vertices || right > bounds.vertices {
+        return Parsed.Invalid("line {number}: each side has 1 to {bounds.vertices} vertices")
+      }
+      if edges < 0 || edges > bounds.edges {
+        return Parsed.Invalid("line {number}: a graph has at most {bounds.edges} edges")
+      }
+      if edges > left * right {
+        return Parsed.Invalid("line {number}: {left} × {right} vertices have only {left * right} possible edges")
+      }
+      generated = Some(random(left, right, edges, seed))
+      continue
+    }
+    other += 1
+    if head == "left:" || head == "right:" {
+      for name in words.slice(1, words.length()) {
+        if head == "left:" { lefts.push(name) } else { rights.push(name) }
+      }
+    } else if head.endsWith(":") && head.length() > 1 {
+      let from = head.slice(0, head.length() - 1)
+      if words.length() == 1 {
+        lefts.push(from)
+      }
+      for to in words.slice(1, words.length()) {
+        edgeLefts.push(from)
+        edgeRights.push(to)
+        lefts.push(from)
+        rights.push(to)
+      }
+    } else if words.length() == 2 {
+      edgeLefts.push(head)
+      edgeRights.push(words.get(1).unwrapOr(""))
+      lefts.push(head)
+      rights.push(words.get(1).unwrapOr(""))
+    } else {
+      return Parsed.Invalid("line {number}: expected an edge `left right`, a list `left: right right …`, `left:`/`right:` declarations or `random …`; found `{line}`")
+    }
+    if edgeLefts.length() > bounds.edges {
+      return Parsed.Invalid("a graph has at most {bounds.edges} edges")
+    }
+  }
+  match generated {
+    Some(graph) => {
+      if other > 0 {
+        return Parsed.Invalid("`random` makes the whole graph: remove the other lines, or the `random` line")
+      }
+      return Parsed.Ok(graph)
+    }
+    None => {}
+  }
+  let leftNames = Names.of(lefts.freeze())
+  let rightNames = Names.of(rights.freeze())
+  if leftNames.names.length() > bounds.vertices || rightNames.names.length() > bounds.vertices {
+    return Parsed.Invalid("each side has at most {bounds.vertices} vertices")
+  }
+  if leftNames.names.length() == 0 {
+    return Parsed.Invalid("the graph has no vertices: write an edge `a x`, or pick an example")
+  }
+  var froms = Vector.of()
+  var tos = Vector.of()
+  var at = 0
+  while at < edgeLefts.length() {
+    froms.push(leftNames.indexOf(edgeLefts.get(at).unwrapOr("")))
+    tos.push(rightNames.indexOf(edgeRights.get(at).unwrapOr("")))
+    at += 1
+  }
+  Parsed.Ok(build(leftNames.names, rightNames.names, froms.freeze(), tos.freeze()))
+}
+
+fn withoutComment(line: String) -> String {
+  match line.indexOf("#") {
+    Some(at) => line.slice(0, at)
+    None => line
+  }
+}
+
+/// The words of `line`, split at spaces and tabs.
+fn wordsOf(line: String) -> Array<String> {
+  var out = Vector.of()
+  for word in line.replace("\t", " ").replace("\r", " ").split(" ") {
+    if word != "" {
+      out.push(word)
+    }
+  }
+  out.freeze()
+}
+
+/// Vertex names in the order they were first given, and a sorted index to
+/// find each one's number.
+struct Names {
+  names: Array<String>
+  /// `(name, number)` sorted by name.
+  sorted: Array<Named>
+}
+
+struct Named {
+  name: String
+  number: Int
+}
+
+impl Names {
+  /// The distinct names of `given`, in order of first appearance.
+  fn of(given: Array<String>) -> Names {
+    var tagged = Vector.of()
+    var at = 0
+    for name in given {
+      tagged.push(Named(name: name, number: at))
+      at += 1
+    }
+    // Stable, so of equal names the first given comes first.
+    let byName = tagged.freeze().sorted(by: fn(a, b) { a.name < b.name })
+    var firsts = Vector.of()
+    var previous = ""
+    var any = false
+    for one in byName {
+      if !any || one.name != previous {
+        firsts.push(one)
+        previous = one.name
+        any = true
+      }
+    }
+    let byPlace = firsts.freeze().sorted(by: fn(a, b) { a.number < b.number })
+    var names = Vector.of()
+    var numbered = Vector.of()
+    var number = 0
+    for one in byPlace {
+      names.push(one.name)
+      numbered.push(Named(name: one.name, number: number))
+      number += 1
+    }
+    Names(names: names.freeze(), sorted: numbered.freeze().sorted(by: fn(a, b) { a.name < b.name }))
+  }
+
+  /// The number of `name`, which is one of the names; -1 otherwise.
+  fn indexOf(self, name: String) -> Int {
+    var low = 0
+    var high = self.sorted.length()
+    while low < high {
+      let middle = (low + high) / 2
+      let one = self.sorted.get(middle).unwrapOr(Named(name: "", number: -1))
+      if one.name < name {
+        low = middle + 1
+      } else {
+        high = middle
+      }
+    }
+    let found = self.sorted.get(low).unwrapOr(Named(name: "", number: -1))
+    if found.name == name { found.number } else { -1 }
+  }
+}
+
+/// The graph of edges `froms[i]`–`tos[i]`, a repeated edge once, each
+/// adjacency list in the order the edges were given.
+export fn build(left: Array<String>, right: Array<String>, froms: Array<Int>, tos: Array<Int>) -> Graph {
+  let n = left.length()
+  let m = right.length()
+  // Counting sort by left end, keeping the given order within each list.
+  var counts = filled(n + 1, 0)
+  for from in froms {
+    counts.set(from + 1, counts.get(from + 1).unwrapOr(0) + 1)
+  }
+  var u = 0
+  while u < n {
+    counts.set(u + 1, counts.get(u + 1).unwrapOr(0) + counts.get(u).unwrapOr(0))
+    u += 1
+  }
+  var next = counts.snapshot()
+  var placed = filled(froms.length(), 0)
+  var at = 0
+  while at < froms.length() {
+    let from = froms.get(at).unwrapOr(0)
+    let slot = next.get(from).unwrapOr(0)
+    placed.set(slot, tos.get(at).unwrapOr(0))
+    next.set(from, slot + 1)
+    at += 1
+  }
+  // Repeated edges out: a right vertex seen in this list already.
+  var seen = filled(m, -1)
+  var start = Vector.of(0)
+  var adjacent = Vector.of()
+  u = 0
+  while u < n {
+    var e = counts.get(u).unwrapOr(0)
+    let end = counts.get(u + 1).unwrapOr(0)
+    while e < end {
+      let v = placed.get(e).unwrapOr(0)
+      if seen.get(v).unwrapOr(-1) != u {
+        seen.set(v, u)
+        adjacent.push(v)
+      }
+      e += 1
+    }
+    start.push(adjacent.length())
+    u += 1
+  }
+  Graph(left: left, right: right, start: start.freeze(), adjacent: adjacent.freeze())
+}
+
+/// A graph of `edges` distinct edges drawn uniformly from the
+/// `left × right` possible ones, named `l1…` and `r1…`; the same for the
+/// same four numbers.
+export fn random(left: Int, right: Int, edges: Int, seed: Int) -> Graph {
+  var generator = rng.seeded(seed)
+  var froms = Vector.of()
+  var tos = Vector.of()
+  let possible = left * right
+  if edges * 2 > possible {
+    // Dense: decide each possible edge in turn, taking exactly `edges` of
+    // them (selection sampling).
+    var needed = edges
+    var cell = 0
+    while cell < possible && needed > 0 {
+      if generator.below(possible - cell) < needed {
+        froms.push(cell / right)
+        tos.push(cell % right)
+        needed -= 1
+      }
+      cell += 1
+    }
+  } else {
+    // Sparse: draw, drop repeats, and draw again for what was dropped.
+    var cells: Array<Int> = []
+    while cells.length() < edges {
+      var drawn = cells.toVector()
+      var more = edges - cells.length()
+      while more > 0 {
+        drawn.push(generator.below(possible))
+        more -= 1
+      }
+      cells = distinctSorted(drawn.freeze())
+    }
+    for cell in cells {
+      froms.push(cell / right)
+      tos.push(cell % right)
+    }
+  }
+  var lefts = Vector.of()
+  var k = 1
+  while k <= left {
+    lefts.push("l{k}")
+    k += 1
+  }
+  var rights = Vector.of()
+  k = 1
+  while k <= right {
+    rights.push("r{k}")
+    k += 1
+  }
+  build(lefts.freeze(), rights.freeze(), froms.freeze(), tos.freeze())
+}
+
+/// The distinct values of `values`, ascending.
+///
+/// Sorted by a merge sort of its own rather than `sorted(by:)`: a function
+/// that writes a lambda stays on the encoded tier, and the generator's sort
+/// of fifty thousand cells is long enough that a run below it holding its
+/// worker would be seen by the other apps (ADR 0085's limit; see the README).
+fn distinctSorted(values: Array<Int>) -> Array<Int> {
+  let n = values.length()
+  var from = values.toVector()
+  var into = values.toVector()
+  var width = 1
+  while width < n {
+    var low = 0
+    while low < n {
+      let middle = (low + width).min(n)
+      let high = (low + 2 * width).min(n)
+      var i = low
+      var j = middle
+      var k = low
+      while k < high {
+        let a = from.get(i).unwrapOr(0)
+        let b = from.get(j).unwrapOr(0)
+        if i < middle && (j >= high || a <= b) {
+          into.set(k, a)
+          i += 1
+        } else {
+          into.set(k, b)
+          j += 1
+        }
+        k += 1
+      }
+      low = high
+    }
+    let swap = from
+    from = into
+    into = swap
+    width *= 2
+  }
+  var out = Vector.of()
+  var at = 0
+  while at < n {
+    let value = from.get(at).unwrapOr(0)
+    if at == 0 || value != from.get(at - 1).unwrapOr(0) {
+      out.push(value)
+    }
+    at += 1
+  }
+  out.freeze()
+}
+
+/// `count` copies of `value`.
+fn filled(count: Int, value: Int) -> Vector<Int> {
+  var out = Vector.of()
+  var at = 0
+  while at < count {
+    out.push(value)
+    at += 1
+  }
+  out
+}
+
+// ------------------------------------------------------------- algorithms
+
+/// A maximum matching, by Hopcroft and Karp.
+export fn hopcroftKarp(graph: Graph) -> Matching {
+  let n = graph.left.length()
+  let m = graph.right.length()
+  let start = graph.start
+  let adjacent = graph.adjacent
+  let unreached = n + m + 1
+  var partnerOfLeft = filled(n, -1)
+  var partnerOfRight = filled(m, -1)
+  var layer = filled(n, 0)
+  var queue = filled(n, 0)
+  var cursor = filled(n, 0)
+  var stack = filled(n, 0)
+  var via = filled(n, 0)
+  var size = 0
+  var scans = 0
+  var rounds = 0
+  while true {
+    // Layer the graph from the free left vertices; `limit` is the length of
+    // the shortest augmenting paths, in left vertices.
+    var head = 0
+    var tail = 0
+    var u = 0
+    while u < n {
+      layer.set(u, unreached)
+      if partnerOfLeft.get(u).unwrapOr(-1) == -1 {
+        layer.set(u, 0)
+        queue.set(tail, u)
+        tail += 1
+      }
+      u += 1
+    }
+    var limit = unreached
+    while head < tail {
+      let x = queue.get(head).unwrapOr(0)
+      head += 1
+      let depth = layer.get(x).unwrapOr(0)
+      if depth < limit {
+        var e = start.get(x).unwrapOr(0)
+        let end = start.get(x + 1).unwrapOr(0)
+        while e < end {
+          let v = adjacent.get(e).unwrapOr(0)
+          scans += 1
+          let w = partnerOfRight.get(v).unwrapOr(-1)
+          if w == -1 {
+            if limit == unreached {
+              limit = depth + 1
+            }
+          } else if layer.get(w).unwrapOr(0) == unreached {
+            layer.set(w, depth + 1)
+            queue.set(tail, w)
+            tail += 1
+          }
+          e += 1
+        }
+      }
+    }
+    if limit == unreached {
+      break
+    }
+    rounds += 1
+    // Augment along vertex-disjoint shortest paths in the layers.
+    u = 0
+    while u < n {
+      cursor.set(u, start.get(u).unwrapOr(0))
+      u += 1
+    }
+    var root = 0
+    while root < n {
+      if partnerOfLeft.get(root).unwrapOr(-1) == -1 {
+        stack.set(0, root)
+        var top = 0
+        var searching = true
+        while searching {
+          let x = stack.get(top).unwrapOr(0)
+          let e = cursor.get(x).unwrapOr(0)
+          if e == start.get(x + 1).unwrapOr(0) {
+            // A dead end: no shortest path goes through `x` this round.
+            layer.set(x, unreached)
+            if top == 0 {
+              searching = false
+            } else {
+              top -= 1
+            }
+          } else {
+            cursor.set(x, e + 1)
+            let v = adjacent.get(e).unwrapOr(0)
+            scans += 1
+            let w = partnerOfRight.get(v).unwrapOr(-1)
+            let depth = layer.get(x).unwrapOr(0)
+            if w == -1 {
+              if depth + 1 == limit {
+                via.set(top, v)
+                var k = 0
+                while k <= top {
+                  let a = stack.get(k).unwrapOr(0)
+                  let b = via.get(k).unwrapOr(0)
+                  partnerOfLeft.set(a, b)
+                  partnerOfRight.set(b, a)
+                  k += 1
+                }
+                size += 1
+                searching = false
+              }
+            } else if layer.get(w).unwrapOr(0) == depth + 1 {
+              via.set(top, v)
+              top += 1
+              stack.set(top, w)
+            }
+          }
+        }
+      }
+      root += 1
+    }
+  }
+  Matching(
+    partnerOfLeft: partnerOfLeft.toArray(),
+    partnerOfRight: partnerOfRight.toArray(),
+    size: size,
+    scans: scans,
+    rounds: rounds,
+  )
+}
+
+/// A maximum matching by one augmenting-path search per left vertex
+/// (Kuhn's algorithm), with no greedy start: the slow one.
+export fn augmenting(graph: Graph) -> Matching {
+  let n = graph.left.length()
+  let m = graph.right.length()
+  let start = graph.start
+  let adjacent = graph.adjacent
+  var partnerOfLeft = filled(n, -1)
+  var partnerOfRight = filled(m, -1)
+  // `visited[v] == root` marks `v` as seen by the search from `root`.
+  var visited = filled(m, -1)
+  var cursor = filled(n, 0)
+  var stack = filled(n, 0)
+  var via = filled(n, 0)
+  var size = 0
+  var scans = 0
+  var rounds = 0
+  var root = 0
+  while root < n {
+    rounds += 1
+    stack.set(0, root)
+    cursor.set(root, start.get(root).unwrapOr(0))
+    var top = 0
+    var searching = true
+    while searching {
+      let x = stack.get(top).unwrapOr(0)
+      let e = cursor.get(x).unwrapOr(0)
+      if e == start.get(x + 1).unwrapOr(0) {
+        if top == 0 {
+          searching = false
+        } else {
+          top -= 1
+        }
+      } else {
+        cursor.set(x, e + 1)
+        let v = adjacent.get(e).unwrapOr(0)
+        scans += 1
+        if visited.get(v).unwrapOr(-1) != root {
+          visited.set(v, root)
+          let w = partnerOfRight.get(v).unwrapOr(-1)
+          via.set(top, v)
+          if w == -1 {
+            var k = 0
+            while k <= top {
+              let a = stack.get(k).unwrapOr(0)
+              let b = via.get(k).unwrapOr(0)
+              partnerOfLeft.set(a, b)
+              partnerOfRight.set(b, a)
+              k += 1
+            }
+            size += 1
+            searching = false
+          } else {
+            stack.set(top + 1, w)
+            cursor.set(w, start.get(w).unwrapOr(0))
+            top += 1
+          }
+        }
+      }
+    }
+    root += 1
+  }
+  Matching(
+    partnerOfLeft: partnerOfLeft.toArray(),
+    partnerOfRight: partnerOfRight.toArray(),
+    size: size,
+    scans: scans,
+    rounds: rounds,
+  )
+}
+
+// ------------------------------------------------------------ certificate
+
+/// Checks `matching` against `graph` without trusting how it was found: every
+/// pair an edge, no vertex twice, the size what it says — and König's cover.
+///
+/// From the free left vertices, follow edges not in the matching to the
+/// right and matched edges back to the left; call what is reached `Z`. Then
+/// the left vertices outside `Z` and the right vertices in `Z` cover every
+/// edge, and when no augmenting path exists (no free right vertex in `Z`)
+/// there are exactly as many of them as matched pairs.
+export fn certify(graph: Graph, matching: Matching) -> Certificate {
+  let n = graph.left.length()
+  let m = graph.right.length()
+  var problems = Vector.of()
+  var pairs = 0
+  var u = 0
+  while u < n {
+    let v = matching.partnerOfLeft.get(u).unwrapOr(-1)
+    if v != -1 {
+      pairs += 1
+      if !hasEdge(graph, u, v) {
+        problems.push("{name(graph.left, u)}–{name(graph.right, v)} is matched but is not an edge")
+      }
+      if matching.partnerOfRight.get(v).unwrapOr(-1) != u {
+        problems.push("{name(graph.right, v)} is matched to {name(graph.left, u)} on one side only")
+      }
+    }
+    u += 1
+  }
+  var v = 0
+  while v < m {
+    let w = matching.partnerOfRight.get(v).unwrapOr(-1)
+    if w != -1 && matching.partnerOfLeft.get(w).unwrapOr(-1) != v {
+      problems.push("{name(graph.left, w)} is matched to {name(graph.right, v)} on one side only")
+    }
+    v += 1
+  }
+  if pairs != matching.size {
+    problems.push("the matching says {matching.size} pairs and holds {pairs}")
+  }
+  // Alternating reach from the free left vertices.
+  var reachedLeft = filled(n, 0)
+  var reachedRight = filled(m, 0)
+  var queue = Vector.of()
+  u = 0
+  while u < n {
+    if matching.partnerOfLeft.get(u).unwrapOr(-1) == -1 {
+      reachedLeft.set(u, 1)
+      queue.push(u)
+    }
+    u += 1
+  }
+  var head = 0
+  while head < queue.length() {
+    let x = queue.get(head).unwrapOr(0)
+    head += 1
+    var e = graph.start.get(x).unwrapOr(0)
+    let end = graph.start.get(x + 1).unwrapOr(0)
+    while e < end {
+      let y = graph.adjacent.get(e).unwrapOr(0)
+      if reachedRight.get(y).unwrapOr(0) == 0 && matching.partnerOfLeft.get(x).unwrapOr(-1) != y {
+        reachedRight.set(y, 1)
+        let w = matching.partnerOfRight.get(y).unwrapOr(-1)
+        if w == -1 {
+          problems.push("an augmenting path ends at {name(graph.right, y)}: the matching is not maximum")
+        } else if reachedLeft.get(w).unwrapOr(0) == 0 {
+          reachedLeft.set(w, 1)
+          queue.push(w)
+        }
+      }
+      e += 1
+    }
+  }
+  var coverLeft = Vector.of()
+  var coverRight = Vector.of()
+  var coverSize = 0
+  u = 0
+  while u < n {
+    let inCover = reachedLeft.get(u).unwrapOr(0) == 0
+    coverLeft.push(inCover)
+    if inCover {
+      coverSize += 1
+    }
+    u += 1
+  }
+  v = 0
+  while v < m {
+    let inCover = reachedRight.get(v).unwrapOr(0) == 1
+    coverRight.push(inCover)
+    if inCover {
+      coverSize += 1
+    }
+    v += 1
+  }
+  let left = coverLeft.freeze()
+  let right = coverRight.freeze()
+  // The cover, checked edge by edge rather than taken on trust.
+  var uncovered = 0
+  u = 0
+  while u < n {
+    var e = graph.start.get(u).unwrapOr(0)
+    let end = graph.start.get(u + 1).unwrapOr(0)
+    while e < end {
+      let y = graph.adjacent.get(e).unwrapOr(0)
+      if !left.get(u).unwrapOr(false) && !right.get(y).unwrapOr(false) {
+        uncovered += 1
+      }
+      e += 1
+    }
+    u += 1
+  }
+  if uncovered > 0 {
+    problems.push("{uncovered} edge(s) have no end in the cover")
+  }
+  if coverSize != pairs {
+    problems.push("the cover has {coverSize} vertices and the matching {pairs} pairs")
+  }
+  let found = problems.freeze()
+  Certificate(
+    proved: found.length() == 0,
+    coverLeft: left,
+    coverRight: right,
+    coverSize: coverSize,
+    problems: found,
+  )
+}
+
+/// Whether `u`–`v` is an edge.
+export fn hasEdge(graph: Graph, u: Int, v: Int) -> Bool {
+  var e = graph.start.get(u).unwrapOr(0)
+  let end = graph.start.get(u + 1).unwrapOr(0)
+  while e < end {
+    if graph.adjacent.get(e).unwrapOr(-1) == v {
+      return true
+    }
+    e += 1
+  }
+  false
+}
+
+fn name(names: Array<String>, at: Int) -> String {
+  names.get(at).unwrapOr("#{at}")
+}

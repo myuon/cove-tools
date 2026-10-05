@@ -1,0 +1,36 @@
+use web
+
+/// The algorithm playground: an algorithm, an input to run it on, and a
+/// page that shows what it found, what it cost and why it stopped.
+///
+/// - `GET /` lists the algorithms.
+/// - `GET /matching` is maximum bipartite matching; `?example=<name>` fills
+///   the form with an example and the page's script runs it; the form posts
+///   any graph (`POST /matching`), and the answer is the page with the
+///   result.
+/// - `part=result` answers the result alone, for the page's script.
+/// - `GET /app.js` is that script.
+///
+/// The algorithms are Cove, run in this request's isolate: the host gives
+/// them a clock to time themselves by, and the limits in `app.toml`.
+export fn handle(request: web.Request) -> web.Response {
+  let parts = request.path.split("/")
+  let first = parts.get(1).unwrapOr("")
+  let base = request.headers.get("x-forwarded-prefix").unwrapOr("")
+  let get = request.method == "GET" || request.method == "HEAD"
+  if first == "" && get {
+    return htmlResponse(200, indexPage(base))
+  }
+  if first == "app.js" && get {
+    return web.Response(status: 200, headers: pageHeaders("text/javascript; charset=utf-8"), body: script())
+  }
+  if first == "matching" && (get || request.method == "POST") {
+    return matchingPage(base, fieldsOf(request), request.method == "POST")
+  }
+  textResponse(404, "no such page\n")
+}
+
+fn indexPage(base: String) -> String {
+  let content = "<h1>Algorithm playground</h1><p>Algorithms written in Cove, run in a fresh isolate for each request on cove-host, beside the other apps. Each page takes an input — or an example, some generated from a seed — runs the algorithm under this app's limits, and shows the answer, a check of it, what the run cost and, if a limit stopped it, which.</p><table><tr><th>algorithm</th><th>what it shows</th></tr><tr><td><a href=\"{h(base)}/matching\">Maximum bipartite matching</a></td><td>Hopcroft–Karp against the simple augmenting-path algorithm; the matching drawn over the graph; König's vertex cover as the proof that no larger matching exists</td></tr></table><p class=note>Limits per request (<code>apps/algo/app.toml</code>): fuel, a wall-clock deadline, a heap, the request and response sizes, and at most a few runs in flight at once. A heavy run yields its worker every couple of milliseconds while other requests wait, so the other apps on the host keep answering.</p>"
+  layout(base, "algorithms", "", content)
+}

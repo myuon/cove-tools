@@ -525,6 +525,7 @@ impl Front {
                 accepted: Instant::now(),
                 reply,
                 cancel: cancel.clone(),
+                tally: Default::default(),
             },
         });
         if let Err(why) = self.engine.queue.admit(index, start) {

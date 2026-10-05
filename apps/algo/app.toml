@@ -1,0 +1,14 @@
+# The algorithm playground (issue #4): maximum bipartite matching — and, in
+# later PRs, SAT and simulated annealing — written in Cove, run on request.
+# Pure but for the clock, which times each run.
+grant = ["time"]
+
+[limits]
+fuel = 400000000
+deadline = "10s"
+max_host_calls = 64
+max_heap_words = 2097152
+max_in_flight = 4
+max_queued = 32
+max_request_bytes = 262144
+max_response_bytes = 4194304

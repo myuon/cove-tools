@@ -123,3 +123,18 @@ Every request in every run was answered 200; none failed.
 CPU per request (the edge tables have it from `ps`); `aggregate`'s random
 upstream latencies (`slow` is fixed); more than one host process; Linux.
 CI does not run this: a shared runner's numbers say nothing.
+
+## Beside the algorithm playground
+
+`bench/algo.sh` measures `hello`'s latency (open loop, 500 req/s) while K
+clients keep the algorithm playground's heavy matching run in flight
+(`cove-host-load --mix algo`, closed loop), four workers, for K = 0, 4, 8, on
+one backend; it prints the `algo` app's yield counters after each. Results
+and the native-tier finding they led to are in
+[`apps/algo/README.md`](../apps/algo/README.md#responsiveness):
+`hello`'s p99 goes from 2 ms to under 5 ms beside them, on both tiers.
+
+```console
+$ sh bench/algo.sh 3 native > bench/results/algo-$(date +%F)-native.txt
+$ sh bench/algo.sh 3 vm > bench/results/algo-$(date +%F)-vm.txt
+```
