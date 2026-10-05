@@ -470,8 +470,7 @@ fn authed() -> String {
 /// What a browser on the admin app's own pages sends with a form.
 fn same_site() -> String {
     format!(
-        "Authorization: {UI_LOGIN}\r\nOrigin: https://{UI_HOST}\r\nSec-Fetch-Site: same-origin\r\n\
-         Cf-Access-Authenticated-User-Email: owner@example.com\r\n"
+        "Authorization: {UI_LOGIN}\r\nOrigin: https://{UI_HOST}\r\nSec-Fetch-Site: same-origin\r\n"
     )
 }
 
@@ -682,12 +681,11 @@ fn the_pages_enable_disable_configure_and_reset() {
         !own.contains("action=\"/apps/admin/disable\""),
         "no disable button for itself"
     );
-    // The history says who.
+    // The history says who: with Access off (no `[access]` team or aud
+    // here), the secret, which names nobody. A verified Access user's email
+    // is recorded instead (tests/access.rs).
     let history = ui(&host, "GET", "/history", &authed(), "").body;
-    assert!(
-        history.contains("admin app: owner@example.com"),
-        "{history}"
-    );
+    assert!(history.contains("admin app: token"), "{history}");
 }
 
 #[test]
@@ -698,12 +696,11 @@ fn the_pages_escape_what_they_show() {
         "Authorization: {UI_LOGIN}\r\nCf-Access-Authenticated-User-Email: <script>alert(1)</script>\r\n"
     );
     ui(&host, "POST", "/apps/hello/disable", &sneaky, "");
+    // What a client says of its user is not who: only a verified identity
+    // is (`auth.identity`), so the header is not recorded at all.
     let history = ui(&host, "GET", "/history", &authed(), "").body;
-    assert!(!history.contains("<script>"), "{history}");
-    assert!(
-        history.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
-        "{history}"
-    );
+    assert!(!history.contains("alert(1)"), "{history}");
+    assert!(history.contains("admin app: token"), "{history}");
     // A form posted back is escaped too.
     let echoed = ui(
         &host,

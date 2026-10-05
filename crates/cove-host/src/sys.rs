@@ -7,6 +7,8 @@
 //! | `time.nowMicros()` | `Int`: microseconds since the Unix epoch, **strictly increasing** across every call in the process (one more than the last when the clock has not moved on or went back), so it orders, and names, things made in the same millisecond |
 //! | `random.hex(bytes)` | `String`: `bytes` (1–64) random bytes from the operating system, as lowercase hex |
 //! | `auth.check(secret, authorization)` | `Bool`: whether an `Authorization` header value presents the app's secret `secret` |
+//! | `auth.identity(headers)` | `Result<auth.Identity, Error>`: who is asking — a verified Cloudflare Access user, or the `[access] token` ([`crate::access`]) |
+//! | `auth.usesAccess()` | `Bool`: whether Access is on for this app ([`crate::access`]) |
 //!
 //! `auth.check` takes the header as the client sent it and accepts
 //! `Bearer <secret>` and `Basic <base64(user:secret)>` (any user name, so a
@@ -17,14 +19,20 @@
 //! variable, a file, or (for tests) a literal. An unknown secret name is
 //! `false`.
 //!
-//! All three answer at once.
+//! All three answer at once, but for an `auth.identity` that has to fetch
+//! Access's keys first, which parks.
 
 use std::io::Read;
 
-use cove_runtime::{Effect, HostApi, HostType, ModuleSchema, OperationSchema, RuntimeError, Value};
+use std::sync::Arc;
 
-use crate::config::Secrets;
-use crate::hosts::{AppContext, HostModule};
+use cove_runtime::{
+    Effect, FieldSchema, HostAnswer, HostApi, HostType, ModuleSchema, OperationSchema, Reentry,
+    RuntimeError, Transfer, TypeSchema, Value,
+};
+
+use crate::access::{Gate, Presented, Step, Verifier};
+use crate::hosts::{transfer, AppContext, HostModule, PendingWork};
 
 const fn op(
     name: &'static str,
@@ -70,13 +78,35 @@ pub const RANDOM: ModuleSchema = ModuleSchema {
 pub const AUTH: ModuleSchema = ModuleSchema {
     name: "auth",
     capability: "auth",
-    operations: &[op(
-        "check",
-        &[HostType::String, HostType::String],
-        HostType::Bool,
-        "auth",
-    )],
-    types: &[],
+    operations: &[
+        op(
+            "check",
+            &[HostType::String, HostType::String],
+            HostType::Bool,
+            "auth",
+        ),
+        op(
+            "identity",
+            &[HostType::Map(&HostType::String, &HostType::String)],
+            HostType::Result(&HostType::Named("auth.Identity"), &HostType::Error),
+            "auth",
+        ),
+        op("usesAccess", &[], HostType::Bool, "auth"),
+    ],
+    types: &[TypeSchema {
+        name: "Identity",
+        cases: &[],
+        fields: &[
+            FieldSchema {
+                name: "email",
+                ty: HostType::String,
+            },
+            FieldSchema {
+                name: "via",
+                ty: HostType::String,
+            },
+        ],
+    }],
     resources: &[],
 };
 
@@ -107,8 +137,35 @@ impl HostModule for AuthModule {
         AUTH
     }
     fn instantiate(&self, app: &AppContext) -> Result<Box<dyn HostApi>, String> {
+        let say = {
+            let name = app.app.clone();
+            let quiet = app.quiet;
+            let logs = Arc::clone(&app.logs);
+            move |line: &str| {
+                logs.push("warn", line);
+                if !quiet {
+                    println!("[{name}] warn: {line}");
+                }
+            }
+        };
+        if let Some(off) = &app.access.off {
+            if app.granted.contains("auth") {
+                say(&format!("{off}: Cloudflare Access is off for this app"));
+            }
+        }
+        let verifier = match &app.access.jwt {
+            Some(policy) if app.granted.contains("auth") => {
+                Some(Arc::new(Verifier::new(policy.clone(), Box::new(say))?))
+            }
+            _ => None,
+        };
         Ok(Box::new(AuthHost {
-            secrets: app.secrets.clone(),
+            gate: Arc::new(Gate {
+                access: app.access.clone(),
+                secrets: app.secrets.clone(),
+                verifier,
+            }),
+            io: app.io.clone(),
         }))
     }
 }
@@ -171,20 +228,77 @@ impl HostApi for RandomHost {
 }
 
 struct AuthHost {
-    secrets: Secrets,
+    gate: Arc<Gate>,
+    io: tokio::runtime::Handle,
+}
+
+/// `auth.identity`'s answer, as the `Result` value.
+fn identity_answer(identity: Result<crate::access::Identity, String>) -> Value {
+    match identity {
+        Ok(identity) => Value::ok(identity.value()),
+        Err(why) => Value::err(Value::error(why)),
+    }
+}
+
+impl AuthHost {
+    /// The verification left after [`Gate::begin`], as a future.
+    fn verify(
+        &self,
+        verifier: Arc<Verifier>,
+        assertion: String,
+        presented: Presented,
+    ) -> impl std::future::Future<Output = Result<Transfer, RuntimeError>> + Send + 'static {
+        let gate = Arc::clone(&self.gate);
+        async move {
+            let verified = verifier.verify(&assertion).await;
+            transfer(&identity_answer(gate.finish(&presented, verified)))
+        }
+    }
 }
 
 impl HostApi for AuthHost {
     fn module_schema(&self) -> ModuleSchema {
         AUTH
     }
-    fn call(&self, _op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        let text = |at: usize| args.get(at).and_then(Value::as_str).unwrap_or_default();
-        let ok = match self.secrets.0.get(text(0)) {
-            Some(secret) => presents(text(1), secret),
-            None => false,
-        };
-        Ok(Value::bool(ok))
+
+    /// The blocking answer; `auth.identity` waits on the worker for a key
+    /// fetch here, where the run cannot park.
+    fn call(&self, op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        match op {
+            "identity" => {
+                let presented = Presented::from_headers(args.first().unwrap_or(&Value::unit()));
+                match self.gate.begin(&presented) {
+                    Step::Done(identity) => Ok(identity_answer(identity)),
+                    Step::Verify(verifier, assertion) => self
+                        .io
+                        .block_on(self.verify(verifier, assertion, presented))
+                        .map(Transfer::into_value),
+                }
+            }
+            "usesAccess" => Ok(Value::bool(self.gate.verifier.is_some())),
+            _ => {
+                let text = |at: usize| args.get(at).and_then(Value::as_str).unwrap_or_default();
+                let ok = match self.gate.secrets.0.get(text(0)) {
+                    Some(secret) => presents(text(1), secret),
+                    None => false,
+                };
+                Ok(Value::bool(ok))
+            }
+        }
+    }
+
+    fn call_parkable(&self, op: &str, args: Vec<Value>, _back: &mut dyn Reentry) -> HostAnswer {
+        if op != "identity" {
+            return HostAnswer::Ready(self.call(op, args));
+        }
+        let presented = Presented::from_headers(args.first().unwrap_or(&Value::unit()));
+        match self.gate.begin(&presented) {
+            Step::Done(identity) => HostAnswer::Ready(Ok(identity_answer(identity))),
+            Step::Verify(verifier, assertion) => {
+                PendingWork::new("auth.identity", self.verify(verifier, assertion, presented))
+                    .answer()
+            }
+        }
     }
 }
 

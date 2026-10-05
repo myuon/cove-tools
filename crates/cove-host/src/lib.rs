@@ -20,6 +20,7 @@
 //! The README is the walkthrough; this crate's tests start the host
 //! in-process on a free port.
 
+pub mod access;
 pub mod admin;
 pub mod admin_module;
 pub mod apps;

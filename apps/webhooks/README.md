@@ -2,8 +2,8 @@
 
 A Cove app on cove-host (issue #2). It hands out **receive URLs** that keep
 every request sent to them, and **admin pages** to read what was received.
-Handling and HTML are Cove. Persistence, the clock, randomness and the admin
-credential check are the host's typed modules.
+Handling and HTML are Cove. Persistence, the clock, randomness and who is
+asking are the host's typed modules.
 
 | path (below `/webhooks`) | what | auth |
 | --- | --- | --- |
@@ -91,17 +91,33 @@ secret as the password.
 
 ## Admin access
 
-On this host an app checks a credential with `auth.check(secret, header)`. The
-host compares the `Authorization` header it is given against the secret named
-in `app.toml` under `[secrets]`: `admin = { env = "WEBHOOKS_ADMIN_TOKEN" }`
-here (`file = "..."` and, for tests, `value = "..."` also work). It accepts
-`Bearer <secret>` and `Basic <base64(any-user:secret)>`, so a browser's login
-prompt works. The comparison is constant-time, and the secret never enters the
-app's run: the code can check a credential but cannot read one, so it can't
-log it or leak it in an error.
+The admin pages ask the host who is asking: `auth.identity(request.headers)`
+(main README, *Cloudflare Access*).
 
-Receive URLs and admin pages are separate paths. Only `/admin/` asks for the
-secret, and nothing under `/in/` can read or change what is stored.
+**Deployed, Cloudflare Access** (issue #23). `covtools.ramda.io` is behind
+the Access application `covtools`, and the host verifies the token Access
+adds to each request (`Cf-Access-Jwt-Assertion`, or the `CF_Authorization`
+cookie): signed by the team's keys, for that application's AUD tag, not
+expired, with an email (and one of `ACCESS_ALLOWED_EMAILS`, if set). The
+settings are `[access]` in `app.toml`, the values from `ACCESS_TEAM_DOMAIN`,
+`COVTOOLS_ACCESS_AUD` and `ACCESS_ALLOWED_EMAILS` in the environment
+([deploy/cloudflare.md](../../deploy/cloudflare.md) §6). Without a valid
+token the pages answer 403 with no login prompt; with Access on, the
+`WEBHOOKS_ADMIN_TOKEN` secret is not accepted (`fallback = "none"`).
+
+**Run without Access** (`team` or `aud` unset, as in [Running
+it](#running-it)): the secret named under `[secrets]`, `admin = { env =
+"WEBHOOKS_ADMIN_TOKEN" }` here (`file = "..."` and, for tests, `value = "..."`
+also work), is the way in. The host accepts `Bearer <secret>` and `Basic
+<base64(any-user:secret)>`, so a browser's login prompt (401 with
+`WWW-Authenticate: Basic`) works. The comparison is constant-time, and the
+secret never enters the app's run: the code can check a credential but cannot
+read one, so it can't log it or leak it in an error.
+
+Receive URLs and admin pages are separate paths. Only `/admin/` asks who is
+asking — the receive URLs never call `auth.identity`, so they need no token
+and fetch no keys, and in the deployment `/webhooks/in` is an Access Bypass
+application — and nothing under `/in/` can read or change what is stored.
 
 **Cross-site forms.** A browser re-sends a stored Basic login with any request
 to the site, including a form posted from another site. So a request that
@@ -216,7 +232,7 @@ accepted 202 0.302223s
 | --- | --- | --- |
 | curl receive → restart → history still visible → resend to another endpoint | `receive_restart_and_resend_to_another_endpoint`; also `a_request_is_stored_whole_and_survives_a_restart` | [Running it](#running-it) |
 | a delayed endpoint waiting doesn't stop other apps answering | `a_delayed_endpoint_parks_while_other_apps_answer` (one worker; `hello` and the lab's pages answer during a 3 s delay; one park, no blocking call) | [Simulating responses](#simulating-responses) |
-| admin access control | `the_admin_pages_need_the_secret_and_the_receive_urls_do_not` (401 without, with a wrong Bearer token, and with a wrong Basic password; the Basic login works; receive URLs need nothing; cross-site form posts are 403) | [Admin access](#admin-access) |
+| admin access control | `the_admin_pages_need_the_secret_and_the_receive_urls_do_not` (401 without, with a wrong Bearer token, and with a wrong Basic password; the Basic login works; receive URLs need nothing; cross-site form posts are 403); behind Access, `access.rs::the_webhook_labs_pages_need_a_token_and_its_receive_urls_do_not` (403 without a token, with the admin UI's token and with the secret; the lab's token gets in; receive URLs need nothing and fetch no keys) | [Admin access](#admin-access) |
 | storage limits | `retention_and_the_body_limit_bound_what_is_kept`, `a_body_past_the_apps_request_limit_is_refused_by_the_host`; masking in `secret_headers_are_masked_unless_the_endpoint_says_not` | [What is stored, and how much](#what-is-stored-and-how-much) |
 | display escaping | `everything_a_sender_controls_is_escaped_on_the_pages`, plus resend responses in `a_resend_that_gets_no_response_is_stored_as_a_failure` and settings in `bad_settings_are_refused_and_good_ones_are_shown_escaped` | [Display and escaping](#display-and-escaping) |
 | resend stores the response or the failure | `receive_restart_and_resend_to_another_endpoint`, `a_resend_that_gets_no_response_is_stored_as_a_failure` | [Resending](#resending) |

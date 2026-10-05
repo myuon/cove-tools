@@ -13,9 +13,11 @@ use text
 ///   receive URL, query, headers, body, time) and answers `200` with the
 ///   event's id. No credentials: the endpoint id is the secret part of the
 ///   URL.
-/// - `/admin/...` is everything else, behind the app's `admin` secret
-///   (`Authorization: Bearer <secret>`, or a browser's Basic login with the
-///   secret as the password): the endpoint list and the form that makes one,
+/// - `/admin/...` is everything else, for an identity (`auth.identity`):
+///   the user Cloudflare Access let in, verified by the host; or, run
+///   without Access, the app's `admin` secret (`Authorization: Bearer
+///   <secret>`, or a browser's Basic login with the secret as the password):
+///   the endpoint list and the form that makes one,
 ///   an endpoint's history, one request in full, its JSON and raw views,
 ///   and deleting.
 export fn handle(request: web.Request) -> web.Response {
@@ -127,17 +129,25 @@ fn problem(message: String) -> Json {
 
 // --------------------------------------------------------------------- admin
 
-/// The admin pages, behind the `admin` secret.
+/// The admin pages, for an identity (`auth.identity`): deployed, the user
+/// Cloudflare Access let in; run locally without Access, the `admin`
+/// secret.
 fn admin(request: web.Request, parts: Array<String>) -> web.Response {
-  if !auth.check("admin", request.headers.get("authorization").unwrapOr("")) {
-    return web.Response(
-      status: 401,
-      headers: Map.of(
-        MapEntry(key: "www-authenticate", value: "Basic realm=\"webhook lab\""),
-        MapEntry(key: "content-type", value: "text/plain; charset=utf-8"),
-      ),
-      body: "the webhook lab's pages need the admin secret\n",
-    )
+  match auth.identity(request.headers) {
+    Ok(_) => {}
+    Err(error) => {
+      if auth.usesAccess() {
+        return textResponse(403, "the webhook lab's pages are reached through Cloudflare Access: {error.message}\n")
+      }
+      return web.Response(
+        status: 401,
+        headers: Map.of(
+          MapEntry(key: "www-authenticate", value: "Basic realm=\"webhook lab\""),
+          MapEntry(key: "content-type", value: "text/plain; charset=utf-8"),
+        ),
+        body: "the webhook lab's pages need the admin secret: {error.message}\n",
+      )
+    }
   }
   if request.method != "GET" && request.method != "HEAD" {
     if !sameOrigin(request) {

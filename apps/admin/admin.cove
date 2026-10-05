@@ -13,17 +13,15 @@ use text
 /// - `GET /history` is the change history.
 /// - `POST /apps/<app>/enable|disable|configure|reset` make the changes.
 ///
-/// Everything is behind the `admin` secret (and, deployed, behind Cloudflare
-/// Access as well); a change posted from another site is refused. The host
-/// re-checks every change by reloading the app, keeps it only if it makes
-/// sense, and refuses the admin app anything that would lock it out.
+/// Every page needs an identity (`auth.identity`): deployed, the user
+/// Cloudflare Access let in, verified by the host; run locally without
+/// Access, the `admin` secret. A change posted from another site is refused.
+/// The host re-checks every change by reloading the app, keeps it only if it
+/// makes sense, and refuses the admin app anything that would lock it out.
 export fn handle(request: web.Request) -> web.Response {
-  if !auth.check("admin", request.headers.get("authorization").unwrapOr("")) {
-    return web.Response(
-      status: 401,
-      headers: pageHeaders("text/plain; charset=utf-8").inserted("www-authenticate", "Basic realm=\"cove-tools admin\""),
-      body: "the admin pages need the admin secret\n",
-    )
+  let identity = match auth.identity(request.headers) {
+    Ok(identity) => identity
+    Err(error) => return refused(error.message)
   }
   let get = request.method == "GET" || request.method == "HEAD"
   if !get {
@@ -58,7 +56,7 @@ export fn handle(request: web.Request) -> web.Response {
   if get || parts.length() > 4 {
     return textResponse(404, "no such page\n")
   }
-  let who = user(request)
+  let who = user(identity)
   let form = text.parseForm(request.body)
   if action == "enable" || action == "disable" {
     return finish(at, app, action, host.setEnabled(app.name, action == "enable", who), form)
@@ -112,10 +110,29 @@ fn find(name: String) -> Option<host.App> {
   None
 }
 
-/// Who is asking, as far as this app can tell: the email Cloudflare Access
-/// says it let in, when there is one. The history keeps it as said.
-fn user(request: web.Request) -> String {
-  request.headers.get("cf-access-authenticated-user-email").unwrapOr("").trim()
+/// Who is asking, for the change history: the email Cloudflare Access
+/// let in, verified by the host; `token` for the `admin` secret, which
+/// names nobody.
+fn user(identity: auth.Identity) -> String {
+  if identity.via == "access" {
+    return identity.email
+  }
+  "token"
+}
+
+/// A request with no identity. Behind Access, a browser that got here has
+/// a login already, so no prompt: the request did not come through Access
+/// (or its login is for something else). Without Access, the browser's
+/// login prompt asks for the secret.
+fn refused(why: String) -> web.Response {
+  if auth.usesAccess() {
+    return textResponse(403, "the admin pages are reached through Cloudflare Access: {why}\n")
+  }
+  web.Response(
+    status: 401,
+    headers: pageHeaders("text/plain; charset=utf-8").inserted("www-authenticate", "Basic realm=\"cove-tools admin\""),
+    body: "the admin pages need the admin secret: {why}\n",
+  )
 }
 
 /// Where the host mounted the app: "" when it is reached by hostname.

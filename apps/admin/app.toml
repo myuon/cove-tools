@@ -16,8 +16,24 @@ deadline = "60s"
 [route]
 hosts = ["covtools-admin.ramda.io", "admin.localhost"]
 
-# Every page needs this secret too: `Authorization: Bearer <secret>`, or the
-# password of the browser's login prompt (any user name). The app is refused
-# at load without it.
+# Who may use the pages (`auth.identity`). Deployed, the user Cloudflare
+# Access let in: the host verifies the `Cf-Access-Jwt-Assertion` token
+# against the team's keys and this app's Access application (`aud`), and the
+# change history records its email. The values are the deployment's, from
+# the environment (deploy/env.example); with `team` or `aud` unset — a local
+# run — Access is off and the `admin` secret is the way in, as
+# `Authorization: Bearer <secret>` or the password of the browser's login
+# prompt. With Access on, `fallback = "none"`: the secret is not accepted,
+# so a request that did not come through Access (straight to the host's
+# port) is refused whatever it presents.
+[access]
+team = { env = "ACCESS_TEAM_DOMAIN" }
+aud = { env = "COVTOOLS_ADMIN_ACCESS_AUD" }
+emails = { env = "ACCESS_ALLOWED_EMAILS" }
+token = "admin"
+fallback = "none"
+
+# The token way in, for a run without Access. The app is refused at load
+# without it.
 [secrets]
 admin = { env = "ADMIN_UI_TOKEN" }

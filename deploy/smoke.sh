@@ -7,8 +7,9 @@
 # It runs install.sh as on the server, takes ExecStart from
 # cove-tools.service with /home/ioijoi moved to the scratch home, starts
 # it, checks the public and admin listeners answer as deployed (apps on
-# 8790, /_host/ only on 8791), stops it with SIGTERM as systemd would, and
-# runs backup.sh. Linux, x86-64; ports 8790 and 8791 free.
+# 8790, /_host/ only on 8791, Cloudflare Access on), stops it with SIGTERM as
+# systemd would, starts it again with Access off to check the token way in,
+# and runs backup.sh. Linux, x86-64; ports 8790 and 8791 free.
 set -euo pipefail
 
 tarball="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -37,52 +38,94 @@ grep -q '^ADMIN_UI_TOKEN=.' "$root/env" || fail "the reinstall did not add ADMIN
 [ "$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")" = "$webhooks_before" ] \
   || fail "the reinstall changed WEBHOOKS_ADMIN_TOKEN"
 [ "$(stat -c %a "$root/env")" = 600 ] || fail "env is not mode 0600 after the reinstall"
+# A setting the env lacks is appended with the example's value; one it has
+# is kept, even when it differs.
+sed -i -e '/^ACCESS_TEAM_DOMAIN=/d' -e 's/^COVTOOLS_ACCESS_AUD=.*/COVTOOLS_ACCESS_AUD=kept/' "$root/env"
+bash "$here/install.sh" "$tarball" > /dev/null
+grep -q '^ACCESS_TEAM_DOMAIN=ioijoi.cloudflareaccess.com$' "$root/env" \
+  || fail "the reinstall did not add ACCESS_TEAM_DOMAIN back"
+grep -q '^COVTOOLS_ACCESS_AUD=kept$' "$root/env" || fail "the reinstall changed COVTOOLS_ACCESS_AUD"
+sed -i "s/^COVTOOLS_ACCESS_AUD=kept$/$(grep '^COVTOOLS_ACCESS_AUD=' "$here/env.example")/" "$root/env"
 
 # The unit's command line, at the scratch home.
 command="$(sed -n '/^ExecStart=/,/[^\\]$/p' "$root/current/deploy/cove-tools.service" \
   | sed -e 's/^ExecStart=//' -e 's/\\$//' | tr '\n' ' ' | sed "s|/home/ioijoi|$HOME|g")"
 echo "running: $command"
-(
-  cd "$root"
-  set -a
-  # shellcheck source=/dev/null
-  . "$root/env"
-  set +a
-  # shellcheck disable=SC2086
-  exec $command
-) &
-pid=$!
-for _ in $(seq 100); do
-  curl -fsS -o /dev/null http://127.0.0.1:8790/ 2>/dev/null && break
-  sleep 0.2
-done
+
+# Starts the host as systemd would, with the env and then `$*` (assignments
+# that override it).
+start_host() {
+  (
+    cd "$root"
+    set -a
+    # shellcheck source=/dev/null
+    . "$root/env"
+    for assignment in "$@"; do export "${assignment?}"; done
+    set +a
+    # shellcheck disable=SC2086
+    exec $command
+  ) &
+  pid=$!
+  for _ in $(seq 100); do
+    curl -fsS -o /dev/null http://127.0.0.1:8790/ 2>/dev/null && break
+    sleep 0.2
+  done
+}
+
+stop_host() {
+  kill -TERM "$pid"
+  wait "$pid" || fail "the host did not exit cleanly on SIGTERM"
+  pid=""
+}
 
 status() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+header() { curl -s -o /dev/null -D - "$@" | tr -d '\r'; }
+admin_token="$(sed -n 's/^ADMIN_UI_TOKEN=//p' "$root/env")"
+token="$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")"
+admin_host='Host: covtools-admin.ramda.io'
+
+# 1. As deployed: Cloudflare Access on. Nothing here comes through Access,
+# so the admin UI and the webhook lab's pages refuse it — the apps' own
+# tokens too — and prompt for nothing. No request carries a well-formed
+# token, so the host fetches no keys.
+start_host
 [ "$(status http://127.0.0.1:8790/algo/)" = 200 ] || fail "the algo app is not served"
 [ "$(status http://127.0.0.1:8790/_host/stats)" = 404 ] || fail "/_host/ is on the public listener"
 [ "$(status http://127.0.0.1:8791/_host/stats)" = 200 ] || fail "/_host/ is not on the admin listener"
 [ "$(status -X POST http://127.0.0.1:8791/apps/algo/update)" = 401 ] || fail "the admin listener took an update without its token"
+[ "$(status -H "$admin_host" http://127.0.0.1:8790/)" = 403 ] || fail "the admin UI answered without an Access token"
+[ "$(status -H "$admin_host" -u "admin:$admin_token" http://127.0.0.1:8790/)" = 403 ] \
+  || fail "the admin UI took its token with Access on"
+[ "$(status -H "$admin_host" -H 'Cf-Access-Jwt-Assertion: not.a.token' http://127.0.0.1:8790/)" = 403 ] \
+  || fail "the admin UI took a malformed Access token"
+header -H "$admin_host" http://127.0.0.1:8790/ | grep -qi '^www-authenticate' \
+  && fail "the admin UI prompts for a login behind Access"
+[ "$(status -H "Authorization: Bearer $token" http://127.0.0.1:8790/webhooks/admin)" = 403 ] \
+  || fail "the webhook lab's pages took the token with Access on"
+[ "$(status -X POST --data hi http://127.0.0.1:8790/webhooks/in/0000000000000000)" = 404 ] \
+  || fail "a receive URL asked for credentials"
+[ "$(status http://127.0.0.1:8790/admin/)" = 404 ] || fail "the admin app is on the main hostname"
+stop_host
+
+# 2. Access off (no team): the apps' tokens are the way in, as before.
+start_host ACCESS_TEAM_DOMAIN=
 # The webhook lab writes its receive URLs at the public origin.
-token="$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")"
 made="$(curl -fsS -H "Authorization: Bearer $token" -H 'Accept: application/json' \
   --data 'name=smoke' http://127.0.0.1:8790/webhooks/admin/endpoints)"
 case "$made" in
   *'"https://covtools.ramda.io/webhooks/in/'*) ;;
   *) fail "the receive URL is not at the public origin: $made" ;;
 esac
-
 # The admin UI: reached by its hostname only, behind its own secret.
-admin_token="$(sed -n 's/^ADMIN_UI_TOKEN=//p' "$root/env")"
-admin_host='Host: covtools-admin.ramda.io'
 [ "$(status -H "$admin_host" http://127.0.0.1:8790/)" = 401 ] || fail "the admin UI answered without its token"
+header -H "$admin_host" http://127.0.0.1:8790/ | grep -qi '^www-authenticate: basic' \
+  || fail "the admin UI does not prompt for its token with Access off"
 [ "$(status -H "$admin_host" -u "admin:$admin_token" http://127.0.0.1:8790/)" = 200 ] || fail "the admin UI refused its token"
 [ "$(status http://127.0.0.1:8790/admin/)" = 404 ] || fail "the admin app is on the main hostname"
 [ "$(status -X POST -H "$admin_host" -u "admin:$admin_token" -H 'Origin: https://evil.example' \
   http://127.0.0.1:8790/apps/hello/disable)" = 403 ] || fail "the admin UI took a cross-site POST"
 
-kill -TERM "$pid"
-wait "$pid" || fail "the host did not exit cleanly on SIGTERM"
-pid=""
+stop_host
 
 bash "$root/current/deploy/backup.sh"
 ls "$root"/backups/*/webhooks.kv.sqlite3.gz > /dev/null || fail "no backup of the webhook lab's store"
