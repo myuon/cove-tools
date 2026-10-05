@@ -25,6 +25,10 @@ jobs:
       # is several times slower, and one profile means one build.
       - name: clippy
         run: cargo clippy --workspace --all-targets --profile checked -- -D warnings
+      - name: doc
+        run: cargo doc --workspace --no-deps --profile checked
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: test
         run: cargo test --workspace --profile checked
       - name: test on the encoded VM

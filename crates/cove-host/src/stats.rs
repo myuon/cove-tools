@@ -4,7 +4,13 @@
 //! never used to decide anything, so no ordering between two of them is
 //! promised.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// How many recent errors each app keeps.
+pub const RECENT_ERRORS: usize = 50;
 
 use serde_json::{json, Map, Value as Json};
 
@@ -144,12 +150,41 @@ pub struct AppCounters {
     pub fetches: AtomicU64,
     pub fetch_refused: AtomicU64,
     pub fetch_errors: AtomicU64,
+    /// Updates installed, and updates refused (the current version kept).
+    pub updates: AtomicU64,
+    pub updates_refused: AtomicU64,
+    /// The last [`RECENT_ERRORS`] errors, newest last.
+    recent: Mutex<VecDeque<Json>>,
 }
 
 impl AppCounters {
     pub fn error(&self, kind: ErrorKind) {
         self.served.fetch_add(1, Ordering::Relaxed);
         self.errors[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Notes an error in the app's recent errors: when, which kind, which
+    /// version, and the first line of the message.
+    pub fn recent_error(&self, kind: ErrorKind, version: &str, message: &str) {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let mut recent = self.recent.lock().unwrap();
+        if recent.len() == RECENT_ERRORS {
+            recent.pop_front();
+        }
+        recent.push_back(json!({
+            "unix_ms": millis,
+            "kind": kind.name(),
+            "status": kind.status(),
+            "version": version,
+            "message": message.lines().next().unwrap_or_default(),
+        }));
+    }
+
+    /// The recent errors, oldest first.
+    pub fn recent_errors(&self) -> Vec<Json> {
+        self.recent.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn errors(&self, kind: ErrorKind) -> u64 {
@@ -197,6 +232,8 @@ impl AppCounters {
             "fuel": read(&self.fuel),
             "worker_ms": read(&self.worker_ns) as f64 / 1e6,
             "heap_peak_words": read(&self.heap_peak_words),
+            "updates": read(&self.updates),
+            "updates_refused": read(&self.updates_refused),
             "fetch": {
                 "calls": read(&self.fetches),
                 "refused": read(&self.fetch_refused),

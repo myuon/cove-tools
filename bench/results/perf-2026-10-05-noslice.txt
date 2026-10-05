@@ -1,0 +1,116 @@
+# 2026-10-05T03:16:05Z Darwin x86_64 backend=auto slice=0 load=3.57 3.78 3.44
+# cove-host: loading apps from /var/folders/85/by6yvy817mj0cgg4nm3vf6m80000gn/T/tmp.UwJvh80iPy
+#   crunch     v1-41c2bd68  requires [-]  granted [-]  ok: 227 fn on native, checked in 22.2 ms, prepared in 2.0 ms
+#   hello      v1-dae256d1  requires [-]  granted [-]  ok: 234 fn on native, checked in 11.6 ms, prepared in 2.4 ms
+#   notes      v1-cf6980a0  requires [kv, log]  granted [kv, log]  ok: 226 fn on native, checked in 3.7 ms, prepared in 2.5 ms
+#   proxy      v1-c6d4262d  requires [fetch, log]  granted [fetch, log]  ok: 227 fn on native, checked in 17.0 ms, prepared in 2.6 ms
+#   slow       v1-52b0f651  requires [log, timer]  granted [log, timer]  ok: 220 fn on native, checked in 14.6 ms, prepared in 1.6 ms
+# rep 1
+## --mix cpu-io --rate 330 --connections 200 --requests 1500
+1500 requests to 127.0.0.1:18180 (cpu-io), 200 connections kept alive, open loop at 330 req/s, latency from the intended start
+  answered 1500 (0 failed to connect or read) in 4.73 s: 317 req/s
+  latency ms: p50 4.42  p90 185.60  p99 187.26  max 188.40   (p99 from the send 185.65)
+  send lag ms: p50 1.31  p99 2.47  max 2.82; 1085 sent more than 1 ms late
+  crunch   525 x 200                 111.1 req/s  p50    6.82 ms  p99   13.64 ms
+  hello    375 x 200                  79.4 req/s  p50    1.52 ms  p99    2.94 ms
+  proxy    148 x 200                  31.3 req/s  p50    1.73 ms  p99    3.18 ms
+  slow     452 x 200                  95.7 req/s  p50  185.18 ms  p99  187.71 ms
+## --mix cpu-io --rate 990 --connections 400 --requests 4000
+4000 requests to 127.0.0.1:18180 (cpu-io), 400 connections kept alive, open loop at 990 req/s, latency from the intended start
+  answered 4000 (0 failed to connect or read) in 4.22 s: 947 req/s
+  latency ms: p50 3.93  p90 184.84  p99 186.07  max 188.49   (p99 from the send 184.83)
+  send lag ms: p50 1.03  p99 2.09  max 2.22; 2112 sent more than 1 ms late
+  crunch   1402 x 200                332.0 req/s  p50    6.37 ms  p99   12.83 ms
+  hello    1001 x 200                237.0 req/s  p50    1.15 ms  p99    2.24 ms
+  proxy    397 x 200                  94.0 req/s  p50    1.38 ms  p99    2.50 ms
+  slow     1200 x 200                284.1 req/s  p50  184.48 ms  p99  186.49 ms
+## --mix cpu-io --rate 1500 --connections 600 --requests 6000
+6000 requests to 127.0.0.1:18180 (cpu-io), 600 connections kept alive, open loop at 1500 req/s, latency from the intended start
+  answered 6000 (0 failed to connect or read) in 4.18 s: 1434 req/s
+  latency ms: p50 4.22  p90 185.11  p99 187.83  max 194.42   (p99 from the send 186.86)
+  send lag ms: p50 0.90  p99 1.93  max 2.28; 2573 sent more than 1 ms late
+  crunch   2100 x 200                501.8 req/s  p50    6.50 ms  p99   13.12 ms
+  hello    1499 x 200                358.2 req/s  p50    1.20 ms  p99    3.65 ms
+  proxy    597 x 200                 142.7 req/s  p50    1.43 ms  p99    5.29 ms
+  slow     1804 x 200                431.1 req/s  p50  184.60 ms  p99  189.36 ms
+## --mix cpu-io --connections 256 --requests 3000
+3000 requests to 127.0.0.1:18180 (cpu-io), 256 connections kept alive, closed loop, latency from the send
+  answered 3000 (0 failed to connect or read) in 1.62 s: 1851 req/s
+  latency ms: p50 12.99  p90 409.47  p99 499.91  max 561.10   (p99 from the send 499.91)
+  crunch   1049 x 200                647.4 req/s  p50    7.56 ms  p99  138.52 ms
+  hello    752 x 200                 464.1 req/s  p50    2.41 ms  p99  121.85 ms
+  proxy    298 x 200                 183.9 req/s  p50    4.85 ms  p99  161.17 ms
+  slow     901 x 200                 556.0 req/s  p50  401.74 ms  p99  533.43 ms
+# rep 2
+## --mix cpu-io --rate 330 --connections 200 --requests 1500
+1500 requests to 127.0.0.1:18180 (cpu-io), 200 connections kept alive, open loop at 330 req/s, latency from the intended start
+  answered 1500 (0 failed to connect or read) in 4.73 s: 317 req/s
+  latency ms: p50 4.53  p90 185.63  p99 187.19  max 189.52   (p99 from the send 185.62)
+  send lag ms: p50 1.30  p99 2.43  max 2.67; 1095 sent more than 1 ms late
+  crunch   525 x 200                 111.0 req/s  p50    6.66 ms  p99   13.38 ms
+  hello    375 x 200                  79.3 req/s  p50    1.51 ms  p99    2.52 ms
+  proxy    148 x 200                  31.3 req/s  p50    1.74 ms  p99    2.80 ms
+  slow     452 x 200                  95.6 req/s  p50  185.07 ms  p99  187.74 ms
+## --mix cpu-io --rate 990 --connections 400 --requests 4000
+4000 requests to 127.0.0.1:18180 (cpu-io), 400 connections kept alive, open loop at 990 req/s, latency from the intended start
+  answered 4000 (0 failed to connect or read) in 4.23 s: 946 req/s
+  latency ms: p50 4.03  p90 185.03  p99 186.53  max 189.69   (p99 from the send 185.15)
+  send lag ms: p50 1.01  p99 2.07  max 2.48; 2043 sent more than 1 ms late
+  crunch   1402 x 200                331.7 req/s  p50    6.32 ms  p99   14.44 ms
+  hello    1001 x 200                236.8 req/s  p50    1.11 ms  p99    2.39 ms
+  proxy    397 x 200                  93.9 req/s  p50    1.42 ms  p99    4.12 ms
+  slow     1200 x 200                283.9 req/s  p50  184.60 ms  p99  186.93 ms
+## --mix cpu-io --rate 1500 --connections 600 --requests 6000
+6000 requests to 127.0.0.1:18180 (cpu-io), 600 connections kept alive, open loop at 1500 req/s, latency from the intended start
+  answered 6000 (0 failed to connect or read) in 4.19 s: 1433 req/s
+  latency ms: p50 4.28  p90 185.37  p99 187.83  max 194.27   (p99 from the send 186.64)
+  send lag ms: p50 1.08  p99 2.12  max 3.51; 3430 sent more than 1 ms late
+  crunch   2100 x 200                501.7 req/s  p50    6.66 ms  p99   13.17 ms
+  hello    1499 x 200                358.1 req/s  p50    1.35 ms  p99    3.46 ms
+  proxy    597 x 200                 142.6 req/s  p50    1.61 ms  p99    5.09 ms
+  slow     1804 x 200                431.0 req/s  p50  184.84 ms  p99  189.45 ms
+## --mix cpu-io --connections 256 --requests 3000
+3000 requests to 127.0.0.1:18180 (cpu-io), 256 connections kept alive, closed loop, latency from the send
+  answered 3000 (0 failed to connect or read) in 1.62 s: 1852 req/s
+  latency ms: p50 12.83  p90 412.03  p99 508.61  max 559.23   (p99 from the send 508.61)
+  crunch   1049 x 200                647.4 req/s  p50    7.53 ms  p99  147.93 ms
+  hello    752 x 200                 464.1 req/s  p50    2.49 ms  p99  138.97 ms
+  proxy    298 x 200                 183.9 req/s  p50    4.42 ms  p99  172.56 ms
+  slow     901 x 200                 556.1 req/s  p50  402.38 ms  p99  545.10 ms
+# rep 3
+## --mix cpu-io --rate 330 --connections 200 --requests 1500
+1500 requests to 127.0.0.1:18180 (cpu-io), 200 connections kept alive, open loop at 330 req/s, latency from the intended start
+  answered 1500 (0 failed to connect or read) in 4.72 s: 318 req/s
+  latency ms: p50 4.48  p90 185.48  p99 187.09  max 189.37   (p99 from the send 185.48)
+  send lag ms: p50 1.28  p99 2.56  max 4.24; 1068 sent more than 1 ms late
+  crunch   525 x 200                 111.1 req/s  p50    7.08 ms  p99   15.88 ms
+  hello    375 x 200                  79.4 req/s  p50    1.54 ms  p99    2.72 ms
+  proxy    148 x 200                  31.3 req/s  p50    1.61 ms  p99    3.34 ms
+  slow     452 x 200                  95.7 req/s  p50  185.00 ms  p99  187.52 ms
+## --mix cpu-io --rate 990 --connections 400 --requests 4000
+4000 requests to 127.0.0.1:18180 (cpu-io), 400 connections kept alive, open loop at 990 req/s, latency from the intended start
+  answered 4000 (0 failed to connect or read) in 4.23 s: 947 req/s
+  latency ms: p50 3.96  p90 184.95  p99 186.39  max 187.38   (p99 from the send 185.08)
+  send lag ms: p50 1.03  p99 2.10  max 2.44; 2098 sent more than 1 ms late
+  crunch   1402 x 200                331.8 req/s  p50    6.32 ms  p99   12.87 ms
+  hello    1001 x 200                236.9 req/s  p50    1.15 ms  p99    2.27 ms
+  proxy    397 x 200                  94.0 req/s  p50    1.30 ms  p99    2.74 ms
+  slow     1200 x 200                284.0 req/s  p50  184.51 ms  p99  186.91 ms
+## --mix cpu-io --rate 1500 --connections 600 --requests 6000
+6000 requests to 127.0.0.1:18180 (cpu-io), 600 connections kept alive, open loop at 1500 req/s, latency from the intended start
+  answered 6000 (0 failed to connect or read) in 4.18 s: 1434 req/s
+  latency ms: p50 4.17  p90 185.30  p99 187.93  max 194.16   (p99 from the send 187.04)
+  send lag ms: p50 0.95  p99 1.98  max 2.42; 2757 sent more than 1 ms late
+  crunch   2100 x 200                501.9 req/s  p50    6.51 ms  p99   13.13 ms
+  hello    1499 x 200                358.3 req/s  p50    1.20 ms  p99    3.43 ms
+  proxy    597 x 200                 142.7 req/s  p50    1.47 ms  p99    5.02 ms
+  slow     1804 x 200                431.1 req/s  p50  184.72 ms  p99  189.52 ms
+## --mix cpu-io --connections 256 --requests 3000
+3000 requests to 127.0.0.1:18180 (cpu-io), 256 connections kept alive, closed loop, latency from the send
+  answered 3000 (0 failed to connect or read) in 1.61 s: 1861 req/s
+  latency ms: p50 12.73  p90 409.31  p99 510.56  max 568.89   (p99 from the send 510.56)
+  crunch   1049 x 200                650.7 req/s  p50    7.68 ms  p99  151.97 ms
+  hello    752 x 200                 466.5 req/s  p50    2.58 ms  p99  141.87 ms
+  proxy    298 x 200                 184.8 req/s  p50    5.15 ms  p99  173.11 ms
+  slow     901 x 200                 558.9 req/s  p50  400.26 ms  p99  547.29 ms
+bench/perf.sh: line 70: 34044 Terminated: 15          "$BIN/cove-host" serve --apps "$APPS" --data "$DATA" --addr "$ADDR" --workers 4 --slice "$SLICE" --backend "$BACKEND" --no-admin --quiet 2> "$DATA/host.err"

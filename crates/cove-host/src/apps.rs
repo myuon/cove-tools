@@ -72,6 +72,12 @@ pub struct LoadOptions {
 pub struct App {
     /// The name that routes to it: `/hello/...` reaches `hello`.
     pub name: String,
+    /// This version's number: 1 for the first loaded, one more for each
+    /// update.
+    pub number: u64,
+    /// `v<number>-<hash>`, the hash of the app's files: in the stats, the
+    /// logs and every response's `x-cove-app-version`.
+    pub version: String,
     pub dir: PathBuf,
     /// `module.function`.
     pub entry: String,
@@ -179,8 +185,9 @@ impl App {
             }
         };
         format!(
-            "{:<10} requires [{}]{open}  granted [{}]  {verdict}",
+            "{:<10} {}  requires [{}]{open}  granted [{}]  {verdict}",
             self.name,
+            self.version,
             list(&self.required),
             list(&self.granted),
         )
@@ -236,8 +243,35 @@ pub fn load_all(root: &Path, options: &LoadOptions) -> Result<Vec<App>, String> 
 /// An app as its directory and config describe it, before anything is
 /// compiled; refused if the config does not read.
 pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
+    describe_as(name, dir, Lineage::first())
+}
+
+/// What a version of an app inherits from the versions before it: its
+/// counters and its log, which belong to the app rather than a version, and
+/// its number.
+pub struct Lineage {
+    pub counters: Arc<AppCounters>,
+    pub logs: Arc<LogRing>,
+    pub number: u64,
+}
+
+impl Lineage {
+    /// An app's first version.
+    pub fn first() -> Lineage {
+        Lineage {
+            counters: Arc::new(AppCounters::default()),
+            logs: Arc::new(LogRing::default()),
+            number: 1,
+        }
+    }
+}
+
+/// [`describe`], for version `lineage.number` of an app.
+pub fn describe_as(name: &str, dir: &Path, lineage: Lineage) -> (App, Option<AppConfig>) {
     let mut app = App {
         name: name.to_string(),
+        number: lineage.number,
+        version: format!("v{}-{:08x}", lineage.number, content_hash(dir) as u32),
         dir: dir.to_path_buf(),
         entry: format!("{name}.handle"),
         granted: BTreeSet::new(),
@@ -246,8 +280,8 @@ pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
         limits: AppLimits::default(),
         kv: KvLimits::default(),
         fetch: FetchPolicy::default(),
-        counters: Arc::new(AppCounters::default()),
-        logs: Arc::new(LogRing::default()),
+        counters: lineage.counters,
+        logs: lineage.logs,
         state: AppState::Refused(String::new()),
     };
     if let Err(why) = valid_name(name) {
@@ -270,6 +304,48 @@ pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
     }
 }
 
+/// FNV-1a over the app's files — `app.toml` and every `.cove` file, with
+/// their paths — in a fixed order: the same files hash the same, so a
+/// version id says whether two loads were of the same code.
+fn content_hash(dir: &Path) -> u64 {
+    let mut files = Vec::new();
+    let mut walk = vec![dir.to_path_buf()];
+    while let Some(at) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() && at == dir {
+                walk.push(path);
+            } else if path.extension().is_some_and(|e| e == "cove")
+                || path.file_name().is_some_and(|n| n == "app.toml")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for file in files {
+        eat(file
+            .strip_prefix(dir)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .as_bytes());
+        eat(&[0]);
+        eat(&std::fs::read(&file).unwrap_or_default());
+        eat(&[0]);
+    }
+    hash
+}
+
 /// An app's name is its route and its main module's name, so it has to be
 /// both: a Cove identifier, and not one of the host's reserved prefixes.
 fn valid_name(name: &str) -> Result<(), String> {
@@ -286,7 +362,18 @@ fn valid_name(name: &str) -> Result<(), String> {
 
 /// Loads one app.
 pub fn load(name: &str, dir: &Path, options: &LoadOptions) -> App {
-    let (mut app, config) = describe(name, dir);
+    load_as(name, dir, options, Lineage::first())
+}
+
+/// [`load`], as version `lineage.number` of an app: the host's update. The
+/// app's log goes to `<data>/<app>/log.txt` as well as its ring.
+pub fn load_as(name: &str, dir: &Path, options: &LoadOptions, lineage: Lineage) -> App {
+    let (mut app, config) = describe_as(name, dir, lineage);
+    if let Some(data) = &options.data {
+        if valid_name(name).is_ok() {
+            app.logs.attach(data.join(name).join("log.txt"));
+        }
+    }
     if config.is_none() {
         return app;
     }

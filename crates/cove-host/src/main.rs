@@ -54,6 +54,26 @@ enum Command {
         /// Print no `log` lines.
         #[arg(long)]
         quiet: bool,
+        /// Where the admin listener (updates) listens; keep it on localhost.
+        #[arg(long, default_value = "127.0.0.1:8081")]
+        admin: String,
+        /// Run without an admin listener: no updates but a restart.
+        #[arg(long)]
+        no_admin: bool,
+    },
+    /// Load an app's directory again and switch the running host to the new
+    /// version if it loads (or add the app, for a new name). In-flight
+    /// requests finish on the old version.
+    Update {
+        app: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Stop routing to an app on the running host.
+    Remove {
+        app: String,
+        #[command(flatten)]
+        admin: AdminArgs,
     },
     /// Check apps against the host's schemas and grants; non-zero if any
     /// would be refused.
@@ -75,6 +95,66 @@ enum Command {
     },
 }
 
+/// How `update` and `remove` reach the running host.
+#[derive(clap::Args)]
+struct AdminArgs {
+    /// The host's admin listener.
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    admin: String,
+    /// The file holding the admin token; the host's `<data>/admin.token`.
+    #[arg(long, default_value = "data/admin.token")]
+    token_file: PathBuf,
+}
+
+/// Sends one admin request; prints the answer; fails unless it was a 2xx.
+fn admin(args: &AdminArgs, method: reqwest::Method, path: &str) -> ExitCode {
+    let token = match std::fs::read_to_string(&args.token_file) {
+        Ok(token) => token.trim().to_string(),
+        Err(e) => {
+            eprintln!(
+                "cove-host: cannot read the admin token from `{}`: {e}",
+                args.token_file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let url = format!("http://{}{path}", args.admin);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("cove-host: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let answer = runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .request(method, &url)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await?;
+        let status = response.status();
+        Ok::<_, reqwest::Error>((status, response.text().await?))
+    });
+    match answer {
+        Ok((status, body)) if status.is_success() => {
+            print!("{body}");
+            ExitCode::SUCCESS
+        }
+        Ok((status, body)) => {
+            eprint!("cove-host: {status}\n{body}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("cove-host: cannot reach the admin listener at {url}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Serve {
@@ -88,6 +168,8 @@ fn main() -> ExitCode {
             max_in_flight,
             backend,
             quiet,
+            admin,
+            no_admin,
         } => {
             let mut options = ServeOptions::new(apps);
             options.addr = addr;
@@ -101,6 +183,7 @@ fn main() -> ExitCode {
             options.max_in_flight = max_in_flight;
             options.backend = backend;
             options.quiet = quiet;
+            options.admin = (!no_admin).then_some(admin);
             eprintln!("cove-host: loading apps from {}", options.apps.display());
             let host = match Host::start(options) {
                 Ok(host) => host,
@@ -113,6 +196,12 @@ fn main() -> ExitCode {
             host.wait_for_ctrl_c();
             eprintln!("cove-host: shutting down");
             ExitCode::SUCCESS
+        }
+        Command::Update { app, admin: args } => {
+            admin(&args, reqwest::Method::POST, &format!("/apps/{app}/update"))
+        }
+        Command::Remove { app, admin: args } => {
+            admin(&args, reqwest::Method::DELETE, &format!("/apps/{app}"))
         }
         Command::Check { apps, names } => {
             finish(toolchain::check(&apps, &names, &HostModules::standard()))
