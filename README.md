@@ -21,12 +21,15 @@ the runtime needs goes to [myuon/cove](https://github.com/myuon/cove) first.
 $ cargo build --profile checked
 $ ./target/checked/cove-host serve --apps apps
 cove-host: loading apps from apps
-  crunch     requires [-]  granted [-]  ok: 227 fn on native, checked in 17.9 ms, prepared in 1.9 ms
-  hello      requires [-]  granted [-]  ok: 234 fn on native, checked in 13.1 ms, prepared in 3.4 ms
-  slow       requires [log, timer]  granted [log, timer]  ok: 220 fn on native, checked in 16.7 ms, prepared in 1.6 ms
+  crunch     v1-397ddca0  requires [-]  granted [-]  ok: 227 fn on native, checked in 19.3 ms, prepared in 1.9 ms
+  hello      v1-05b655c0  requires [-]  granted [-]  ok: 234 fn on native, checked in 11.6 ms, prepared in 2.4 ms
+  notes      v1-cf6980a0  requires [kv, log]  granted [kv, log]  ok: 226 fn on native, checked in 3.7 ms, prepared in 2.5 ms
+  proxy      v1-f26c6f57  requires [fetch, log]  granted [fetch, log]  ok: 227 fn on native, checked in 21.1 ms, prepared in 2.1 ms
+  slow       v1-2914903a  requires [log, timer]  granted [log, timer]  ok: 220 fn on native, checked in 12.8 ms, prepared in 1.6 ms
 
 listening on http://127.0.0.1:8080 — 16 worker thread(s), a run yields after 2.0 ms while others wait, a fresh isolate per request, apps served round robin
-  stats: curl -s http://127.0.0.1:8080/_host/stats
+  stats: curl -s http://127.0.0.1:8080/_host/stats   ops page: http://127.0.0.1:8080/_host/ui
+  admin: http://127.0.0.1:8081 (token in data/admin.token); update with `cove-host update <app>`
 ```
 
 (`--profile checked` is release with debug assertions and overflow checks
@@ -38,8 +41,9 @@ app; default `./data`), `--addr` (default `127.0.0.1:8080`), `--workers N` (thre
 that run Cove; default one per hardware thread), `--io-threads N` (HTTP and
 pending host work; default 2), `--slice MS` (default 2; `0` never asks a run
 to yield), `--max-connections N` and `--max-in-flight N` (default 10,000
-each), `--backend auto|vm|native` (default `auto`) and `--quiet` (no `log`
-lines).
+each), `--backend auto|vm|native` (default `auto`), `--quiet` (no `log`
+lines on stdout), and `--admin ADDR` (the admin listener for updates, default
+`127.0.0.1:8081`) or `--no-admin`.
 
 ### The sample apps
 
@@ -136,7 +140,10 @@ the stats).
 
 `GET /_host/apps/<app>/logs?n=200` answers an app's recent log lines — its
 `log.*` and the host's own lines about it (a failed request, a run that
-would not yield), the last 1,000 kept in memory:
+would not yield, an update), the last 1,000 kept in memory. They are also
+written to `<data>/<app>/log.txt`, rotated to `log.1.txt` past 1 MiB (one
+old file kept), by a writer thread of their own, so no worker or I/O thread
+waits on a file:
 
 ```console
 $ curl -s http://127.0.0.1:8080/_host/apps/notes/logs
@@ -144,14 +151,29 @@ $ curl -s http://127.0.0.1:8080/_host/apps/notes/logs
 1791168727.547 info: stored zeta (1 bytes)
 ```
 
-### Stats
+### Stats and the operations page
 
-`GET /` lists the apps; `GET /_host/stats` is JSON — per app: `state`
-(`ready` or `refused`, with the reason), `tier`, `required` and `granted`,
+`GET /` lists the apps. The operations views are read-only:
+
+| path | what |
+| --- | --- |
+| `GET /_host/ui` | one HTML page (no script, refreshes every 5 s): every app's version, state, tier, counters, queues, parks, yields, declined and overdue yields, worker time, instructions, live versions, errors, cancellations, rejections, KV usage against its quota and fetch counts; the last 20 errors and 10 log lines of each app. Every value from an app is HTML-escaped |
+| `GET /_host/stats` | the same counters as JSON, with server totals |
+| `GET /_host/apps/<app>` | one app as JSON: the above, its `limits`, every version it has had (`version`, `loaded_unix_s`, `current`, `alive`, `program_alive`) and its last 50 errors (`unix_ms`, `kind`, `status`, `version`, `message`) |
+| `GET /_host/apps/<app>/logs?n=200` | its recent log lines, as text |
+
+They are on the public listener and unauthenticated, so a reverse proxy in
+front of the host should not forward `/_host/` (an error message names
+source lines).
+
+`/_host/stats`, per app: `state`
+(`ready`, `refused` with the reason, or `removed`), `version`, `tier`, `required` and `granted`,
 `served`, `ok`, `errors` by kind, `rejected` by reason, `in_flight`,
 `queued`, `parked`, `parks`, `yields`, `yield_requests`, `yields_declined`,
 `overdue_yields`, `blocking_host_calls`, `instructions`, `fuel`, `worker_ms`,
-`heap_peak_words` and `fetch` (`calls`, `refused`, `errors`); and the server's `connections`,
+`heap_peak_words`, `fetch` (`calls`, `refused`, `errors`), `kv` (`keys`,
+`bytes`, `max_keys`, `max_bytes`, for an app granted `kv`), `updates`,
+`updates_refused`, `versions_alive` and `programs_alive`; and the server's `connections`,
 `rejected_connections`, `not_found`, `admitted` and `totals`.
 
 ### Checking and testing an app
@@ -196,6 +218,77 @@ ran 5 test(s), 5 passed
 
 Both take app names to narrow them (`cove-host check hello`), and `test`
 takes `--filter`.
+
+## Updating an app
+
+```console
+$ $EDITOR apps/hello/hello.cove                 # Hello → Hi
+$ ./target/checked/cove-host update hello
+{
+  "app": "hello",
+  "previous": "v1-05b655c0",
+  "version": "v2-11744df1"
+}
+$ curl -si http://127.0.0.1:8080/hello/ | grep -i -e x-cove -e hi
+x-cove-app-version: v2-11744df1
+Hi, world! (GET /)
+$ echo 'fn broken( {' >> apps/hello/hello.cove
+$ ./target/checked/cove-host update hello; echo "exit $?"
+cove-host: 422 Unprocessable Entity
+update of `hello` refused; still serving v2-11744df1:
+does not parse:
+error[cove::parse::unexpected_token]: expected identifier, found `{`
+  --> hello/hello.cove:51:12
+   |
+51 | fn broken( {
+   |            ^
+
+exit 1
+$ curl -s http://127.0.0.1:8080/hello/
+Hi, world! (GET /)
+```
+
+`cove-host update <app>` asks the running host to load `<apps>/<app>` again.
+The new version is parsed, checked, admitted (capabilities, `spawn`, config),
+lowered, prepared and compiled on a blocking thread — not on a worker, not on
+the I/O runtime — while the current version keeps serving. **Only if all of
+that succeeds** is the app's route switched, in one step; otherwise the
+current version stays and the command prints the diagnostics and exits 1
+(`updates_refused` in the stats, a line in the app's log).
+
+- **Requests in flight finish on the version they were admitted to** —
+  queued, running, yielded or parked: a request holds its version (and so
+  its prepared program and registry) until it answers. Requests admitted
+  after the switch get the new one.
+- **The old version is dropped when its last request ends.** Its
+  `PreparedProgram` goes with it; `/_host/apps/<app>` lists each version with
+  `alive` and `program_alive`, and `versions_alive` / `programs_alive` count
+  them.
+- **Every response says which version answered**: `x-cove-app-version:
+  v<n>-<hash>`, the hash being of the app's files, so two loads of the same
+  code have the same hash. The id is in the stats, the logs and every
+  recent error too.
+- The app's counters, log, queue and KV store belong to the app, not the
+  version: they carry over. During an update both versions share the one
+  store (and its quota accounting); the new version's quotas apply from the
+  switch.
+- A name the host does not serve yet is **added** by `update`; `cove-host
+  remove <app>` stops routing to an app (in-flight requests finish; its data
+  stays, and `update` brings it back as its next version).
+- One update runs at a time.
+
+**The admin listener.** Updates go to a second listener, `--admin`
+(default `127.0.0.1:8081`), never to the public one, so a reverse proxy that
+forwards the public port cannot reach them, and the admin port can stay on
+localhost whatever the public one is. Every admin request needs
+`Authorization: Bearer <token>`; the host writes a random 256-bit token to
+`<data>/admin.token` (mode 0600) the first time it starts without one, and
+`cove-host update` / `remove` read it from there (`--token-file`, `--admin`
+to point them elsewhere). Anything without the token is 401 and changes
+nothing. The endpoints are `POST /apps/<app>/update`, `DELETE /apps/<app>`
+and `GET /apps` (the stats). There is no file watcher: an update is an
+explicit act, which is what makes a refused one a report rather than a
+silent non-event.
 
 ## Writing an app
 
@@ -474,6 +567,52 @@ nothing here has been reviewed as a sandbox.
 There is no TLS. Put the host behind a reverse proxy (Caddy, nginx) that
 terminates TLS and forwards to `--addr`, which defaults to localhost.
 
+## Performance
+
+`bench/perf.sh` runs `cove-host-load` (a small load generator in this crate)
+against a host with four workers — the configuration of the Cove repository's
+edge/Go comparison (`examples/edge/compare/README.md`, cove #589/#593) —
+using the same method: open loop with latency measured from each request's
+**intended** start (no coordinated omission), and closed loop for capacity.
+[`bench/README.md`](bench/README.md) has the conditions, the commands, the
+full tables and the comparison; in short, on the same machine
+(i7-10700K, macOS, native tier):
+
+| | cove-host | edge (native where measured) | Go |
+| --- | ---: | ---: | ---: |
+| `hello` capacity, 64 in flight | 110,671 req/s | 84,235 (VM) | 122,725 |
+| `crunch n=20000` capacity, 16 in flight | 4,809 req/s | 2,783 | 3,720 |
+| `cpu-io` mix capacity, 256 in flight | 1,831 req/s | 1,044 | 1,364 |
+| `hello` p99 inside the mix at 990 req/s | 2.3 ms | 13.5 | — |
+
+The HTTP stacks differ (hyper on tokio here; the edge sample's own std
+HTTP/1.1 with a `poll(2)` idle thread; Go's `net/http`), the load generators
+differ, and the edge `crunch` row predates the native tier's 32-bit division
+(cove #596), which this host's Cove revision has. So these say *no
+regression* rather than *faster than Go*. The check that matters for the
+scheduler: **`hello`'s p99 inside the CPU+I/O mix stays at 2.3–3.0 ms from
+330 to 1,434 req/s** (78% of the mix's capacity), against 2.6 ms for `hello`
+alone; past saturation, the 2 ms slice keeps it at 95 ms against 139 ms
+without one.
+
+```console
+$ cargo build --profile checked
+$ sh bench/perf.sh 3 > bench/results/perf-$(date +%F).txt
+$ SLICE=0 ONLY=mix sh bench/perf.sh 3 > bench/results/perf-$(date +%F)-noslice.txt
+$ python3 bench/summarize.py bench/results/perf-*.txt
+```
+
+## Issue #1's completion criteria
+
+| criterion | where it is shown |
+| --- | --- |
+| two or more independent Cove apps run at once | `host.rs::two_or_more_apps_are_served_concurrently`; the walkthrough above serves five |
+| per-app KV isolation, and persistence across a restart | `services.rs::an_apps_keys_are_its_own`, `::the_store_survives_a_restart`; manual: the `notes` walkthrough, restart, `GET /notes/todo` |
+| a light app keeps answering beside a CPU-heavy and an I/O app | `host.rs::hello_answers_while_crunch_saturates_the_workers_and_slow_is_parked`; measured: [Performance](#performance), `hello`'s p99 in the mix |
+| budget overrun, overload and an invalid update stop no other app | `host.rs::a_budget_overrun_ends_that_request_only`, `::overload_is_rejected_explicitly_and_other_apps_still_answer`, `updates.rs::a_failed_update_keeps_the_current_version_and_says_why` (another app answering throughout four kinds of refused update) |
+| requests on the old version complete during an update | `updates.rs::in_flight_requests_finish_on_the_old_version_and_new_ones_get_the_new` (parked, running, yielded and queued, each answered by v1; the next by v2; v1 and its program dropped after) |
+| tests, and procedures for starting, updating and checking performance | [Tests](#tests); [Building and running](#building-and-running), [Updating an app](#updating-an-app), [Performance](#performance) |
+
 ## Tests
 
 ```console
@@ -482,7 +621,7 @@ $ cargo t     # = cargo test --workspace --profile checked
 
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
-integration tests (`crates/cove-host/tests/host.rs` and `services.rs`) start the host
+integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and `updates.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
 so, and what it asserts is counted.
@@ -511,7 +650,19 @@ so, and what it asserts is counted.
 - a fetch is abandoned — the upstream sees its connection closed — at the
   run's deadline, and when the client goes away;
 - a client going away cancels a spinning run that is running or yielded, one
-  still queued (without running it), and a parked one, each counted.
+  still queued (without running it), and a parked one, each counted;
+- an update while requests are parked, running, yielded and queued: each of
+  those answers with the old version's body and `x-cove-app-version`, a
+  request after the switch with the new one's, and once they have drained
+  the old version and its `PreparedProgram` are gone;
+- an update refused for a parse error, an ungranted capability, a `spawn` or
+  a config error keeps the current version serving, answers 422 with the
+  reason, and another app answers throughout;
+- the admin listener answers 401 without the token (missing, wrong, empty)
+  and changes nothing, and the public listener has no update route;
+- an update adds an app, `remove` removes one, and an update brings it back;
+- the operations page escapes markup an app logs, and shows errors and KV
+  usage against the quota; an app's log reaches `<data>/<app>/log.txt`.
 
 `COVE_HOST_TEST_BACKEND=vm cargo t` runs the same suite on the encoded VM,
 as CI does on its second pass.
