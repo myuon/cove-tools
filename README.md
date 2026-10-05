@@ -9,9 +9,9 @@ that runs them on one machine.
 - **`apps/`** — the sample apps: `hello` (pure), `crunch` (CPU-heavy),
   `slow` (waits on a timer that parks the run), `notes` (the persistent
   key-value store) and `proxy` (allowlisted outbound HTTP); and the real
-  apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2), and
-  [**`ledger`**](apps/ledger/README.md), the bench ledger (#3). An algorithm
-  playground (#4) comes next.
+  apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2),
+  [**`ledger`**](apps/ledger/README.md), the bench ledger (#3), and
+  [**`algo`**](apps/algo/README.md), the algorithm playground (#4).
 
 The host is Rust; the apps are Cove. Cove is a git dependency pinned to one
 commit (`rev` in the workspace `Cargo.toml`), and a change the compiler or
@@ -161,7 +161,7 @@ $ curl -s http://127.0.0.1:8080/_host/apps/notes/logs
 | --- | --- |
 | `GET /_host/ui` | one HTML page (no script, refreshes every 5 s): every app's version, state, tier, counters, queues, parks, yields, declined and overdue yields, worker time, instructions, live versions, errors, cancellations, rejections, KV usage against its quota and fetch counts; the last 20 errors and 10 log lines of each app. Every value from an app is HTML-escaped |
 | `GET /_host/stats` | the same counters as JSON, with server totals |
-| `GET /_host/apps/<app>` | one app as JSON: the above, its `limits`, every version it has had (`version`, `loaded_unix_s`, `current`, `alive`, `program_alive`) and its last 50 errors (`unix_ms`, `kind`, `status`, `version`, `message`) |
+| `GET /_host/apps/<app>` | one app as JSON: the above, its `limits`, every version it has had (`version`, `loaded_unix_s`, `current`, `alive`, `program_alive`), its last 50 errors (`unix_ms`, `kind`, `status`, `version`, `message`) and, on the native tier, `native`: how many functions have machine code (`compiled` of `reachable`) and each one left on the encoded tier (`refusals`: `function`, `reason`, the `instruction` the code generator stopped at, and `at`/`source`, where the source wrote it) |
 | `GET /_host/apps/<app>/logs?n=200` | its recent log lines, as text |
 
 They are on the public listener and unauthenticated, so a reverse proxy in
@@ -471,6 +471,18 @@ reason, and every other app starts.
 | the client went away before the answer | the run is cancelled (queued, running, yielded or parked) and counted as `errors.cancelled`; 499 in the app's log |
 | a `kv.put` past a quota, a `fetch` off the allowlist or past its limits | not a status: the app's `Err` to answer as it likes |
 
+**Every answer of a run says what the run cost**, in headers the host adds:
+`x-cove-run-fuel` and `x-cove-run-instructions` (the runtime's counts),
+`x-cove-run-yields`, `x-cove-run-yields-declined`, `x-cove-run-parks`,
+`x-cove-run-worker-us` (time on a worker, every slice summed) and
+`x-cove-run-wall-us` (admission to answer). **A run a limit stopped also
+says which**: `x-cove-stop` is the error kind's name — `fuel`, `deadline`,
+`host_calls`, `call_depth`, `heap`, `queue_timeout`, `response_too_large`,
+`cancelled`, `runtime`, … — so a page that runs a request with `fetch` can
+say why without reading the diagnostic (`apps/algo` does). An app cannot
+read its own meter during a run, which is why this is a header and not a
+host call.
+
 429 and 503 are deliberately different: 429 is *this app* at its own limit
 (its neighbours are unaffected, and the client of that app should back off);
 503 is the whole host. Every one is counted under the app in
@@ -545,7 +557,11 @@ never by trusting it:
   at least 20 ms) as `overdue_yields` and logs it; the runtime's own
   `yields_declined` is summed per app; and the run's **deadline still ends
   it**, since the deadline is checked at every safepoint whether or not the
-  run can yield.
+  run can yield. `/_host/apps/<app>`'s `native.refusals` names the functions
+  left on the encoded tier, with the instruction and the source line: a
+  function that makes a host call, or writes a lambda, is one — and an
+  algorithm called from such a function, by compiled code, cannot yield at
+  all. The algorithm playground met exactly that ([its README](apps/algo/README.md#yields-on-the-native-tier)).
 - **A host call that cannot park blocks, and is counted.** In the same
   places a call cannot park; `timer.sleep` then sleeps on the worker
   (`blocking_host_calls`), bounded by its 60 s maximum. None of the sample
@@ -612,6 +628,11 @@ scheduler: **`hello`'s p99 inside the CPU+I/O mix stays at 2.3–3.0 ms from
 alone; past saturation, the 2 ms slice keeps it at 95 ms against 139 ms
 without one.
 
+Beside a real CPU-heavy app — the algorithm playground's matching runs
+holding all four workers — `hello`'s p99 is 4.7 ms on the native tier and
+4.7 ms on the VM, against 2.0 ms alone (`bench/algo.sh`,
+[`apps/algo/README.md`](apps/algo/README.md#responsiveness)).
+
 ```console
 $ cargo build --profile checked
 $ sh bench/perf.sh 3 > bench/results/perf-$(date +%F).txt
@@ -638,7 +659,8 @@ $ cargo t     # = cargo test --workspace --profile checked
 
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
-integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and `updates.rs`) start the host
+integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and
+`updates.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
 so, and what it asserts is counted.

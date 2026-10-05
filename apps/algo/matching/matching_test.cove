@@ -1,0 +1,152 @@
+fn bounds() -> Bounds {
+  Bounds(vertices: 5000, edges: 50000)
+}
+
+fn graphOf(text: String) -> Result<Graph, Error> {
+  match parse(text, bounds()) {
+    Parsed.Ok(graph) => Ok(graph)
+    Parsed.Invalid(why) => Err(Error(why))
+  }
+}
+
+/// Both algorithms' size on `graph`, checked to agree and to be proved by
+/// the certificate.
+fn maximum(graph: Graph) -> Result<Int, Error> {
+  let fast = hopcroftKarp(graph)
+  let slow = augmenting(graph)
+  assertEqual(fast.size, slow.size)?
+  assert(certify(graph, fast).proved)?
+  assert(certify(graph, slow).proved)?
+  Ok(fast.size)
+}
+
+/// The size of a maximum matching by trying everything: left vertex `u` is
+/// left out, or matched to each free neighbour in turn.
+fn brute(graph: Graph, u: Int, var used: Vector<Bool>) -> Int {
+  if u == graph.left.length() {
+    return 0
+  }
+  var best = brute(graph, u + 1, var used)
+  var e = graph.start.get(u).unwrapOr(0)
+  let end = graph.start.get(u + 1).unwrapOr(0)
+  while e < end {
+    let v = graph.adjacent.get(e).unwrapOr(0)
+    if !used.get(v).unwrapOr(true) {
+      used.set(v, true)
+      best = best.max(1 + brute(graph, u + 1, var used))
+      used.set(v, false)
+    }
+    e += 1
+  }
+  best
+}
+
+test fn theExamplesHaveTheirKnownMaximum() -> Result<Unit, Error> {
+  assertEqual(maximum(graphOf("ann: cook clean\nbob: cook\ncat: clean drive\ndan: drive fix\neve: fix serve\n")?)?, 5)?
+  // Hall's condition fails for {s1, s2, s3}: three vertices, two neighbours.
+  assertEqual(maximum(graphOf("s1: logic algebra\ns2: logic algebra\ns3: logic algebra\ns4: algebra topology geometry\n")?)?, 3)?
+  // The greedy first choice a–x has to be undone.
+  assertEqual(maximum(graphOf("a x\na y\nb x\n")?)?, 2)?
+  // A star: one centre, so one pair.
+  assertEqual(maximum(graphOf("c: a b c d e\n")?)?, 1)?
+  // K_{3,3} has a perfect matching; isolated vertices change nothing.
+  assertEqual(maximum(graphOf("left: q\nright: z\na: x y z\nb: x y z\nc: x y z\n")?)?, 3)?
+  // No edges at all.
+  assertEqual(maximum(graphOf("left: a b\nright: x\n")?)?, 0)?
+  Ok(())
+}
+
+test fn theSeminarCoverIsTheOneTheExampleNames() -> Result<Unit, Error> {
+  let graph = graphOf("left: s1 s2 s3 s4\nright: logic algebra topology geometry\ns1: logic algebra\ns2: logic algebra\ns3: logic algebra\ns4: algebra topology geometry\n")?
+  let proof = certify(graph, hopcroftKarp(graph))
+  assert(proof.proved)?
+  assertEqual(proof.coverSize, 3)?
+  assertEqual(proof.coverLeft, [false, false, false, true])?
+  assertEqual(proof.coverRight, [true, true, false, false])?
+  Ok(())
+}
+
+test fn bothAgreeWithTryingEverythingOnSmallGraphs() -> Result<Unit, Error> {
+  var seed = 1
+  while seed <= 60 {
+    let left = 1 + seed % 6
+    let right = 1 + (seed / 6) % 6
+    let edges = (seed * 7) % (left * right + 1)
+    let graph = random(left, right, edges, seed)
+    var used = Vector.of()
+    var v = 0
+    while v < right {
+      used.push(false)
+      v += 1
+    }
+    assertEqual(maximum(graph)?, brute(graph, 0, var used))?
+    seed += 1
+  }
+  Ok(())
+}
+
+test fn bothAgreeOnLargerGraphs() -> Result<Unit, Error> {
+  for seed in [1, 2, 3] {
+    let graph = random(300, 250, 900, seed)
+    let size = maximum(graph)?
+    assert(size > 0 && size <= 250)?
+  }
+  Ok(())
+}
+
+test fn aMatchingThatIsNotMaximumIsNotProved() -> Result<Unit, Error> {
+  // a–x alone, where b–x, a–y is larger.
+  let graph = graphOf("a x\na y\nb x\n")?
+  let short = Matching(partnerOfLeft: [0, -1], partnerOfRight: [0, -1], size: 1, scans: 0, rounds: 0)
+  let proof = certify(graph, short)
+  assert(!proof.proved)?
+  assert(proof.problems.length() > 0)?
+  // A pair that is not an edge.
+  let wrong = Matching(partnerOfLeft: [-1, 1], partnerOfRight: [-1, 1], size: 1, scans: 0, rounds: 0)
+  assert(!certify(graph, wrong).proved)?
+  Ok(())
+}
+
+test fn aSeedIsAlwaysTheSameGraph() -> Result<Unit, Error> {
+  let a = random(40, 30, 200, 9)
+  let b = random(40, 30, 200, 9)
+  let c = random(40, 30, 200, 10)
+  assertEqual(a.adjacent, b.adjacent)?
+  assertEqual(a.start, b.start)?
+  assert(a.adjacent != c.adjacent)?
+  // Exactly the edges asked for, none twice, sparse or dense.
+  assertEqual(a.edges(), 200)?
+  assertEqual(random(10, 10, 80, 3).edges(), 80)?
+  assertEqual(random(10, 10, 100, 3).edges(), 100)?
+  Ok(())
+}
+
+test fn theInputIsReadAsWritten() -> Result<Unit, Error> {
+  let graph = graphOf("# people and jobs\nleft: z\na x  # a comment\na: y x\nb: \n")?
+  assertEqual(graph.left, ["z", "a", "b"])?
+  assertEqual(graph.right, ["x", "y"])?
+  // The repeated a–x counts once.
+  assertEqual(graph.edges(), 2)?
+  let generated = graphOf("# a comment\nrandom 4 5 6 1\n")?
+  assertEqual(generated.left.length(), 4)?
+  assertEqual(generated.edges(), 6)?
+  Ok(())
+}
+
+test fn badInputIsRefusedWithTheLine() -> Result<Unit, Error> {
+  for text in ["a b c", "random 4 4", "random 4 4 x", "random 0 4 1", "random 2 2 5", "a x\nrandom 3 3 3", "# nothing\n"] {
+    match parse(text, bounds()) {
+      Parsed.Ok(_) => return Err(Error("`{text}` was read"))
+      Parsed.Invalid(_) => {}
+    }
+  }
+  match parse("random 6 6 6", Bounds(vertices: 5, edges: 100)) {
+    Parsed.Ok(_) => return Err(Error("a side over the bound was read"))
+    Parsed.Invalid(why) => assert(why.contains("1 to 5 vertices"))?
+  }
+  match parse("a x\nb y\nc z", Bounds(vertices: 5, edges: 2)) {
+    Parsed.Ok(_) => return Err(Error("edges over the bound were read"))
+    Parsed.Invalid(why) => assert(why.contains("at most 2 edges"))?
+  }
+  Ok(())
+}

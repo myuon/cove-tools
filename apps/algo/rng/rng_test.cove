@@ -1,0 +1,50 @@
+/// The first words of xorshift64 from Marsaglia's own starting state, so the
+/// generator is the published one and not merely a deterministic one.
+test fn isMarsagliasXorshift64() -> Result<Unit, Error> {
+  var rng = Rng(state: 88172645463325252)
+  assertEqual(rng.next(), 8748534153485358512)?
+  assertEqual(rng.next(), 3040900993826735515)?
+  assertEqual(rng.next(), 3453997556048239312)?
+  Ok(())
+}
+
+test fn aSeedNamesOneSequence() -> Result<Unit, Error> {
+  var a = seeded(7)
+  var b = seeded(7)
+  var c = seeded(8)
+  var same = true
+  var differs = false
+  var turns = 0
+  while turns < 100 {
+    let x = a.next()
+    if x != b.next() {
+      same = false
+    }
+    if x != c.next() {
+      differs = true
+    }
+    turns += 1
+  }
+  assert(same)?
+  assert(differs)?
+  Ok(())
+}
+
+test fn drawsStayInRange() -> Result<Unit, Error> {
+  var rng = seeded(0)
+  var seen = Vector.of(0, 0, 0, 0, 0, 0, 0)
+  var turns = 0
+  while turns < 7000 {
+    let k = rng.below(7)
+    assert(k >= 0 && k < 7)?
+    seen.set(k, seen.get(k).unwrapOr(0) + 1)
+    let u = rng.unit()
+    assert(u >= 0.0 && u < 1.0)?
+    turns += 1
+  }
+  // Each of the seven about a thousand times.
+  for count in seen {
+    assert(count > 850 && count < 1150)?
+  }
+  Ok(())
+}

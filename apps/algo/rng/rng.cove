@@ -1,0 +1,58 @@
+// A seeded pseudo-random generator, in Cove: xorshift64 (Marsaglia, 2003),
+// whose whole state is one 64-bit word. Every random thing the playground
+// makes — a generated graph, a random formula, the points of a tour and the
+// moves of an annealing run — comes from one of these, so a seed names the
+// same input and the same run on every machine and every backend. The host's
+// `random` is not used: it cannot be replayed.
+//
+// Shifts and `bitXor` read an `Int` as a two's-complement word and never
+// stop the run, which is why the generator uses no multiplication: `*`
+// stops the run on overflow.
+
+/// The generator's state. Never zero.
+export struct Rng {
+  state: Int
+}
+
+/// A generator for `seed`. Every seed is fine, zero included: the seed is
+/// mixed with a fixed odd word, and a state that would come out zero is
+/// replaced.
+export fn seeded(seed: Int) -> Rng {
+  // 0x9E3779B97F4A7C15, the golden-ratio word, as a signed Int.
+  var state = seed.bitXor(-7046029254386353131)
+  if state == 0 {
+    state = 88172645463325252
+  }
+  var rng = Rng(state: state)
+  // A few turns so that nearby seeds do not start nearby.
+  var turns = 0
+  while turns < 8 {
+    rng.next()
+    turns += 1
+  }
+  rng
+}
+
+impl Rng {
+  /// The next 64-bit word, any sign.
+  fn next(var self) -> Int {
+    var x = self.state
+    x = x.bitXor(x.shiftLeft(13))
+    x = x.bitXor(x.shiftRightLogical(7))
+    x = x.bitXor(x.shiftLeft(17))
+    self.state = x
+    x
+  }
+
+  /// A whole number from 0 to `bound - 1`; `bound` must be positive. The top
+  /// 62 bits taken modulo `bound`: the bias is below 2^-40 for any bound the
+  /// playground asks for.
+  fn below(var self, bound: Int) -> Int {
+    self.next().shiftRightLogical(2) % bound
+  }
+
+  /// A number in [0, 1), with 53 random bits.
+  fn unit(var self) -> Float {
+    self.next().shiftRightLogical(11).toFloat() / 9007199254740992.0
+  }
+}

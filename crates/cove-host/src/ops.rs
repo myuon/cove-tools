@@ -158,7 +158,63 @@ pub fn app_detail(context: &OpsContext, slot: &Slot) -> Json {
         "recent_errors".into(),
         Json::Array(slot.counters.recent_errors()),
     );
+    object.insert("native".into(), native_report(slot));
     entry
+}
+
+/// What the native tier made of the current version: how many functions it
+/// compiled and which it left on the encoded tier, with the code generator's
+/// reason. A compiled function calling one of those runs it in the dispatch
+/// loop, and a run below such a call declines to yield (ADR 0085) — so this
+/// is where an app's `yields_declined` and `overdue_yields` are explained.
+/// `null` for a version on the encoded VM.
+fn native_report(slot: &Slot) -> Json {
+    let Some(app) = slot.current() else {
+        return Json::Null;
+    };
+    let Some(ready) = app.ready() else {
+        return Json::Null;
+    };
+    let Some(native) = ready.program.native() else {
+        return Json::Null;
+    };
+    let program = ready.program.program();
+    let refusals: Vec<Json> = native
+        .refusals()
+        .iter()
+        .map(|refused| {
+            let mut entry = json!({"function": refused.name, "reason": refused.reason});
+            // The instruction the code generator stopped at, and where the
+            // source wrote it.
+            let function = program.function(refused.id);
+            if let Some(pc) = refused.at.map(|pc| pc as usize) {
+                if let Some(inst) = function.code.get(pc) {
+                    let debug = format!("{inst:?}");
+                    let variant = debug
+                        .split(|c: char| !c.is_alphanumeric())
+                        .next()
+                        .unwrap_or_default();
+                    entry["instruction"] = json!(variant);
+                }
+                if let Some(span) = function.spans.get(pc) {
+                    let file = ready.sources.get(span.file);
+                    let (line, column) = file.line_col(span.start);
+                    entry["at"] = json!(format!(
+                        "{}:{line}:{column}",
+                        ready.sources.path(span.file).display()
+                    ));
+                    entry["source"] = json!(file.line_text(line).trim());
+                }
+            }
+            entry
+        })
+        .collect();
+    json!({
+        "reachable": native.reachable(),
+        "compiled": native.compiled(),
+        "refused": native.refused(),
+        "refusals": refusals,
+    })
 }
 
 /// Escapes text for HTML.

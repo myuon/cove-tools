@@ -85,7 +85,40 @@ pub struct Flight {
     pub accepted: Instant,
     pub reply: oneshot::Sender<Reply>,
     pub cancel: Cancel,
+    /// What the run has cost so far, for its answer's [`RUN_HEADERS`].
+    pub tally: Tally,
 }
+
+/// What one request's run cost, counted across its slices and parks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tally {
+    pub yields: u64,
+    pub parks: u64,
+    /// Time on a worker, every slice summed.
+    pub worker: Duration,
+}
+
+/// The headers every answer of a run carries, saying what the run cost: the
+/// runtime's fuel and instruction counts, how often it yielded, declined to
+/// yield and parked, its time on a worker and from admission to answer (both
+/// in microseconds). An app cannot read its own meter, so this is where a page
+/// that wants to show "this took N instructions" finds it — `fetch` the page
+/// and read the headers.
+pub const RUN_HEADERS: [&str; 7] = [
+    "x-cove-run-fuel",
+    "x-cove-run-instructions",
+    "x-cove-run-yields",
+    "x-cove-run-yields-declined",
+    "x-cove-run-parks",
+    "x-cove-run-worker-us",
+    "x-cove-run-wall-us",
+];
+
+/// The header a run that a limit stopped is answered with: the
+/// [`ErrorKind`]'s name — `fuel`, `deadline`, `cancelled`, `host_calls`,
+/// `call_depth`, `heap`, `queue_timeout`, … — so a page can say why without
+/// reading the diagnostic.
+pub const STOP_HEADER: &str = "x-cove-stop";
 
 /// Calls a request off: raised by the HTTP side when the client goes away
 /// before its answer.
@@ -603,7 +636,10 @@ impl Engine {
     fn run_job(self: &Arc<Self>, worker: usize, job: Job) {
         match job {
             Job::Start(start) => {
-                let Start { request, flight } = *start;
+                let Start {
+                    request,
+                    mut flight,
+                } = *start;
                 let app = Arc::clone(&flight.version);
                 let ready = app.ready().expect("only a loaded app is admitted");
                 if flight.cancel.is_cancelled() {
@@ -633,7 +669,7 @@ impl Engine {
                 let budget =
                     Budget::with_cancellation(app.limits.run.clone(), flight.cancel.flag.clone());
                 let signal = vm.yield_request();
-                let step = self.sliced(worker, &app, signal, || {
+                let step = self.sliced(worker, &app, &mut flight.tally, signal, || {
                     let argument = request_value(&request);
                     vm.invoke_within_parkable(
                         budget,
@@ -648,13 +684,15 @@ impl Engine {
                 let Resume {
                     parked,
                     answer,
-                    flight,
+                    mut flight,
                 } = *resume;
                 let step = match answer {
                     Some(answer) => {
                         let signal = parked.yield_request();
                         let version = Arc::clone(&flight.version);
-                        self.sliced(worker, &version, signal, || parked.resume(answer))
+                        self.sliced(worker, &version, &mut flight.tally, signal, || {
+                            parked.resume(answer)
+                        })
                     }
                     None => {
                         let (vm, error) = parked.cancel();
@@ -664,10 +702,15 @@ impl Engine {
                 self.settle(step, flight);
             }
             Job::Continue(cont) => {
-                let Continue { yielded, flight } = *cont;
+                let Continue {
+                    yielded,
+                    mut flight,
+                } = *cont;
                 let signal = yielded.yield_request();
                 let version = Arc::clone(&flight.version);
-                let step = self.sliced(worker, &version, signal, || yielded.resume());
+                let step = self.sliced(worker, &version, &mut flight.tally, signal, || {
+                    yielded.resume()
+                });
                 self.settle(step, flight);
             }
         }
@@ -679,6 +722,7 @@ impl Engine {
         &self,
         worker: usize,
         app: &Arc<App>,
+        tally: &mut Tally,
         signal: YieldRequest,
         step: impl FnOnce() -> Step,
     ) -> Step {
@@ -696,31 +740,51 @@ impl Engine {
         if self.slice.is_some() {
             *self.running[worker].lock().unwrap() = None;
         }
+        let held = since.elapsed();
+        tally.worker += held;
         app.counters
             .worker_ns
-            .fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add(held.as_nanos() as u64, Ordering::Relaxed);
         step
     }
 
     /// Answers `flight` with `reply`, counted as `kind`.
     fn fail(&self, flight: Flight, kind: ErrorKind, reply: Reply) {
+        self.fail_metered(flight, kind, reply, None);
+    }
+
+    /// [`Engine::fail`], for a run that got as far as running: its meter.
+    fn fail_metered(
+        &self,
+        flight: Flight,
+        kind: ErrorKind,
+        reply: Reply,
+        meter: Option<(u64, u64, u64)>,
+    ) {
         let app = &flight.version;
         app.counters.error(kind);
         app.counters
             .recent_error(kind, &app.version, reply.body.as_str());
-        let reply = reply.with_header(VERSION_HEADER, app.version.as_str());
+        let reply = with_run_headers(reply, &flight, meter)
+            .with_header(STOP_HEADER, kind.name())
+            .with_header(VERSION_HEADER, app.version.as_str());
         let _ = flight.reply.send(reply);
         self.queue.finished(flight.app);
     }
 
     /// What a run came to: an answer to send, a park to hand on, or a yield
     /// to queue.
-    fn settle(self: &Arc<Self>, step: Step, flight: Flight) {
+    fn settle(self: &Arc<Self>, step: Step, mut flight: Flight) {
         let app = Arc::clone(&flight.version);
         let counters = &app.counters;
         match step {
             Step::Answered(vm, outcome) => {
                 let heap = vm.heap_words();
+                let meter = (
+                    vm.meter().fuel_spent(),
+                    vm.instructions(),
+                    vm.yields_declined(),
+                );
                 counters
                     .instructions
                     .fetch_add(vm.instructions(), Ordering::Relaxed);
@@ -770,7 +834,8 @@ impl Engine {
                     Ok(reply) => {
                         counters.served.fetch_add(1, Ordering::Relaxed);
                         counters.ok.fetch_add(1, Ordering::Relaxed);
-                        let reply = reply.with_header(VERSION_HEADER, app.version.as_str());
+                        let reply = with_run_headers(reply, &flight, Some(meter))
+                            .with_header(VERSION_HEADER, app.version.as_str());
                         let _ = flight.reply.send(reply);
                         self.queue.finished(flight.app);
                     }
@@ -786,11 +851,17 @@ impl Engine {
                         if kind != ErrorKind::Cancelled {
                             eprintln!("cove-host: [{}] {line}", app.name);
                         }
-                        self.fail(flight, kind, Reply::text(kind.status(), body));
+                        self.fail_metered(
+                            flight,
+                            kind,
+                            Reply::text(kind.status(), body),
+                            Some(meter),
+                        );
                     }
                 }
             }
             Step::Parked(mut parked) => {
+                flight.tally.parks += 1;
                 counters.parks.fetch_add(1, Ordering::Relaxed);
                 counters.parked.fetch_add(1, Ordering::Relaxed);
                 match parked.take_request().map(|r| r.downcast::<PendingWork>()) {
@@ -820,6 +891,7 @@ impl Engine {
                 }
             }
             Step::Yielded(yielded) => {
+                flight.tally.yields += 1;
                 counters.yields.fetch_add(1, Ordering::Relaxed);
                 let app = flight.app;
                 self.queue
@@ -925,6 +997,26 @@ async fn sleep_at_most(left: Duration) {
         }
         _ => std::future::pending().await,
     }
+}
+
+/// `reply` with the [`RUN_HEADERS`] of a run that has `tally` and, if it ran
+/// to an answer, `fuel`, `instructions` and `declined` yields.
+fn with_run_headers(reply: Reply, flight: &Flight, meter: Option<(u64, u64, u64)>) -> Reply {
+    let (fuel, instructions, declined) = meter.unwrap_or_default();
+    let values = [
+        fuel,
+        instructions,
+        flight.tally.yields,
+        declined,
+        flight.tally.parks,
+        flight.tally.worker.as_micros() as u64,
+        flight.accepted.elapsed().as_micros() as u64,
+    ];
+    let mut reply = reply;
+    for (name, value) in RUN_HEADERS.iter().zip(values) {
+        reply = reply.with_header(name, value.to_string());
+    }
+    reply
 }
 
 fn first_line(text: &str) -> &str {
