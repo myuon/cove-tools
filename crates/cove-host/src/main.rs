@@ -95,6 +95,26 @@ enum Command {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Route to a disabled app again (kept across restarts).
+    Enable {
+        app: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Stop routing to an app, keeping it loaded and its data (kept across
+    /// restarts). Works on the admin app too, which the admin app cannot do.
+    Disable {
+        app: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Drop the admin app's changes to an app's grant, allowlist and limits,
+    /// and reload it from its app.toml.
+    Reset {
+        app: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Check apps against the host's schemas and grants; non-zero if any
     /// would be refused.
     Check {
@@ -236,6 +256,17 @@ fn main() -> ExitCode {
         }
         Command::Remove { app, admin: args } => {
             admin(&args, reqwest::Method::DELETE, &format!("/apps/{app}"))
+        }
+        Command::Enable { app, admin: args } => {
+            admin(&args, reqwest::Method::POST, &format!("/apps/{app}/enable"))
+        }
+        Command::Disable { app, admin: args } => admin(
+            &args,
+            reqwest::Method::POST,
+            &format!("/apps/{app}/disable"),
+        ),
+        Command::Reset { app, admin: args } => {
+            admin(&args, reqwest::Method::POST, &format!("/apps/{app}/reset"))
         }
         Command::Check { apps, names } => {
             finish(toolchain::check(&apps, &names, &HostModules::standard()))

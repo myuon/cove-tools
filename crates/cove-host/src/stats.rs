@@ -102,6 +102,8 @@ pub enum Rejection {
     TooLarge,
     /// The request was malformed: a body that is not UTF-8 (400).
     BadRequest,
+    /// The app is disabled by the administrator (503).
+    Disabled,
 }
 
 /// One app's counters.
@@ -116,6 +118,7 @@ pub struct AppCounters {
     pub rejected_server_busy: AtomicU64,
     pub rejected_too_large: AtomicU64,
     pub rejected_bad_request: AtomicU64,
+    pub rejected_disabled: AtomicU64,
     /// Runs parked at a host call, now.
     pub parked: AtomicU64,
     /// Parks, summed over every run.
@@ -197,6 +200,7 @@ impl AppCounters {
             Rejection::ServerBusy => &self.rejected_server_busy,
             Rejection::TooLarge => &self.rejected_too_large,
             Rejection::BadRequest => &self.rejected_bad_request,
+            Rejection::Disabled => &self.rejected_disabled,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -218,6 +222,7 @@ impl AppCounters {
                 "server_busy": read(&self.rejected_server_busy),
                 "too_large": read(&self.rejected_too_large),
                 "bad_request": read(&self.rejected_bad_request),
+                "disabled": read(&self.rejected_disabled),
             },
             "in_flight": in_flight,
             "queued": queued,

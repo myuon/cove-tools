@@ -24,9 +24,12 @@ use cove_sema::package::{Module, Package, Unit};
 use cove_sema::resolve::Program;
 use cove_sema::{Compiler, Config, HostSchemas};
 
-use crate::config::{read_app, AppConfig, AppLimits, FetchPolicy, KvLimits, Secrets};
+use crate::config::{
+    read_app_with, AppConfig, AppLimits, AppOverride, FetchPolicy, KvLimits, Secrets, ADMIN_APP,
+};
 use crate::hosts::{AppContext, HostModules};
 use crate::logs::LogRing;
+use crate::overrides::Control;
 use crate::stats::AppCounters;
 
 /// Which tier runs an app's requests.
@@ -66,6 +69,8 @@ pub struct LoadOptions {
     pub data: Option<PathBuf>,
     /// The I/O runtime the modules wait on.
     pub io: tokio::runtime::Handle,
+    /// What the admin app's `host` module acts on; given to that app only.
+    pub control: Option<Arc<Control>>,
 }
 
 /// One app, ready or refused.
@@ -93,6 +98,13 @@ pub struct App {
     pub fetch: FetchPolicy,
     /// What `auth.check` compares against; never shown.
     pub secrets: Secrets,
+    /// `[route] hosts`: the hostnames that reach this app, and the only
+    /// way to it when there are any.
+    pub hosts: Vec<String>,
+    /// `[fetch] allow` as configured, for the admin app to show and edit.
+    pub fetch_allow: Vec<String>,
+    /// The admin's changes this version was loaded with, if any.
+    pub overridden: Option<AppOverride>,
     pub counters: Arc<AppCounters>,
     /// The app's recent log lines: its `log.*` and the host's lines about it.
     pub logs: Arc<LogRing>,
@@ -151,6 +163,18 @@ impl App {
         data: Option<&Path>,
         io: &tokio::runtime::Handle,
     ) -> AppContext {
+        self.context_with(quiet, data, io, None)
+    }
+
+    /// [`App::context`], with the host's control for the admin app — and
+    /// for no other app, whatever it is granted.
+    pub fn context_with(
+        &self,
+        quiet: bool,
+        data: Option<&Path>,
+        io: &tokio::runtime::Handle,
+        control: Option<&Arc<Control>>,
+    ) -> AppContext {
         AppContext {
             app: self.name.clone(),
             quiet,
@@ -162,6 +186,7 @@ impl App {
             fetch: self.fetch.clone(),
             secrets: self.secrets.clone(),
             io: io.clone(),
+            control: control.filter(|_| self.name == ADMIN_APP).cloned(),
         }
     }
 
@@ -246,7 +271,7 @@ pub fn load_all(root: &Path, options: &LoadOptions) -> Result<Vec<App>, String> 
 /// An app as its directory and config describe it, before anything is
 /// compiled; refused if the config does not read.
 pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
-    describe_as(name, dir, Lineage::first())
+    describe_as(name, dir, Lineage::first(), None)
 }
 
 /// What a version of an app inherits from the versions before it: its
@@ -269,8 +294,14 @@ impl Lineage {
     }
 }
 
-/// [`describe`], for version `lineage.number` of an app.
-pub fn describe_as(name: &str, dir: &Path, lineage: Lineage) -> (App, Option<AppConfig>) {
+/// [`describe`], for version `lineage.number` of an app, with the admin's
+/// changes `over` applied to its `app.toml`.
+pub fn describe_as(
+    name: &str,
+    dir: &Path,
+    lineage: Lineage,
+    over: Option<&AppOverride>,
+) -> (App, Option<AppConfig>) {
     let mut app = App {
         name: name.to_string(),
         number: lineage.number,
@@ -284,6 +315,9 @@ pub fn describe_as(name: &str, dir: &Path, lineage: Lineage) -> (App, Option<App
         kv: KvLimits::default(),
         fetch: FetchPolicy::default(),
         secrets: Secrets::default(),
+        hosts: Vec::new(),
+        fetch_allow: Vec::new(),
+        overridden: over.filter(|over| over.changes_config()).cloned(),
         counters: lineage.counters,
         logs: lineage.logs,
         state: AppState::Refused(String::new()),
@@ -292,8 +326,10 @@ pub fn describe_as(name: &str, dir: &Path, lineage: Lineage) -> (App, Option<App
         app.state = AppState::Refused(why);
         return (app, None);
     }
-    match read_app(dir, name) {
+    match read_app_with(dir, name, over) {
         Ok(config) => {
+            app.hosts = config.hosts.clone();
+            app.fetch_allow = config.file_allow.clone();
             app.entry = config.entry.clone();
             app.granted = config.granted.clone();
             app.limits = config.limits.clone();
@@ -371,9 +407,26 @@ pub fn load(name: &str, dir: &Path, options: &LoadOptions) -> App {
 }
 
 /// [`load`], as version `lineage.number` of an app: the host's update. The
-/// app's log goes to `<data>/<app>/log.txt` as well as its ring.
+/// app's log goes to `<data>/<app>/log.txt` as well as its ring. The
+/// admin's stored changes to the app, if any, are applied.
 pub fn load_as(name: &str, dir: &Path, options: &LoadOptions, lineage: Lineage) -> App {
-    let (mut app, config) = describe_as(name, dir, lineage);
+    let over = options
+        .control
+        .as_ref()
+        .and_then(|control| control.overrides.get(name));
+    load_with(name, dir, options, lineage, over.as_ref())
+}
+
+/// [`load_as`], with `over` as the admin's changes — the candidate a
+/// change is tried with before it is kept.
+pub fn load_with(
+    name: &str,
+    dir: &Path,
+    options: &LoadOptions,
+    lineage: Lineage,
+    over: Option<&AppOverride>,
+) -> App {
+    let (mut app, config) = describe_as(name, dir, lineage, over);
     if let Some(data) = &options.data {
         if valid_name(name).is_ok() {
             app.logs.attach(data.join(name).join("log.txt"));
@@ -450,13 +503,18 @@ pub fn admit(app: &mut App, compiled: &Compiled) -> Result<(), String> {
     let missing: Vec<String> = app.required.difference(&app.granted).cloned().collect();
     if !missing.is_empty() {
         return Err(format!(
-            "`{}` requires {}, which app.toml does not grant",
+            "`{}` requires {}, which {} does not grant",
             app.entry,
             missing
                 .iter()
                 .map(|name| format!("`{name}`"))
                 .collect::<Vec<_>>()
-                .join(" and ")
+                .join(" and "),
+            if app.overridden.is_some() {
+                "app.toml with the admin's changes"
+            } else {
+                "app.toml"
+            }
         ));
     }
     Ok(())
@@ -547,7 +605,12 @@ fn prepare(app: &mut App, options: &LoadOptions) -> Result<Ready, String> {
 
     let (module, function) = app.entry.split_once('.').unwrap_or_default();
     let (module, function) = (module.to_string(), function.to_string());
-    let context = app.context(options.quiet, options.data.as_deref(), &options.io);
+    let context = app.context_with(
+        options.quiet,
+        options.data.as_deref(),
+        &options.io,
+        options.control.as_ref(),
+    );
     let hosts = Arc::new(options.modules.registry(&app.granted, &context)?);
     let sources = Arc::new(compiled.sources);
     let runtime = Arc::new(Runtime::new(

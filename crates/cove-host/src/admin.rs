@@ -12,7 +12,14 @@
 //! | --- | --- |
 //! | `POST /apps/<app>/update` | loads `<apps>/<app>` as the app's next version and routes to it if it loads; a new name adds the app. 200 with the old and new versions; 422 with the diagnostics, the current version still serving; 404 for no such directory |
 //! | `DELETE /apps/<app>` | stops routing to the app; what is in flight finishes |
+//! | `POST /apps/<app>/enable`, `/disable` | routes to the app again, or stops ([`crate::manage`]); its data stays |
+//! | `POST /apps/<app>/reset` | drops the admin app's changes to the app's configuration and reloads it from `app.toml` |
 //! | `GET /apps` | the stats, as `GET /_host/stats` |
+//! | `GET /changes?n=50` | the change history, newest first, as JSON |
+//!
+//! These are the emergency exits when the admin app is broken or locked
+//! out: they do not go through it, and they may do what it may not —
+//! disable the admin app, or reset it.
 //!
 //! Anything without the token is 401, and changes nothing — except, under
 //! `--ops-listener admin`, a `GET` under `/_host/` ([`crate::ops`]): the
@@ -36,6 +43,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
 
 use crate::convert::Reply;
+use crate::manage::{ChangeError, Via};
 use crate::ops::{self, OpsListener};
 use crate::server::{is_ops_path, json_reply, to_response, Front, UpdateError};
 
@@ -99,14 +107,43 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
     }
     let path = request.uri().path().to_string();
     let method = request.method().clone();
-    let name = path
-        .strip_prefix("/apps/")
-        .map(|rest| rest.trim_end_matches("/update"))
-        .unwrap_or_default()
-        .to_string();
+    let (name, verb) = match path.strip_prefix("/apps/") {
+        Some(rest) => match rest.split_once('/') {
+            Some((name, verb)) => (name.to_string(), verb.to_string()),
+            None => (rest.to_string(), String::new()),
+        },
+        None => (String::new(), String::new()),
+    };
+    let changed = |result: Result<String, ChangeError>| match result {
+        Ok(message) => Reply::text(200, format!("{message}\n")),
+        Err(ChangeError::NotFound(why)) => Reply::text(404, format!("{why}\n")),
+        Err(ChangeError::Refused(why)) => Reply::text(422, format!("{why}\n")),
+    };
     match (method, path.as_str()) {
         (Method::GET, "/apps") => json_reply(&ops::stats(&front_ops(front))),
-        (Method::POST, _) if path.ends_with("/update") && !name.is_empty() => {
+        (Method::GET, "/changes") => {
+            let n = request
+                .uri()
+                .query()
+                .and_then(|query| {
+                    form_urlencoded::parse(query.as_bytes())
+                        .find(|(key, _)| key == "n")
+                        .and_then(|(_, n)| n.parse().ok())
+                })
+                .unwrap_or(50);
+            json_reply(&json!(front.control.history.newest(n)))
+        }
+        (Method::POST, _) if !name.is_empty() && (verb == "enable" || verb == "disable") => {
+            changed(
+                front
+                    .set_enabled(&name, verb == "enable", &Via::Listener)
+                    .await,
+            )
+        }
+        (Method::POST, _) if !name.is_empty() && verb == "reset" => {
+            changed(front.reset(&name, &Via::Listener).await)
+        }
+        (Method::POST, _) if verb == "update" && !name.is_empty() => {
             match front.update(&name).await {
                 Ok(installed) => {
                     let mut reply = json_reply(&json!({
@@ -127,15 +164,14 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
                 ),
             }
         }
-        (Method::DELETE, _) if !name.is_empty() && !name.contains('/') => {
-            match front.remove(&name) {
-                Some(version) => Reply::text(200, format!("removed `{name}` (was {version})\n")),
-                None => Reply::text(404, format!("no app named `{name}` is routed to\n")),
-            }
-        }
+        (Method::DELETE, _) if !name.is_empty() && verb.is_empty() => match front.remove(&name) {
+            Some(version) => Reply::text(200, format!("removed `{name}` (was {version})\n")),
+            None => Reply::text(404, format!("no app named `{name}` is routed to\n")),
+        },
         _ => Reply::text(
             404,
-            "cove-host admin: POST /apps/<app>/update, DELETE /apps/<app>, GET /apps\n",
+            "cove-host admin: POST /apps/<app>/update, DELETE /apps/<app>, \
+             POST /apps/<app>/enable|disable|reset, GET /apps, GET /changes\n",
         ),
     }
 }

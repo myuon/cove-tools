@@ -16,8 +16,16 @@
 //! | neither (the default) | `http`, whatever the client sent | its `Host` |
 //!
 //! `x-forwarded-host` is removed in every case: `host` is the one answer.
-//! `--public-origin` is the one to use behind a proxy that serves one
-//! hostname; it does not depend on what the proxy forwards.
+//! `--public-origin` is the one to use behind a proxy; it does not depend on
+//! what the proxy forwards.
+//!
+//! **An app reached by hostname** (`[route] hosts`, [`crate::router`]) has
+//! that hostname as its origin: under `--public-origin
+//! https://covtools.example`, a request routed by `Host:
+//! admin.covtools.example` is told `https` and `admin.covtools.example` (the
+//! public origin's scheme, and its port if it has one), so each hostname a
+//! proxy serves is its own origin. The name is the one the route matched,
+//! never a header the client chose.
 
 use std::collections::BTreeMap;
 
@@ -59,6 +67,14 @@ impl std::str::FromStr for PublicOrigin {
     }
 }
 
+impl PublicOrigin {
+    /// The port, when the origin names one.
+    pub fn port(&self) -> Option<&str> {
+        let after_v6 = self.authority.rsplit(']').next().unwrap_or_default();
+        after_v6.rsplit_once(':').map(|(_, port)| port)
+    }
+}
+
 impl std::fmt::Display for PublicOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}://{}", self.scheme, self.authority)
@@ -77,12 +93,22 @@ pub struct Forwarding {
 
 impl Forwarding {
     /// Rewrites `headers` (lower-case names, repeated values joined with
-    /// `, `) to what the app is told.
-    pub fn apply(&self, headers: &mut BTreeMap<String, String>) {
+    /// `, `) to what the app is told. `hostname` is the name the request was
+    /// routed by, for an app reached by hostname.
+    pub fn apply(&self, headers: &mut BTreeMap<String, String>, hostname: Option<&str>) {
         let forwarded_host = headers.remove("x-forwarded-host");
         let forwarded_proto = headers.remove("x-forwarded-proto");
         let (proto, host) = match &self.public_origin {
-            Some(origin) => (origin.scheme.clone(), Some(origin.authority.clone())),
+            Some(origin) => {
+                let authority = match hostname {
+                    Some(name) => match origin.port() {
+                        Some(port) => format!("{name}:{port}"),
+                        None => name.to_string(),
+                    },
+                    None => origin.authority.clone(),
+                };
+                (origin.scheme.clone(), Some(authority))
+            }
             None if self.trust_proxy => {
                 let proto = forwarded_proto
                     .as_deref()
@@ -140,7 +166,7 @@ mod tests {
             ("x-forwarded-proto", "https"),
             ("x-forwarded-host", "evil.example"),
         ]);
-        Forwarding::default().apply(&mut h);
+        Forwarding::default().apply(&mut h, None);
         assert_eq!(h["x-forwarded-proto"], "http");
         assert_eq!(h["host"], "localhost:8790");
         assert!(!h.contains_key("x-forwarded-host"));
@@ -157,17 +183,17 @@ mod tests {
             ("x-forwarded-proto", "https, http"),
             ("x-forwarded-host", "covtools.example"),
         ]);
-        trust.apply(&mut h);
+        trust.apply(&mut h, None);
         assert_eq!(h["x-forwarded-proto"], "https");
         assert_eq!(h["host"], "covtools.example");
         // Without the forwarded headers, the request's own.
         let mut h = headers(&[("host", "covtools.example")]);
-        trust.apply(&mut h);
+        trust.apply(&mut h, None);
         assert_eq!(h["x-forwarded-proto"], "http");
         assert_eq!(h["host"], "covtools.example");
         // Nonsense is not believed.
         let mut h = headers(&[("host", "a"), ("x-forwarded-proto", "gopher")]);
-        trust.apply(&mut h);
+        trust.apply(&mut h, None);
         assert_eq!(h["x-forwarded-proto"], "http");
     }
 
@@ -182,9 +208,33 @@ mod tests {
             ("x-forwarded-proto", "http"),
             ("x-forwarded-host", "evil.example"),
         ]);
-        fixed.apply(&mut h);
+        fixed.apply(&mut h, None);
         assert_eq!(h["x-forwarded-proto"], "https");
         assert_eq!(h["host"], "covtools.example");
         assert!(!h.contains_key("x-forwarded-host"));
+    }
+
+    #[test]
+    fn a_hostname_route_is_its_own_origin() {
+        let fixed = Forwarding {
+            public_origin: Some("https://covtools.example".parse().unwrap()),
+            trust_proxy: false,
+        };
+        let mut h = headers(&[("host", "admin.covtools.example")]);
+        fixed.apply(&mut h, Some("admin.covtools.example"));
+        assert_eq!(h["x-forwarded-proto"], "https");
+        assert_eq!(h["host"], "admin.covtools.example");
+        let with_port = Forwarding {
+            public_origin: Some("http://h.example:8790".parse().unwrap()),
+            trust_proxy: false,
+        };
+        let mut h = headers(&[("host", "localhost")]);
+        with_port.apply(&mut h, Some("admin.localhost"));
+        assert_eq!(h["host"], "admin.localhost:8790");
+        assert_eq!(
+            with_port.public_origin.as_ref().unwrap().port(),
+            Some("8790")
+        );
+        assert_eq!(fixed.public_origin.as_ref().unwrap().port(), None);
     }
 }

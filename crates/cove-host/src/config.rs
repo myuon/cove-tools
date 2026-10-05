@@ -14,7 +14,16 @@
 //! max_queued = 64                 # requests waiting to start, this app
 //! max_request_bytes = 1048576     # request body
 //! max_response_bytes = 1048576    # response body
+//!
+//! [route]
+//! hosts = ["admin.example"]       # reached by these hostnames only, not /<name>/
 //! ```
+//!
+//! What `app.toml` says can be changed at run time by the admin app
+//! ([`AppOverride`], kept in the data directory by [`crate::overrides`]): the
+//! grant, the fetch allowlist and the limits. An override is applied to the
+//! file as written before anything is validated, so an overridden config is
+//! held to every rule an `app.toml` is.
 //!
 //! Every key is optional and an unknown one is refused: a misspelt limit would
 //! otherwise be a limit silently not applied. A refusal is the app's alone —
@@ -25,7 +34,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use cove_runtime::Limits;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// The capability of the `admin` host module: listing the apps and changing
+/// their configuration.
+pub const ADMIN_CAPABILITY: &str = "admin";
+
+/// The one app that may be granted [`ADMIN_CAPABILITY`]. Granting it to any
+/// other app — in its `app.toml` or through an override — refuses that app.
+pub const ADMIN_APP: &str = "admin";
 
 /// The runtime's fixed per-run heap, in words.
 ///
@@ -56,6 +73,19 @@ pub struct AppFile {
     /// (`auth.check`), never read.
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretFile>,
+    #[serde(default)]
+    pub route: RouteFile,
+}
+
+/// `[route]` as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteFile {
+    /// Hostnames that reach this app with the whole path. An app that has
+    /// any is reached by them only: `/<name>/` on another hostname is not
+    /// it.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// One `[secrets]` entry: where its value comes from.
@@ -254,19 +284,173 @@ impl FetchPolicy {
     }
 }
 
-/// `[limits]` as written.
-#[derive(Debug, Default, Deserialize)]
+/// `[limits]` as written; also what an override sets, key by key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuel: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_host_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_call_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_heap_words: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_in_flight: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queued: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_response_bytes: Option<usize>,
+}
+
+impl LimitsFile {
+    /// Whether no key is set.
+    pub fn is_empty(&self) -> bool {
+        *self == LimitsFile::default()
+    }
+
+    /// `self`, with every key `over` sets replaced.
+    fn overlaid(self, over: &LimitsFile) -> LimitsFile {
+        LimitsFile {
+            fuel: over.fuel.or(self.fuel),
+            max_host_calls: over.max_host_calls.or(self.max_host_calls),
+            deadline: over.deadline.clone().or(self.deadline),
+            max_call_depth: over.max_call_depth.or(self.max_call_depth),
+            max_heap_words: over.max_heap_words.or(self.max_heap_words),
+            max_in_flight: over.max_in_flight.or(self.max_in_flight),
+            max_queued: over.max_queued.or(self.max_queued),
+            max_request_bytes: over.max_request_bytes.or(self.max_request_bytes),
+            max_response_bytes: over.max_response_bytes.or(self.max_response_bytes),
+        }
+    }
+}
+
+/// What the admin app changed of an app's `app.toml`, kept in the data
+/// directory rather than in the file: a release replaces `apps/` wholesale,
+/// and the change has to outlive it.
+///
+/// Sets are kept as what was added and removed relative to the file, not as
+/// the whole set, so that a release whose `app.toml` grants something new
+/// still grants it — unless that very capability was removed here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppOverride {
+    /// `false`: the app is loaded but not routed to.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_add: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_remove: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetch_allow_add: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetch_allow_remove: Vec<String>,
+    #[serde(default, skip_serializing_if = "LimitsFile::is_empty")]
+    pub limits: LimitsFile,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+impl AppOverride {
+    /// The default: enabled, nothing changed.
+    pub fn none() -> AppOverride {
+        AppOverride {
+            enabled: true,
+            ..AppOverride::default()
+        }
+    }
+
+    /// Whether this changes nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == AppOverride::none()
+    }
+
+    /// Whether it changes the configuration (anything but `enabled`).
+    pub fn changes_config(&self) -> bool {
+        AppOverride {
+            enabled: true,
+            ..self.clone()
+        } != AppOverride::none()
+    }
+
+    /// The override that turns the app's own configuration — `file`, as
+    /// its `app.toml` reads with no override — into `grant`, `allow` and
+    /// `limits`; `enabled` as given. A limit equal to what the file already
+    /// comes to is no change and is not kept, so that a later release's
+    /// `app.toml` is not masked by a value nobody changed.
+    pub fn between(
+        file: &AppConfig,
+        grant: &BTreeSet<String>,
+        allow: &[String],
+        limits: &LimitsFile,
+        enabled: bool,
+    ) -> AppOverride {
+        let file_allow: BTreeSet<String> = file.file_allow.iter().cloned().collect();
+        let allow: BTreeSet<String> = allow.iter().cloned().collect();
+        let theirs = file.limits.as_file();
+        let differs = |mine: &Option<u64>, theirs: &Option<u64>| mine.filter(|_| mine != theirs);
+        let differs_usize =
+            |mine: &Option<usize>, theirs: &Option<usize>| mine.filter(|_| mine != theirs);
+        let limits = LimitsFile {
+            fuel: differs(&limits.fuel, &theirs.fuel),
+            max_host_calls: differs(&limits.max_host_calls, &theirs.max_host_calls),
+            deadline: limits.deadline.clone().filter(|mine| {
+                let parsed = |text: &Option<String>| {
+                    text.as_deref().and_then(|text| parse_duration(text).ok())
+                };
+                parsed(&Some(mine.clone())) != parsed(&theirs.deadline)
+            }),
+            max_call_depth: differs_usize(&limits.max_call_depth, &theirs.max_call_depth),
+            max_heap_words: differs(&limits.max_heap_words, &theirs.max_heap_words),
+            max_in_flight: differs_usize(&limits.max_in_flight, &theirs.max_in_flight),
+            max_queued: differs_usize(&limits.max_queued, &theirs.max_queued),
+            max_request_bytes: differs_usize(&limits.max_request_bytes, &theirs.max_request_bytes),
+            max_response_bytes: differs_usize(
+                &limits.max_response_bytes,
+                &theirs.max_response_bytes,
+            ),
+        };
+        AppOverride {
+            enabled,
+            grant_add: grant.difference(&file.granted).cloned().collect(),
+            grant_remove: file.granted.difference(grant).cloned().collect(),
+            fetch_allow_add: allow.difference(&file_allow).cloned().collect(),
+            fetch_allow_remove: file_allow.difference(&allow).cloned().collect(),
+            limits,
+        }
+    }
+
+    /// `file` with this override applied.
+    fn apply(&self, mut file: AppFile) -> AppFile {
+        let mut grant: BTreeSet<String> = file.grant.into_iter().collect();
+        grant.extend(self.grant_add.iter().cloned());
+        for gone in &self.grant_remove {
+            grant.remove(gone);
+        }
+        file.grant = grant.into_iter().collect();
+        let mut allow = file.fetch.allow;
+        for added in &self.fetch_allow_add {
+            if !allow.contains(added) {
+                allow.push(added.clone());
+            }
+        }
+        allow.retain(|entry| !self.fetch_allow_remove.contains(entry));
+        file.fetch.allow = allow;
+        file.limits = std::mem::take(&mut file.limits).overlaid(&self.limits);
+        file
+    }
 }
 
 /// What bounds one app, with the defaults filled in.
@@ -314,6 +498,27 @@ impl Default for AppLimits {
     }
 }
 
+impl AppLimits {
+    /// These limits as `[limits]` would write them, every key set but a
+    /// heap limit that is not.
+    pub fn as_file(&self) -> LimitsFile {
+        LimitsFile {
+            fuel: self.run.fuel,
+            max_host_calls: self.run.max_host_calls,
+            deadline: self
+                .run
+                .deadline
+                .map(|deadline| format!("{}ms", deadline.as_millis())),
+            max_call_depth: self.run.max_call_depth,
+            max_heap_words: self.max_heap_words,
+            max_in_flight: Some(self.max_in_flight),
+            max_queued: Some(self.max_queued),
+            max_request_bytes: Some(self.max_request_bytes),
+            max_response_bytes: Some(self.max_response_bytes),
+        }
+    }
+}
+
 /// An app's configuration, read and validated.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -323,14 +528,33 @@ pub struct AppConfig {
     pub kv: KvLimits,
     pub fetch: FetchPolicy,
     pub secrets: Secrets,
+    /// `[route] hosts`, lower-cased.
+    pub hosts: Vec<String>,
+    /// `[fetch] allow` as written, after any override: the entries the
+    /// admin app edits.
+    pub file_allow: Vec<String>,
 }
 
 /// Reads `dir/app.toml` for the app `name`.
 pub fn read_app(dir: &Path, name: &str) -> Result<AppConfig, String> {
+    read_app_with(dir, name, None)
+}
+
+/// [`read_app`], with `over` applied to the file before it is validated.
+pub fn read_app_with(
+    dir: &Path,
+    name: &str,
+    over: Option<&AppOverride>,
+) -> Result<AppConfig, String> {
     let path = dir.join("app.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
-    parse_app_in(&text, name, Some(dir)).map_err(|e| format!("`{}`: {e}", path.display()))
+    parse_app_with(&text, name, Some(dir), over).map_err(|e| match over {
+        Some(over) if over.changes_config() => {
+            format!("`{}` with the admin's changes: {e}", path.display())
+        }
+        _ => format!("`{}`: {e}", path.display()),
+    })
 }
 
 /// Parses an `app.toml` for the app `name`.
@@ -340,7 +564,22 @@ pub fn parse_app(text: &str, name: &str) -> Result<AppConfig, String> {
 
 /// [`parse_app`], with `file` secrets read relative to `dir`.
 pub fn parse_app_in(text: &str, name: &str, dir: Option<&Path>) -> Result<AppConfig, String> {
+    parse_app_with(text, name, dir, None)
+}
+
+/// [`parse_app_in`], with `over` applied to the file before anything is
+/// validated.
+pub fn parse_app_with(
+    text: &str,
+    name: &str,
+    dir: Option<&Path>,
+    over: Option<&AppOverride>,
+) -> Result<AppConfig, String> {
     let file: AppFile = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    let file = match over {
+        Some(over) => over.apply(file),
+        None => file,
+    };
     let defaults = AppLimits::default();
     let l = file.limits;
     let deadline = match l.deadline {
@@ -374,6 +613,48 @@ pub fn parse_app_in(text: &str, name: &str, dir: Option<&Path>) -> Result<AppCon
         max_request_bytes: l.max_request_bytes.unwrap_or(defaults.max_request_bytes),
         max_response_bytes: l.max_response_bytes.unwrap_or(defaults.max_response_bytes),
     };
+    if limits
+        .run
+        .deadline
+        .is_some_and(|deadline| deadline.is_zero())
+    {
+        return Err("`limits.deadline` must be longer than 0 ms".to_string());
+    }
+    if limits.run.fuel == Some(0) {
+        return Err("`limits.fuel` must be at least 1".to_string());
+    }
+    for capability in &file.grant {
+        if capability.is_empty()
+            || !capability
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!("`grant`: `{capability}` is not a capability name"));
+        }
+    }
+    if file.grant.iter().any(|c| c == ADMIN_CAPABILITY) && name != ADMIN_APP {
+        return Err(format!(
+            "`grant` names `{ADMIN_CAPABILITY}`, which only the app `{ADMIN_APP}` may be \
+             granted: it can change every app's configuration"
+        ));
+    }
+    let mut hosts = Vec::new();
+    for host in &file.route.hosts {
+        let host = host.to_ascii_lowercase();
+        let valid = !host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+        if !valid {
+            return Err(format!(
+                "`route.hosts`: `{host}` is not a hostname (no scheme, port or path)"
+            ));
+        }
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
     let entry = file.entry.unwrap_or_else(|| format!("{name}.handle"));
     if entry.split_once('.').is_none() {
         return Err(format!("`entry = \"{entry}\"` is not `module.function`"));
@@ -417,6 +698,8 @@ pub fn parse_app_in(text: &str, name: &str, dir: Option<&Path>) -> Result<AppCon
         kv,
         fetch,
         secrets,
+        hosts,
+        file_allow: file.fetch.allow,
     })
 }
 
@@ -519,5 +802,71 @@ mod tests {
         assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
         assert!(parse_duration("5m").is_err());
+    }
+
+    #[test]
+    fn an_override_is_kept_as_what_changed_from_the_file() {
+        let file = parse_app(
+            "grant = [\"kv\", \"log\"]\n[limits]\nfuel = 10\n[fetch]\nallow = [\"https://a.example\"]\n",
+            "notes",
+        )
+        .unwrap();
+        let grant: BTreeSet<String> = ["log", "time"].iter().map(|s| s.to_string()).collect();
+        let mut limits = file.limits.as_file();
+        limits.fuel = Some(20);
+        let over = AppOverride::between(
+            &file,
+            &grant,
+            &["https://b.example".to_string()],
+            &limits,
+            true,
+        );
+        assert_eq!(over.grant_add, ["time"]);
+        assert_eq!(over.grant_remove, ["kv"]);
+        assert_eq!(over.fetch_allow_add, ["https://b.example"]);
+        assert_eq!(over.fetch_allow_remove, ["https://a.example"]);
+        // Only the limit that differs from what the file comes to.
+        assert_eq!(
+            over.limits,
+            LimitsFile {
+                fuel: Some(20),
+                ..LimitsFile::default()
+            }
+        );
+        // Applied to a later file that grants something new, the new grant
+        // stays: only what was taken away is.
+        let later = parse_app_with(
+            "grant = [\"kv\", \"log\", \"random\"]\n",
+            "notes",
+            None,
+            Some(&over),
+        )
+        .unwrap();
+        let granted: Vec<&str> = later.granted.iter().map(String::as_str).collect();
+        assert_eq!(granted, ["log", "random", "time"]);
+        assert_eq!(later.limits.run.fuel, Some(20));
+        assert_eq!(later.file_allow, ["https://b.example"]);
+        // Nothing changed is no override.
+        let same = AppOverride::between(
+            &file,
+            &file.granted,
+            &file.file_allow,
+            &file.limits.as_file(),
+            true,
+        );
+        assert!(same.is_empty(), "{same:?}");
+    }
+
+    #[test]
+    fn admin_and_hostnames_are_held_to_their_rules() {
+        let error = parse_app("grant = [\"admin\"]\n", "notes").unwrap_err();
+        assert!(error.contains("only the app `admin`"), "{error}");
+        assert!(parse_app("grant = [\"admin\"]\n", "admin").is_ok());
+        let config = parse_app("[route]\nhosts = [\"Admin.Example\"]\n", "admin").unwrap();
+        assert_eq!(config.hosts, ["admin.example"]);
+        for bad in ["https://a.example", "a.example:80", "a..example", ""] {
+            let text = format!("[route]\nhosts = [\"{bad}\"]\n");
+            assert!(parse_app(&text, "a").is_err(), "{bad}");
+        }
     }
 }

@@ -46,9 +46,10 @@
 //! runtime's own `yields_declined` is summed per app; the run's deadline
 //! still ends it.
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -391,6 +392,10 @@ pub struct Slot {
     pub logs: Arc<LogRing>,
     /// The number the next version of this app is given.
     next_version: AtomicU64,
+    /// Whether new requests are routed to the app. A disabled app keeps its
+    /// current version, its queue, its counters and its data; requests
+    /// already admitted finish, as they do across an update.
+    enabled: AtomicBool,
 }
 
 /// One version a slot has routed to.
@@ -407,6 +412,16 @@ impl Slot {
     /// The version new requests go to.
     pub fn current(&self) -> Option<Arc<App>> {
         self.current.read().unwrap().clone()
+    }
+
+    /// Whether the app is routed to (when it has a current version).
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+
+    /// Routes to the app, or stops: what is in flight finishes either way.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
     }
 
     /// The version number to give the next version loaded into this slot.
@@ -475,6 +490,8 @@ pub struct Installed {
 /// The apps, their queues, and what the workers and the monitor share.
 pub struct Engine {
     slots: RwLock<Vec<Arc<Slot>>>,
+    /// `[route] hosts` of every current version: hostname to app name.
+    hostnames: RwLock<Arc<BTreeMap<String, String>>>,
     pub queue: RunQueue,
     running: Vec<Mutex<Option<Running>>>,
     /// How long a run may hold a worker while others wait; `None` never asks.
@@ -494,6 +511,7 @@ impl Engine {
     ) -> Engine {
         let engine = Engine {
             slots: RwLock::new(Vec::new()),
+            hostnames: RwLock::new(Arc::default()),
             queue: RunQueue::new(max_in_flight),
             running: (0..workers.max(1)).map(|_| Mutex::new(None)).collect(),
             slice,
@@ -554,6 +572,7 @@ impl Engine {
                     counters: Arc::clone(&app.counters),
                     logs: Arc::clone(&app.logs),
                     next_version: AtomicU64::new(1),
+                    enabled: AtomicBool::new(true),
                 });
                 slots.push(Arc::clone(&slot));
                 slot
@@ -570,6 +589,7 @@ impl Engine {
             .unwrap()
             .replace(Arc::clone(&app))
             .map(|old| old.version.clone());
+        self.rebuild_hostnames();
         Installed {
             app: app.name.clone(),
             version: app.version.clone(),
@@ -582,7 +602,36 @@ impl Engine {
     pub fn remove(&self, name: &str) -> Option<String> {
         let slot = self.slot_named(name)?;
         let old = slot.current.write().unwrap().take();
+        self.rebuild_hostnames();
         old.map(|old| old.version.clone())
+    }
+
+    /// Hostname to app name, for every app's current version: what the
+    /// router reads.
+    pub fn hostnames(&self) -> Arc<BTreeMap<String, String>> {
+        Arc::clone(&self.hostnames.read().unwrap())
+    }
+
+    /// The app other than `except` whose current version claims `host`.
+    pub fn host_claimed_by(&self, host: &str, except: &str) -> Option<String> {
+        self.hostnames()
+            .get(host)
+            .filter(|name| name.as_str() != except)
+            .cloned()
+    }
+
+    fn rebuild_hostnames(&self) {
+        let mut table = BTreeMap::new();
+        for slot in self.slots() {
+            if let Some(app) = slot.current() {
+                for host in &app.hosts {
+                    table
+                        .entry(host.clone())
+                        .or_insert_with(|| app.name.clone());
+                }
+            }
+        }
+        *self.hostnames.write().unwrap() = Arc::new(table);
     }
 
     /// A request id.

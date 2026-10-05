@@ -48,8 +48,9 @@ use crate::apps::{load_all, load_as, App, AppState, Backend, Lineage, LoadOption
 use crate::convert::{AppRequest, Reply};
 use crate::hosts::HostModules;
 use crate::ops::{self, OpsContext, OpsListener};
+use crate::overrides::Control;
 use crate::proxy::Forwarding;
-use crate::router::{PathPrefix, Router};
+use crate::router::{ByHostname, Router};
 use crate::sched::{Cancel, Engine, Flight, Installed, Start};
 use crate::stats::{Rejection, ServerCounters};
 
@@ -116,15 +117,17 @@ impl ServeOptions {
 /// What the connection tasks share.
 pub(crate) struct Front {
     pub(crate) engine: Arc<Engine>,
-    router: Box<dyn Router>,
     counters: ServerCounters,
     connections: Arc<Semaphore>,
     started: Instant,
     pub(crate) options: ServeOptions,
     /// How an update loads a version: the options the first load had.
-    load: LoadOptions,
-    /// One update at a time, so that two cannot race for a version number.
-    updating: tokio::sync::Mutex<()>,
+    pub(crate) load: LoadOptions,
+    /// One update (or admin change) at a time, so that two cannot race for
+    /// a version number.
+    pub(crate) updating: tokio::sync::Mutex<()>,
+    /// The admin's changes and their history ([`crate::overrides`]).
+    pub(crate) control: Arc<Control>,
     pub(crate) admin_token: String,
     /// Set by [`Host::shutdown`]: new requests are answered 503.
     draining: AtomicBool,
@@ -165,15 +168,18 @@ impl Host {
             .enable_all()
             .build()
             .map_err(|e| format!("cannot start the I/O runtime: {e}"))?;
+        let control = Arc::new(Control::open(options.data.as_deref())?);
         let load = LoadOptions {
             backend: options.backend,
             quiet: options.quiet,
             modules: options.modules.clone(),
             data: options.data.clone(),
             io: runtime.handle().clone(),
+            control: Some(Arc::clone(&control)),
         };
-        let apps = load_all(&options.apps, &load)?;
-        Host::launch(runtime, apps, options, load)
+        let mut apps = load_all(&options.apps, &load)?;
+        refuse_taken_hostnames(&mut apps);
+        Host::launch(runtime, apps, options, load, control)
     }
 
     /// Starts a host over apps already loaded on `runtime`.
@@ -182,6 +188,7 @@ impl Host {
         apps: Vec<App>,
         options: ServeOptions,
         load: LoadOptions,
+        control: Arc<Control>,
     ) -> Result<Host, String> {
         if options.ops_listener == OpsListener::Admin && options.admin.is_none() {
             return Err(
@@ -210,7 +217,11 @@ impl Host {
             (None, None) => String::new(),
             (None, Some(_)) => crate::admin::token_file(options.data.as_deref())?,
         };
-        let router = PathPrefix;
+        let disabled: Vec<String> = apps
+            .iter()
+            .filter(|app| !control.overrides.enabled(&app.name))
+            .map(|app| app.name.clone())
+            .collect();
         let engine = Arc::new(Engine::new(
             apps,
             options.workers,
@@ -218,11 +229,15 @@ impl Host {
             options.slice,
             runtime.handle().clone(),
         ));
+        for name in &disabled {
+            if let Some(slot) = engine.slot_named(name) {
+                slot.set_enabled(false);
+            }
+        }
         let workers = engine.start_workers()?;
         runtime.spawn(Arc::clone(&engine).monitor());
         let front = Arc::new(Front {
             engine,
-            router: Box::new(router),
             counters: ServerCounters::default(),
             connections: Arc::new(Semaphore::new(options.max_connections.max(1))),
             started: Instant::now(),
@@ -231,7 +246,9 @@ impl Host {
             updating: tokio::sync::Mutex::new(()),
             admin_token,
             draining: AtomicBool::new(false),
+            control: Arc::clone(&control),
         });
+        control.attach(&front);
         let (listener, admin) = {
             let _entered = runtime.enter();
             (
@@ -445,34 +462,49 @@ impl Front {
                 .with_header("connection", "close");
         }
         let path = request.uri().path().to_string();
-        if is_ops_path(&path) {
-            return match self.options.ops_listener {
-                OpsListener::Public => self.ops_reply(&path, request.uri().query()),
-                OpsListener::Admin => {
-                    Reply::text(404, format!("cove-host has nothing at `{path}`\n"))
-                }
-            };
-        }
-        if path == "/" {
-            return Reply::text(200, self.index());
-        }
         let host = request
             .headers()
             .get(hyper::header::HOST)
             .and_then(|value| value.to_str().ok())
-            .map(|host| host.split(':').next().unwrap_or(host).to_string());
-        let Some(route) = self.router.route(host.as_deref(), &path) else {
+            .map(|host| host_name(host).to_string());
+        let router = ByHostname {
+            hosts: self.engine.hostnames(),
+        };
+        let route = router.route(host.as_deref(), &path);
+        // A hostname that routes to an app is the app's, whole: the host's
+        // own paths are on the others.
+        if route.as_ref().is_none_or(|route| route.hostname.is_none()) {
+            if is_ops_path(&path) {
+                return match self.options.ops_listener {
+                    OpsListener::Public => self.ops_reply(&path, request.uri().query()),
+                    OpsListener::Admin => {
+                        Reply::text(404, format!("cove-host has nothing at `{path}`\n"))
+                    }
+                };
+            }
+            if path == "/" {
+                return Reply::text(200, self.index());
+            }
+        }
+        let Some(route) = route else {
             self.counters.not_found.fetch_add(1, Ordering::Relaxed);
             return Reply::text(404, "no app here; try /\n");
         };
         let found = self
             .engine
             .slot_named(&route.app)
-            .and_then(|slot| Some((slot.index, slot.current()?)));
-        let Some((index, app)) = found else {
+            .and_then(|slot| Some((slot.index, slot.enabled(), slot.current()?)));
+        let Some((index, enabled, app)) = found else {
             self.counters.not_found.fetch_add(1, Ordering::Relaxed);
             return Reply::text(404, format!("no app named `{}`\n", route.app));
         };
+        if !enabled {
+            app.counters.rejected(Rejection::Disabled);
+            return Reply::text(
+                503,
+                format!("app `{}` is disabled by the administrator\n", app.name),
+            );
+        }
         if let AppState::Refused(why) = &app.state {
             return Reply::text(503, format!("app `{}` was not loaded: {why}\n", app.name));
         }
@@ -518,7 +550,9 @@ impl Front {
                 .or_insert(value);
         }
         // How the client reached the host: see `crate::proxy`.
-        self.options.forwarding.apply(&mut headers);
+        self.options
+            .forwarding
+            .apply(&mut headers, route.hostname.as_deref());
         // Where the app is mounted, so that it can write links to itself: the
         // host's, whatever the client sent. (Behind a proxy that mounts the
         // host under a prefix of its own, prepend it there.)
@@ -601,8 +635,16 @@ impl Front {
 
     fn index(&self) -> String {
         let mut out = String::from("cove-host: Cove apps, one isolate per request\n\n");
-        for app in self.engine.slots().iter().filter_map(|slot| slot.current()) {
-            out.push_str(&format!("  /{}/  {}\n", app.name, app.describe()));
+        for slot in self.engine.slots() {
+            let Some(app) = slot.current() else {
+                continue;
+            };
+            let at = match app.hosts.first() {
+                Some(host) => format!("//{host}/"),
+                None => format!("/{}/", app.name),
+            };
+            let disabled = if slot.enabled() { "" } else { "  (disabled)" };
+            out.push_str(&format!("  {at}  {}{disabled}\n", app.describe()));
         }
         if self.options.ops_listener == OpsListener::Public {
             out.push_str("\n  /_host/ui  the operations page\n");
@@ -674,6 +716,25 @@ impl Front {
     /// app. Requests already admitted — queued, running, yielded or parked —
     /// finish on the version they were admitted to.
     pub(crate) async fn update(&self, name: &str) -> Result<Installed, UpdateError> {
+        let result = self.update_unrecorded(name).await;
+        let outcome = match &result {
+            Ok(installed) => format!(
+                "applied: {} -> {}",
+                installed.previous.as_deref().unwrap_or("nothing"),
+                installed.version
+            ),
+            Err(UpdateError::NotFound(why)) => format!("refused: {why}"),
+            Err(UpdateError::Refused { why, .. }) => {
+                format!("refused: {}", why.lines().next().unwrap_or_default())
+            }
+        };
+        self.control
+            .history
+            .record(crate::manage::LISTENER, name, "update", "", &outcome);
+        result
+    }
+
+    async fn update_unrecorded(&self, name: &str) -> Result<Installed, UpdateError> {
         let _one_at_a_time = self.updating.lock().await;
         let dir = self.options.apps.join(name);
         if !dir.join("app.toml").is_file() {
@@ -697,12 +758,13 @@ impl Front {
         };
         let load = self.load.clone();
         let owned = name.to_string();
-        let app = tokio::task::spawn_blocking(move || load_as(&owned, &dir, &load, lineage))
+        let mut app = tokio::task::spawn_blocking(move || load_as(&owned, &dir, &load, lineage))
             .await
             .map_err(|e| UpdateError::Refused {
                 current: current.clone(),
                 why: format!("the load failed: {e}"),
             })?;
+        self.refuse_taken_hostnames(&mut app);
         if let AppState::Refused(why) = &app.state {
             app.counters.updates_refused.fetch_add(1, Ordering::Relaxed);
             let line = format!(
@@ -734,12 +796,71 @@ impl Front {
 
     /// Stops routing to `name`; what is in flight finishes.
     pub(crate) fn remove(&self, name: &str) -> Option<String> {
-        let removed = self.engine.remove(name)?;
+        let removed = self.engine.remove(name);
+        self.control.history.record(
+            crate::manage::LISTENER,
+            name,
+            "remove",
+            "",
+            &match &removed {
+                Some(version) => format!("applied: was {version}"),
+                None => "refused: not routed to".to_string(),
+            },
+        );
+        let removed = removed?;
         if let Some(slot) = self.engine.slot_named(name) {
             slot.logs.push("host", &format!("removed (was {removed})"));
         }
         eprintln!("cove-host: [{name}] removed (was {removed})");
         Some(removed)
+    }
+}
+
+/// A `Host` header's name, without its port.
+fn host_name(host: &str) -> &str {
+    match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or(host),
+    }
+}
+
+/// Refuses every app that claims a hostname an app before it (in load
+/// order) claims: a hostname reaches one app.
+fn refuse_taken_hostnames(apps: &mut [App]) {
+    let mut taken: BTreeMap<String, String> = BTreeMap::new();
+    for app in apps.iter_mut() {
+        let clash = app
+            .hosts
+            .iter()
+            .find_map(|host| Some((host.clone(), taken.get(host)?.clone())));
+        match clash {
+            Some((host, owner)) => {
+                app.state = AppState::Refused(format!(
+                    "`route.hosts`: `{host}` already reaches the app `{owner}`"
+                ));
+            }
+            None => {
+                for host in &app.hosts {
+                    taken.insert(host.clone(), app.name.clone());
+                }
+            }
+        }
+    }
+}
+
+impl Front {
+    /// Refuses `app` if another app routed to now claims one of its
+    /// hostnames.
+    pub(crate) fn refuse_taken_hostnames(&self, app: &mut App) {
+        let clash = app
+            .hosts
+            .iter()
+            .find_map(|host| Some((host.clone(), self.engine.host_claimed_by(host, &app.name)?)));
+        if let Some((host, owner)) = clash {
+            app.state = AppState::Refused(format!(
+                "`route.hosts`: `{host}` already reaches the app `{owner}`"
+            ));
+        }
     }
 }
 

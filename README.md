@@ -179,8 +179,9 @@ rebinding its own name to 127.0.0.1. Reach them over SSH:
 `ssh -L 8791:127.0.0.1:8791 <server>`, then `http://localhost:8791/_host/ui`.
 
 `/_host/stats`, per app: `state`
-(`ready`, `refused` with the reason, or `removed`), `version`, `tier`, `required` and `granted`,
-`served`, `ok`, `errors` by kind, `rejected` by reason, `in_flight`,
+(`ready`, `refused` with the reason, `disabled`, or `removed`), `version`, `tier`, `required` and `granted`,
+`hosts` (its `[route] hosts`), `overridden` (whether the admin app changed its configuration),
+`served`, `ok`, `errors` by kind, `rejected` by reason (`disabled` among them), `in_flight`,
 `queued`, `parked`, `parks`, `yields`, `yield_requests`, `yields_declined`,
 `overdue_yields`, `blocking_host_calls`, `instructions`, `fuel`, `worker_ms`,
 `heap_peak_words`, `fetch` (`calls`, `refused`, `errors`), `kv` (`keys`,
@@ -297,10 +298,115 @@ localhost whatever the public one is. Every admin request needs
 `<data>/admin.token` (mode 0600) the first time it starts without one, and
 `cove-host update` / `remove` read it from there (`--token-file`, `--admin`
 to point them elsewhere). Anything without the token is 401 and changes
-nothing. The endpoints are `POST /apps/<app>/update`, `DELETE /apps/<app>`
-and `GET /apps` (the stats). There is no file watcher: an update is an
+nothing. The endpoints are `POST /apps/<app>/update`, `DELETE /apps/<app>`,
+`POST /apps/<app>/enable`, `/disable` and `/reset` (see [Administering apps
+at run time](#administering-apps-at-run-time)), `GET /apps` (the stats) and
+`GET /changes?n=50` (the change history). There is no file watcher: an update is an
 explicit act, which is what makes a refused one a report rather than a
 silent non-event.
+
+## Administering apps at run time
+
+Beyond updating code, an app's **configuration** can be changed on the
+running host — enabled or disabled, its grant, its fetch allowlist, its
+limits — by one app, the admin app (`apps/admin`, issue #17), through a host
+module of its own, and on the machine through the admin listener. No other
+app can: the capability is `admin`, and **only the app named `admin` may be
+granted it**. An `app.toml` of any other app that grants it — or a change
+that would — refuses that app at load, and `cove-host check` says so. The
+grant is a line in the startup banner and in `/_host/stats` like every other
+(`admin  requires [admin, auth, …]  granted [admin, auth, …]`): the one app
+that can change the others is visible as such.
+
+The module is `host` (the admin app's own main module is `admin`, and Cove
+refuses a package module that shadows a host module):
+
+| operation | answers |
+| --- | --- |
+| `host.apps()` | `Array<host.App>`: every app — `state` (`serving`, `disabled`, `refused`, `removed`) and `reason`, `version`, `tier`, `entry`, `hosts`, `required` and `granted` (and `grantAdded`/`grantRemoved`, what the admin changed), `fetchAllow`, `limits` (`host.Limits`: `fuel`, `maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) and `limitsChanged`, `isAdmin`, its counters (`served`, `ok`, `errors`, `rejected`, `inFlight`, `queued`, `kvKeys`, `kvBytes`) and its ten newest `recentErrors` |
+| `host.capabilities()` | `Array<String>`: what a grant may name |
+| `host.history(limit)` | `Array<host.Change>`: `atMs`, `who`, `app`, `action`, `detail`, `outcome`, newest first |
+| `host.setEnabled(app, enabled, who)` | `Result<String, Error>` |
+| `host.configure(app, settings, who)` | `Result<String, Error>`: `settings` is `host.Settings { grant, fetchAllow, limits }`, the whole of what they are to be |
+| `host.reset(app, who)` | `Result<String, Error>`: back to `app.toml` |
+
+The three that change something park the run while the host works (an app
+is reloaded on a blocking thread, as an update is), so they hold no worker.
+
+**A change is a re-check, not a revocation.** Cove decides capabilities
+before a program runs, so there is nothing to take away from a run in
+progress: a change loads the app again with the change applied — parsed,
+checked, admitted, lowered, prepared, compiled — and routes to that version
+the way `cove-host update` does. Requests already admitted finish on the
+version they were admitted to.
+
+| the reload | the change | the app |
+| --- | --- | --- |
+| loads | kept | serves the new version |
+| is refused because its entry requires a capability the change took away | kept | **refused**: answers 503 with the reason; every other app serves |
+| anything else: a limit out of range (fuel, deadline or in-flight below 1, a negative number, a heap above the runtime's), an allowlist entry that does not parse, a capability the host does not have, `admin` for another app | **not kept** | as before; the answer is the reason |
+
+Taking a capability away from an app that needs it is how an app is stopped
+from using it, so that is applied; a change that is merely wrong is not.
+Granting it back loads the app again, with its store as it was.
+
+**Disabling** stops routing to an app and nothing else: its version stays
+loaded, and its queue, counters, log and store stay. A request to it is
+answered **503** `app … is disabled by the administrator` (no `Retry-After`;
+counted as `rejected.disabled`) — 503 rather than 404 so that an app that is
+switched off is not mistaken for a mistyped URL; what was already admitted
+finishes. Enabling routes to it again.
+
+**The admin app cannot disable itself, take `admin` away from itself, or
+make any change that would leave it refused** — those are refused, through
+it. The admin listener can do all three, which is the point of it:
+
+```console
+$ ./target/checked/cove-host disable notes    # or enable, reset
+`notes` disabled: not routed to; in-flight requests finish
+$ ./target/checked/cove-host reset admin      # drop the admin's changes to the admin app
+```
+
+**Where the changes are kept.** Not in `app.toml`: a release's `install.sh`
+replaces `apps/` wholesale, and the deployed unit mounts it read-only. They
+are kept in the data directory, which no release touches:
+
+- `<data>/_host/overrides.json`: per app, `enabled`, the capabilities and
+  allowlist entries added and removed, and the limits set — each relative to
+  `app.toml`, so a later release whose `app.toml` grants something new still
+  grants it unless that very capability was removed. A change back to what
+  the file says leaves no entry. It is applied every time the app loads (at
+  start, on `update`, on a change), so it survives a restart and a release.
+  It is plain JSON and the last way out: delete an app's entry, or the file,
+  and restart. A file that does not read stops the host from starting —
+  running without it would quietly re-enable and re-grant.
+- `<data>/_host/changes.jsonl`: the history — who (what the admin app says
+  of its user, or `admin listener`), when, which app, what was asked and
+  what came of it, refused attempts included — one JSON line each, appended.
+
+### Routing by hostname
+
+An app may be reached by a hostname of its own instead of by its prefix:
+
+```toml
+[route]
+hosts = ["covtools-admin.ramda.io", "admin.localhost"]
+```
+
+A request whose `Host` (without its port) is one of them reaches the app with
+its whole path — `/`, `/apps/notes`, even `/_host/...` — and the app is **not**
+reachable as `/<app>/` on any other hostname: `https://covtools.ramda.io/admin/`
+is a 404. That is what lets a hostname carry an access policy of its own
+(Cloudflare Access, in the deployment) without another hostname's policy
+being a way round it. A hostname reaches one app; a second app claiming it
+is refused. `x-forwarded-prefix` is empty for such an app.
+
+**Each routed hostname is its own origin.** Under `--public-origin
+https://covtools.ramda.io`, a request routed by `covtools-admin.ramda.io` is
+told `x-forwarded-proto: https` and `host: covtools-admin.ramda.io` (the
+public origin's scheme, and its port if it has one) — the name the route
+matched, never one the client chose — so an app's same-origin check compares
+against the origin its own pages were served from.
 
 ## Deploying
 
@@ -405,6 +511,7 @@ do, and an app may use only what `app.toml` grants:
 | `time` | `time` | `nowMillis() -> Int`: the wall clock, milliseconds since the Unix epoch; `nowMicros() -> Int`: microseconds, strictly increasing across the process |
 | `random` | `random` | `hex(bytes: Int) -> String`: 1–64 random bytes from the operating system, as hex |
 | `auth` | `auth` | `check(secret: String, authorization: String) -> Bool`: whether an `Authorization` header (`Bearer <s>`, or `Basic` with `<s>` as the password) presents the app's secret `secret`. Constant-time; the secret itself never reaches the app |
+| `host` | `admin` | the admin app's view of the host, and its changes: see [Administering apps at run time](#administering-apps-at-run-time). Only the app `admin` may be granted it |
 
 Every request also carries `x-forwarded-prefix`: where the host mounted the
 app (`/webhooks`), so it can write links to itself. The host sets it,
@@ -503,6 +610,9 @@ timeout = "10s"                 # one fetch, connect to last byte
 max_request_bytes = 1048576
 max_response_bytes = 4194304
 
+[route]                         # see "Routing by hostname"
+hosts = []                      # e.g. ["admin.example"]: reached by these only
+
 [secrets]                       # what `auth.check` compares against; one of:
 admin = { env = "APP_ADMIN_TOKEN" }   # an environment variable of the host
 # admin = { file = "admin.secret" }   # a file, relative to the app's directory
@@ -524,6 +634,7 @@ reason, and every other app starts.
 | --- | --- |
 | no app by that name | 404 |
 | the app was refused at load | 503 with the reason, no `Retry-After` |
+| the app is disabled by the administrator | 503, no `Retry-After` |
 | request body over `max_request_bytes` (by `Content-Length`, or as a chunked body arrives) | 413 |
 | request body not UTF-8 | 400 |
 | the app already has `max_queued` requests waiting | **429**, `Retry-After: 1` |
@@ -730,7 +841,7 @@ $ cargo t     # = cargo test --workspace --profile checked
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
 integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and
-`updates.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
+`updates.rs`, `admin.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
 so, and what it asserts is counted.
@@ -770,6 +881,16 @@ so, and what it asserts is counted.
 - the admin listener answers 401 without the token (missing, wrong, empty)
   and changes nothing, and the public listener has no update route;
 - an update adds an app, `remove` removes one, and an update brings it back;
+- through the `host` module: the list shows every app's state, grant and
+  limits; a disabled app answers 503 while one of its requests in flight
+  finishes, and enabled again has its store; taking a needed capability
+  away refuses that app alone, and granting it back restores it; eight kinds
+  of wrong change are refused with their reasons and change nothing; `admin`
+  granted to another app is refused at load and by `check`; the admin app
+  cannot disable itself or drop `admin`, and the admin listener can; the
+  changes survive a restart and a release that replaces `apps/`; the history
+  records who, when and what; an app with a hostname is reached by it alone,
+  as that hostname's origin, and a hostname reaches one app;
 - the operations page escapes markup an app logs, and shows errors and KV
   usage against the quota; an app's log reaches `<data>/<app>/log.txt`.
 
