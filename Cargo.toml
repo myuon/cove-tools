@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/cove-host"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/myuon/cove-tools"
@@ -12,11 +12,11 @@ repository = "https://github.com/myuon/cove-tools"
 # change the host needs from the compiler or the runtime goes to myuon/cove
 # first and is picked up here by moving `rev`.
 [workspace.dependencies]
-cove-diag = { git = "https://github.com/myuon/cove", rev = "9272282" }
-cove-ir = { git = "https://github.com/myuon/cove", rev = "9272282" }
-cove-runtime = { git = "https://github.com/myuon/cove", rev = "9272282", features = ["template"] }
-cove-sema = { git = "https://github.com/myuon/cove", rev = "9272282" }
-cove-syntax = { git = "https://github.com/myuon/cove", rev = "9272282" }
+cove-diag = { git = "https://github.com/myuon/cove", rev = "2ca1c94" }
+cove-ir = { git = "https://github.com/myuon/cove", rev = "2ca1c94" }
+cove-runtime = { git = "https://github.com/myuon/cove", rev = "2ca1c94", features = ["template"] }
+cove-sema = { git = "https://github.com/myuon/cove", rev = "2ca1c94" }
+cove-syntax = { git = "https://github.com/myuon/cove", rev = "2ca1c94" }
 
 # The profile the tests run under, for Cove's own reason: they run Cove
 # programs (the CPU-heavy sample app counts primes for tens of milliseconds a

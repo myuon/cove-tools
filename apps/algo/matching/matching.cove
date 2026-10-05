@@ -288,7 +288,7 @@ export fn build(left: Array<String>, right: Array<String>, froms: Array<Int>, to
     counts.set(u + 1, counts.get(u + 1).unwrapOr(0) + counts.get(u).unwrapOr(0))
     u += 1
   }
-  var next = copyOf(counts)
+  var next = counts.snapshot()
   var placed = filled(froms.length(), 0)
   var at = 0
   while at < froms.length() {
@@ -345,10 +345,7 @@ export fn random(left: Int, right: Int, edges: Int, seed: Int) -> Graph {
     // Sparse: draw, drop repeats, and draw again for what was dropped.
     var cells: Array<Int> = []
     while cells.length() < edges {
-      var drawn: Vector<Int> = Vector.of()
-      for cell in cells {
-        drawn.push(cell)
-      }
+      var drawn = cells.toVector()
       var more = edges - cells.length()
       while more > 0 {
         drawn.push(generator.below(possible))
@@ -377,73 +374,18 @@ export fn random(left: Int, right: Int, edges: Int, seed: Int) -> Graph {
 }
 
 /// The distinct values of `values`, ascending.
-///
-/// Sorted by a merge sort of its own rather than `sorted(by:)`: a function
-/// that writes a lambda stays on the encoded tier, and the generator's sort
-/// of fifty thousand cells is long enough that a run below it holding its
-/// worker would be seen by the other apps (ADR 0085's limit; see the README).
 fn distinctSorted(values: Array<Int>) -> Array<Int> {
-  let n = values.length()
-  var from: Vector<Int> = Vector.of()
-  var into: Vector<Int> = Vector.of()
-  for value in values {
-    from.push(value)
-    into.push(value)
-  }
-  var width = 1
-  while width < n {
-    var low = 0
-    while low < n {
-      let middle = (low + width).min(n)
-      let high = (low + 2 * width).min(n)
-      var i = low
-      var j = middle
-      var k = low
-      while k < high {
-        let a = from.get(i).unwrapOr(0)
-        let b = from.get(j).unwrapOr(0)
-        if i < middle && (j >= high || a <= b) {
-          into.set(k, a)
-          i += 1
-        } else {
-          into.set(k, b)
-          j += 1
-        }
-        k += 1
-      }
-      low = high
-    }
-    let swap = from
-    from = into
-    into = swap
-    width *= 2
-  }
+  let ordered = values.sorted(by: fn(a, b) { a < b })
   var out = Vector.of()
   var at = 0
-  while at < n {
-    let value = from.get(at).unwrapOr(0)
-    if at == 0 || value != from.get(at - 1).unwrapOr(0) {
+  while at < ordered.length() {
+    let value = ordered.get(at).unwrapOr(0)
+    if at == 0 || value != ordered.get(at - 1).unwrapOr(0) {
       out.push(value)
     }
     at += 1
   }
   out.freeze()
-}
-
-/// A copy of `values`, element by element.
-///
-/// Not `snapshot()` or `toVector()`: on the native tier at this Cove
-/// revision, a run that yields while making one of those copies can resume
-/// with a store of the wrong size — `runCopy writes 12000 element(s) to 0 of
-/// a destination of 0` — in about one heavy run in fifteen when it is
-/// sliced (see the README, "Yields on the native tier"). Pushing the
-/// elements one by one does not do it.
-fn copyOf(values: Vector<Int>) -> Vector<Int> {
-  var out: Vector<Int> = Vector.of()
-  for value in values {
-    out.push(value)
-  }
-  out
 }
 
 /// `count` copies of `value`.

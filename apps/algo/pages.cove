@@ -1,6 +1,5 @@
 use web
 use draw
-use time
 use text
 
 // The page around every algorithm: the same header, the same form on the
@@ -207,19 +206,4 @@ fn script() -> String {
   \});
 \})();
 "
-}
-
-/// The app's clock, in microseconds: the one function of the app that calls
-/// the host.
-///
-/// It is a function of its own for the native tier's sake. The code
-/// generator does not lower a host call, so a function that makes one runs
-/// on the encoded tier — and compiled code below an encoded frame cannot
-/// yield (ADR 0085). Timing an algorithm with `time.nowMicros()` written
-/// around the call would put every heavy loop under such a frame, and the
-/// run would hold its worker to the end: measured, `hello`'s p99 went from
-/// 2 ms to 10 s beside four heavy runs on four workers. As a leaf, the
-/// encoded frame is only ever this one, and it returns at once.
-fn now() -> Int {
-  time.nowMicros()
 }

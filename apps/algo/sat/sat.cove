@@ -14,10 +14,7 @@ use rng
 //   formulas whose answers are known.
 //
 // A literal is `2 * variable + sign`, variables from 0, `sign` 1 for a
-// negated one; DIMACS numbers variables from 1. Nothing here writes a lambda
-// or calls the host, and the reader scans bytes rather than comparing
-// strings, so on the native tier all of it has machine code and a long
-// search yields like any other loop (see the README).
+// negated one; DIMACS numbers variables from 1.
 
 /// A formula: clause `c` is `literals[start[c]..<start[c + 1]]`.
 export struct Formula {
@@ -93,9 +90,7 @@ export struct Outcome {
 /// number used.
 export fn read(input: String, bounds: Bounds) -> Read {
   let generator = generatorLine(input)
-  // Lengths, not `!=`: a `String` comparison keeps a function off the
-  // native tier, and this one runs the whole reader.
-  if generator.byteLength() > 0 {
+  if generator != "" {
     return generate(generator, bounds)
   }
   var start = Vector.of(0)
@@ -278,12 +273,12 @@ fn generatorLine(input: String) -> String {
 fn generate(line: String, bounds: Bounds) -> Read {
   var words = Vector.of()
   for word in line.split(" ") {
-    if word.byteLength() > 0 {
+    if word != "" {
       words.push(word)
     }
   }
   let name = words.get(0).unwrapOr("")
-  if name.startsWith("sudoku") {
+  if name == "sudoku" {
     if words.length() != 2 {
       return Read.Invalid("`sudoku` takes the 81 cells, row by row, digits and `.` for an empty cell")
     }
@@ -296,7 +291,7 @@ fn generate(line: String, bounds: Bounds) -> Read {
       Err(_) => return Read.Invalid("`{word}` is not a whole number")
     }
   }
-  if name.startsWith("pigeonhole") {
+  if name == "pigeonhole" {
     if numbers.length() != 2 {
       return Read.Invalid("`pigeonhole` takes the pigeons and the holes: `pigeonhole 6 5`")
     }

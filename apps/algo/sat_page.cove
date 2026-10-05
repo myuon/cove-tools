@@ -4,6 +4,7 @@ use sat.Formula
 use sat.Outcome
 use sat.Verdict
 use draw
+use time
 
 // The SAT page: the form, the examples, and the result — the verdict and
 // its check, the search's cost, the assignment drawn (a sudoku as its grid)
@@ -118,15 +119,15 @@ fn satResult(input: String, budget: Int, known: String) -> String {
   if budget < 1 || budget > 100000000 {
     return stopNote("Not run:", "the decision budget is a whole number from 1 to 100,000,000")
   }
-  let started = now()
+  let started = time.nowMicros()
   let formula = match sat.read(input, satBounds()) {
     sat.Read.Ok(formula) => formula
     sat.Read.Invalid(why) => return stopNote("Not run:", why)
   }
-  let readMicros = now() - started
-  let solving = now()
+  let readMicros = time.nowMicros() - started
+  let solving = time.nowMicros()
   let outcome = sat.solve(formula, budget)
-  let solveMicros = now() - solving
+  let solveMicros = time.nowMicros() - solving
   let knownNote = if known == "" { "" } else { " Known: {known}." }
   let verdict = match outcome.verdict {
     Verdict.Satisfiable(values) => {

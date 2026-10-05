@@ -43,6 +43,10 @@ jobs:
         run: |
           ./target/checked/cove-host check --apps apps
           ./target/checked/cove-host test --apps apps
+      # cove#604's reproduction: 160 sliced native runs that copy arrays
+      # into vectors, every answer 60000. Wrong answers at Cove 9272282.
+      - name: native copy-under-slicing regression check
+        run: sh bench/repro/run.sh native
       - name: lint the deploy scripts
         run: shellcheck deploy/*.sh
       # The release tarball, built from this binary, installed into a
