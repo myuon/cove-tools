@@ -28,7 +28,7 @@ jobs:
       - name: test
         run: cargo test --workspace --profile checked
       - name: test on the encoded VM
-        run: cargo test --profile checked --test host
+        run: cargo test --profile checked --tests
         env:
           COVE_HOST_TEST_BACKEND: vm
       - name: check and test the sample apps
