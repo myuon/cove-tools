@@ -34,11 +34,14 @@ pub enum ErrorKind {
     QueueTimeout,
     /// The host itself failed while running the request (500).
     Internal,
+    /// The client went away before the answer: the run was cancelled, or
+    /// never started. Nobody reads the status; 499 is nginx's name for it.
+    Cancelled,
 }
 
 impl ErrorKind {
     /// Every kind, in the order the stats list them.
-    pub const ALL: [ErrorKind; 11] = [
+    pub const ALL: [ErrorKind; 12] = [
         ErrorKind::Fuel,
         ErrorKind::Deadline,
         ErrorKind::HostCalls,
@@ -50,6 +53,7 @@ impl ErrorKind {
         ErrorKind::ResponseTooLarge,
         ErrorKind::QueueTimeout,
         ErrorKind::Internal,
+        ErrorKind::Cancelled,
     ];
 
     /// The name the stats use.
@@ -66,6 +70,7 @@ impl ErrorKind {
             ErrorKind::ResponseTooLarge => "response_too_large",
             ErrorKind::QueueTimeout => "queue_timeout",
             ErrorKind::Internal => "internal",
+            ErrorKind::Cancelled => "cancelled",
         }
     }
 
@@ -74,6 +79,7 @@ impl ErrorKind {
         match self {
             ErrorKind::Deadline => 504,
             ErrorKind::QueueTimeout => 503,
+            ErrorKind::Cancelled => 499,
             _ => 500,
         }
     }
@@ -132,6 +138,12 @@ pub struct AppCounters {
     pub worker_ns: AtomicU64,
     /// The largest heap an answered run had, in words.
     pub heap_peak_words: AtomicU64,
+    /// `fetch` calls made, refused by the allowlist or a limit before
+    /// anything was sent, and failed (no response: unreachable, too slow,
+    /// too large).
+    pub fetches: AtomicU64,
+    pub fetch_refused: AtomicU64,
+    pub fetch_errors: AtomicU64,
 }
 
 impl AppCounters {
@@ -185,6 +197,11 @@ impl AppCounters {
             "fuel": read(&self.fuel),
             "worker_ms": read(&self.worker_ns) as f64 / 1e6,
             "heap_peak_words": read(&self.heap_peak_words),
+            "fetch": {
+                "calls": read(&self.fetches),
+                "refused": read(&self.fetch_refused),
+                "errors": read(&self.fetch_errors),
+            },
         })
     }
 }

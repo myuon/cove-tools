@@ -21,7 +21,7 @@ use cove_sema::resolve::DeclaredTest;
 use cove_sema::HostSchemas;
 
 use crate::apps::{self, App, AppState, Compiled};
-use crate::hosts::{AppContext, HostModules};
+use crate::hosts::HostModules;
 
 /// What a command printed, and whether it succeeded.
 #[derive(Debug, Default)]
@@ -131,6 +131,13 @@ pub fn test(
 ) -> Result<Report, String> {
     let mut report = Report::default();
     let (mut ran, mut failed, mut uncompiled) = (0, 0, 0);
+    // What `fetch` waits on: the tests answer every host call blocking, and
+    // a blocking fetch is the same future, waited for on this thread.
+    let io = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the I/O runtime: {e}"))?;
     for (name, dir) in apps::app_dirs(root, only)? {
         let (app, config) = apps::describe(&name, &dir);
         if config.is_none() {
@@ -161,7 +168,7 @@ pub fn test(
         }) {
             ran += 1;
             let line = format!("{name:<10} {}", test.qualified_name());
-            match run_test(test, &app, modules, &sources, &program) {
+            match run_test(test, &app, modules, &sources, &program, io.handle()) {
                 None => report.out.push_str(&format!("ok    {line}\n")),
                 Some(diagnostic) => {
                     failed += 1;
@@ -192,6 +199,7 @@ fn run_test(
     modules: &HostModules,
     sources: &Arc<cove_diag::SourceMap>,
     program: &Arc<cove_sema::resolve::Program>,
+    io: &tokio::runtime::Handle,
 ) -> Option<Diagnostic> {
     let missing = test
         .entry
@@ -239,16 +247,22 @@ fn run_test(
             )
         }
     };
-    let context = AppContext {
-        app: app.name.clone(),
-        quiet: true,
-        counters: Arc::clone(&app.counters),
+    // A registry per test, with its state in memory: no test sees what
+    // another left in the store, and nothing reaches the data directory.
+    let context = app.context(true, None, io);
+    let hosts = match modules.registry(&app.granted, &context) {
+        Ok(hosts) => hosts,
+        Err(why) => {
+            return Some(
+                Diagnostic::error(FAILED, format!("app `{}` {why}", app.name)).at(test
+                    .entry
+                    .decl
+                    .name
+                    .span),
+            )
+        }
     };
-    let runtime = Runtime::new(
-        Arc::clone(program),
-        Arc::clone(sources),
-        Arc::new(modules.registry(&app.granted, &context)),
-    );
+    let runtime = Runtime::new(Arc::clone(program), Arc::clone(sources), Arc::new(hosts));
     let mut vm = Vm::new(&runtime, runtime.hosts(), &lowered);
     let outcome = vm.run_entry_within(
         Budget::new(app.limits.run.clone()),

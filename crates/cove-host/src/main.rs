@@ -26,6 +26,9 @@ enum Command {
         /// The directory holding one directory per app.
         #[arg(long, default_value = "apps")]
         apps: PathBuf,
+        /// Where apps keep their state (`<data>/<app>/kv.sqlite3`).
+        #[arg(long, default_value = "data")]
+        data: PathBuf,
         /// Where to listen.
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
@@ -76,6 +79,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Serve {
             apps,
+            data,
             addr,
             workers,
             io_threads,
@@ -87,6 +91,7 @@ fn main() -> ExitCode {
         } => {
             let mut options = ServeOptions::new(apps);
             options.addr = addr;
+            options.data = Some(data);
             if let Some(workers) = workers {
                 options.workers = workers.max(1);
             }

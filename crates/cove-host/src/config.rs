@@ -48,6 +48,147 @@ pub struct AppFile {
     pub grant: Vec<String>,
     #[serde(default)]
     pub limits: LimitsFile,
+    #[serde(default)]
+    pub kv: KvFile,
+    #[serde(default)]
+    pub fetch: FetchFile,
+}
+
+/// `[kv]` as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvFile {
+    pub max_key_bytes: Option<usize>,
+    pub max_value_bytes: Option<usize>,
+    pub max_keys: Option<u64>,
+    pub max_bytes: Option<u64>,
+}
+
+/// `[fetch]` as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchFile {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    pub timeout: Option<String>,
+    pub max_request_bytes: Option<usize>,
+    pub max_response_bytes: Option<usize>,
+}
+
+/// An app's key-value quotas.
+#[derive(Clone, Debug)]
+pub struct KvLimits {
+    /// The longest key, in bytes.
+    pub max_key_bytes: usize,
+    /// The largest value, in bytes.
+    pub max_value_bytes: usize,
+    /// How many keys the app may hold.
+    pub max_keys: u64,
+    /// The keys' and values' bytes, summed, the app may hold.
+    pub max_bytes: u64,
+}
+
+impl Default for KvLimits {
+    fn default() -> KvLimits {
+        KvLimits {
+            max_key_bytes: 1024,
+            max_value_bytes: 1 << 20,
+            max_keys: 100_000,
+            max_bytes: 64 << 20,
+        }
+    }
+}
+
+/// One `[fetch] allow` entry: `scheme://host`, `scheme://host:port` or
+/// `scheme://host:*`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowRule {
+    pub scheme: String,
+    pub host: String,
+    /// `None` is any port.
+    pub port: Option<u16>,
+}
+
+impl AllowRule {
+    /// Parses one entry. The port defaults to the scheme's (80 or 443).
+    pub fn parse(text: &str) -> Result<AllowRule, String> {
+        let bad = || {
+            format!(
+                "`{text}` is not an allowlist entry like \"https://api.example.com\", \
+                 \"http://127.0.0.1:8080\" or \"http://localhost:*\""
+            )
+        };
+        let (scheme, rest) = text.split_once("://").ok_or_else(bad)?;
+        let scheme = scheme.to_ascii_lowercase();
+        let default_port = match scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => return Err(bad()),
+        };
+        if rest.is_empty() || rest.contains('/') || rest.contains('@') {
+            return Err(bad());
+        }
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((host, "*")) => (host, None),
+            Some((host, port)) => (host, Some(port.parse().map_err(|_| bad())?)),
+            None => (rest, Some(default_port)),
+        };
+        if host.is_empty() {
+            return Err(bad());
+        }
+        Ok(AllowRule {
+            scheme,
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    /// Whether a request to `scheme://host:port` is allowed by this rule.
+    pub fn admits(&self, scheme: &str, host: &str, port: u16) -> bool {
+        self.scheme == scheme
+            && self.host.eq_ignore_ascii_case(host)
+            && self.port.is_none_or(|allowed| allowed == port)
+    }
+}
+
+impl std::fmt::Display for AllowRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.port {
+            Some(port) => write!(f, "{}://{}:{port}", self.scheme, self.host),
+            None => write!(f, "{}://{}:*", self.scheme, self.host),
+        }
+    }
+}
+
+/// Where an app's `fetch` may go, and how much it may move.
+#[derive(Clone, Debug)]
+pub struct FetchPolicy {
+    /// Empty: nowhere.
+    pub allow: Vec<AllowRule>,
+    /// One fetch, connect to last byte. The run's deadline also bounds it.
+    pub timeout: Duration,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+}
+
+impl Default for FetchPolicy {
+    fn default() -> FetchPolicy {
+        FetchPolicy {
+            allow: Vec::new(),
+            timeout: Duration::from_secs(10),
+            max_request_bytes: 1 << 20,
+            max_response_bytes: 4 << 20,
+        }
+    }
+}
+
+impl FetchPolicy {
+    /// Whether `scheme://host:port` is on the allowlist.
+    pub fn admits(&self, scheme: &str, host: &str, port: u16) -> bool {
+        self.allow
+            .iter()
+            .any(|rule| rule.admits(scheme, host, port))
+    }
 }
 
 /// `[limits]` as written.
@@ -116,6 +257,8 @@ pub struct AppConfig {
     pub entry: String,
     pub granted: BTreeSet<String>,
     pub limits: AppLimits,
+    pub kv: KvLimits,
+    pub fetch: FetchPolicy,
 }
 
 /// Reads `dir/app.toml` for the app `name`.
@@ -166,10 +309,43 @@ pub fn parse_app(text: &str, name: &str) -> Result<AppConfig, String> {
     if entry.split_once('.').is_none() {
         return Err(format!("`entry = \"{entry}\"` is not `module.function`"));
     }
+    let kv_defaults = KvLimits::default();
+    let kv = KvLimits {
+        max_key_bytes: file.kv.max_key_bytes.unwrap_or(kv_defaults.max_key_bytes),
+        max_value_bytes: file
+            .kv
+            .max_value_bytes
+            .unwrap_or(kv_defaults.max_value_bytes),
+        max_keys: file.kv.max_keys.unwrap_or(kv_defaults.max_keys),
+        max_bytes: file.kv.max_bytes.unwrap_or(kv_defaults.max_bytes),
+    };
+    let fetch_defaults = FetchPolicy::default();
+    let fetch = FetchPolicy {
+        allow: file
+            .fetch
+            .allow
+            .iter()
+            .map(|entry| AllowRule::parse(entry).map_err(|why| format!("`fetch.allow`: {why}")))
+            .collect::<Result<_, _>>()?,
+        timeout: match file.fetch.timeout {
+            Some(text) => parse_duration(&text)?,
+            None => fetch_defaults.timeout,
+        },
+        max_request_bytes: file
+            .fetch
+            .max_request_bytes
+            .unwrap_or(fetch_defaults.max_request_bytes),
+        max_response_bytes: file
+            .fetch
+            .max_response_bytes
+            .unwrap_or(fetch_defaults.max_response_bytes),
+    };
     Ok(AppConfig {
         entry,
         granted: file.grant.into_iter().collect(),
         limits,
+        kv,
+        fetch,
     })
 }
 
@@ -230,6 +406,22 @@ mod tests {
     fn a_heap_above_the_ceiling_is_refused() {
         let error = parse_app("[limits]\nmax_heap_words = 99999999\n", "a").unwrap_err();
         assert!(error.contains("fixed per-run heap"), "{error}");
+    }
+
+    #[test]
+    fn allowlist_entries() {
+        let rule = AllowRule::parse("https://API.example.com").unwrap();
+        assert!(rule.admits("https", "api.example.com", 443));
+        assert!(!rule.admits("http", "api.example.com", 443));
+        assert!(!rule.admits("https", "api.example.com", 8443));
+        let any = AllowRule::parse("http://127.0.0.1:*").unwrap();
+        assert!(any.admits("http", "127.0.0.1", 9999));
+        assert!(!any.admits("http", "127.0.0.2", 9999));
+        assert!(AllowRule::parse("ftp://x").is_err());
+        assert!(AllowRule::parse("http://x/path").is_err());
+        assert!(AllowRule::parse("example.com").is_err());
+        let config = parse_app("[fetch]\nallow = [\"http://localhost:8080\"]\n", "a").unwrap();
+        assert!(config.fetch.admits("http", "localhost", 8080));
     }
 
     #[test]

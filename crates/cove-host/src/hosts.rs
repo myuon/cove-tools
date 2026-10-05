@@ -11,6 +11,8 @@
 //! | `web` | — | the `Request` and `Response` types; no operations, so building a `Response` needs no grant (cove#579) |
 //! | `log` | `log` | `info`, `warn` and `error`: a line on standard output, prefixed with the app's name |
 //! | `timer` | `timer` | `sleep(millis)`, answered **pending**: the run parks and holds no worker while it waits |
+//! | `kv` | `kv` | the app's persistent key-value store ([`crate::kv`]) |
+//! | `fetch` | `fetch` | outbound HTTP to the app's allowlist, answered **pending** ([`crate::fetch`]) |
 //!
 //! A module that answers pending hands the scheduler a [`PendingWork`]: a
 //! future that produces the answer. The scheduler runs it on the I/O runtime,
@@ -31,6 +33,8 @@ use cove_runtime::{
     OperationSchema, Reentry, RuntimeError, Transfer, TypeSchema, Value,
 };
 
+use crate::config::{FetchPolicy, KvLimits};
+use crate::logs::LogRing;
 use crate::stats::AppCounters;
 
 /// What a module instance knows about the app it serves.
@@ -38,11 +42,25 @@ use crate::stats::AppCounters;
 pub struct AppContext {
     /// The app's name, which `log` prefixes every line with.
     pub app: String,
-    /// Whether `log` prints nothing.
+    /// Whether `log` prints nothing to standard output. The app's ring of
+    /// recent lines is kept either way.
     pub quiet: bool,
     /// The app's counters, for what a module wants to count (a call that had
     /// to block instead of park, for one).
     pub counters: Arc<AppCounters>,
+    /// The app's recent log lines.
+    pub logs: Arc<LogRing>,
+    /// What the app is granted. Every module is registered for every app —
+    /// the boundary refuses an ungranted call — but a module with state to
+    /// open need open it only for an app that may use it.
+    pub granted: std::collections::BTreeSet<String>,
+    /// The app's own data directory, `<data>/<app>/`; `None` keeps the app's
+    /// state in memory (`cove-host test`).
+    pub data: Option<std::path::PathBuf>,
+    pub kv: KvLimits,
+    pub fetch: FetchPolicy,
+    /// The I/O runtime, for a module that has to wait on it from a worker.
+    pub io: tokio::runtime::Handle,
 }
 
 /// One host module: its schema, and an instance of it per app.
@@ -52,7 +70,10 @@ pub trait HostModule: Send + Sync {
     fn schema(&self) -> ModuleSchema;
     /// The module's implementation for one app. Called once per app, when
     /// the app is loaded, and shared by every request of that app.
-    fn instantiate(&self, app: &AppContext) -> Box<dyn HostApi>;
+    ///
+    /// An `Err` refuses the app (its store cannot be opened, say); the other
+    /// apps still load.
+    fn instantiate(&self, app: &AppContext) -> Result<Box<dyn HostApi>, String>;
 }
 
 /// The modules this host registers, in order.
@@ -62,10 +83,16 @@ pub struct HostModules {
 }
 
 impl HostModules {
-    /// `web`, `log` and `timer`.
+    /// `web`, `log`, `timer`, `kv` and `fetch`.
     pub fn standard() -> HostModules {
         HostModules {
-            modules: vec![Arc::new(Web), Arc::new(LogModule), Arc::new(TimerModule)],
+            modules: vec![
+                Arc::new(Web),
+                Arc::new(LogModule),
+                Arc::new(TimerModule),
+                Arc::new(crate::kv::KvModule),
+                Arc::new(crate::fetch::FetchModule),
+            ],
         }
     }
 
@@ -85,12 +112,12 @@ impl HostModules {
         &self,
         granted: impl IntoIterator<Item = &'a String>,
         app: &AppContext,
-    ) -> HostRegistry {
+    ) -> Result<HostRegistry, String> {
         let mut hosts = HostRegistry::new(Grants::new(granted.into_iter().cloned()));
         for module in &self.modules {
-            hosts.register(module.instantiate(app));
+            hosts.register(module.instantiate(app)?);
         }
-        hosts
+        Ok(hosts)
     }
 }
 
@@ -205,8 +232,8 @@ impl HostModule for Web {
         WEB
     }
 
-    fn instantiate(&self, _app: &AppContext) -> Box<dyn HostApi> {
-        Box::new(WebHost)
+    fn instantiate(&self, _app: &AppContext) -> Result<Box<dyn HostApi>, String> {
+        Ok(Box::new(WebHost))
     }
 }
 
@@ -256,17 +283,19 @@ impl HostModule for LogModule {
         LOG
     }
 
-    fn instantiate(&self, app: &AppContext) -> Box<dyn HostApi> {
-        Box::new(LogHost {
+    fn instantiate(&self, app: &AppContext) -> Result<Box<dyn HostApi>, String> {
+        Ok(Box::new(LogHost {
             app: app.app.clone(),
             quiet: app.quiet,
-        })
+            logs: Arc::clone(&app.logs),
+        }))
     }
 }
 
 struct LogHost {
     app: String,
     quiet: bool,
+    logs: Arc<LogRing>,
 }
 
 impl HostApi for LogHost {
@@ -275,9 +304,10 @@ impl HostApi for LogHost {
     }
 
     fn call(&self, op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        // The boundary held the arity and the argument to `LOG`.
+        let line = args.first().and_then(Value::as_str).unwrap_or_default();
+        self.logs.push(op, line);
         if !self.quiet {
-            // The boundary held the arity and the argument to `LOG`.
-            let line = args.first().and_then(Value::as_str).unwrap_or_default();
             println!("[{}] {op}: {line}", self.app);
         }
         Ok(Value::unit())
@@ -316,10 +346,10 @@ impl HostModule for TimerModule {
         TIMER
     }
 
-    fn instantiate(&self, app: &AppContext) -> Box<dyn HostApi> {
-        Box::new(TimerHost {
+    fn instantiate(&self, app: &AppContext) -> Result<Box<dyn HostApi>, String> {
+        Ok(Box::new(TimerHost {
             counters: Arc::clone(&app.counters),
-        })
+        }))
     }
 }
 
@@ -370,7 +400,11 @@ impl HostApi for TimerHost {
             Err(error) => return HostAnswer::Ready(Err(error)),
         };
         PendingWork::new("timer.sleep", async move {
-            tokio::time::sleep(wanted).await;
+            // Zero is a park and nothing else — the run gives its worker up
+            // and comes back — without the timer's millisecond granularity.
+            if !wanted.is_zero() {
+                tokio::time::sleep(wanted).await;
+            }
             transfer(&Value::unit())
         })
         .answer()

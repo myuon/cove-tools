@@ -17,7 +17,10 @@
 pub mod apps;
 pub mod config;
 pub mod convert;
+pub mod fetch;
 pub mod hosts;
+pub mod kv;
+pub mod logs;
 pub mod router;
 pub mod sched;
 pub mod server;
