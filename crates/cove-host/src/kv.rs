@@ -40,8 +40,9 @@
 //! `max_bytes` (keys and values summed). A `put` past one is the app's `Err`
 //! to handle, naming the quota; the store is unchanged.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cove_runtime::{
     Effect, FieldSchema, HostApi, HostType, ModuleSchema, OperationSchema, RuntimeError,
@@ -128,17 +129,15 @@ impl HostModule for KvModule {
         let store = if !app.granted.contains("kv") {
             None
         } else {
-            Some(
-                match &app.data {
-                    Some(dir) => Store::open(&dir.join("kv.sqlite3"), app.kv.clone()),
-                    None => Store::in_memory(app.kv.clone()),
-                }
-                .map_err(|why| format!("cannot open its kv store: {why}"))?,
-            )
+            Some(match &app.data {
+                Some(dir) => shared(&dir.join("kv.sqlite3"), &app.kv)?,
+                None => Arc::new(Mutex::new(
+                    Store::in_memory(app.kv.clone())
+                        .map_err(|why| format!("cannot open its kv store: {why}"))?,
+                )),
+            })
         };
-        Ok(Box::new(KvHost {
-            store: Mutex::new(store),
-        }))
+        Ok(Box::new(KvHost { store }))
     }
 }
 
@@ -351,7 +350,39 @@ fn successor(prefix: &str) -> Option<String> {
 
 struct KvHost {
     /// `None` for an app not granted `kv`, whose calls the boundary refuses.
-    store: Mutex<Option<Store>>,
+    store: Option<Arc<Mutex<Store>>>,
+}
+
+/// The stores open in this process, by file.
+fn open_stores() -> &'static Mutex<HashMap<PathBuf, Weak<Mutex<Store>>>> {
+    static OPEN: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<Store>>>>> = OnceLock::new();
+    OPEN.get_or_init(Mutex::default)
+}
+
+/// The store at `path`: the one already open, if a version of the app has
+/// it open, with the new version's quotas; or newly opened.
+///
+/// One `Store` per file however many versions of the app are alive during
+/// an update, so that its quota accounting is one account.
+fn shared(path: &Path, limits: &KvLimits) -> Result<Arc<Mutex<Store>>, String> {
+    let mut open = open_stores().lock().unwrap();
+    if let Some(store) = open.get(path).and_then(Weak::upgrade) {
+        store.lock().unwrap().limits = limits.clone();
+        return Ok(store);
+    }
+    let store = Arc::new(Mutex::new(
+        Store::open(path, limits.clone())
+            .map_err(|why| format!("cannot open its kv store: {why}"))?,
+    ));
+    open.insert(path.to_path_buf(), Arc::downgrade(&store));
+    Ok(store)
+}
+
+/// `(keys, bytes)` the store at `path` holds, if it is open.
+pub fn usage(path: &Path) -> Option<(u64, u64)> {
+    let store = open_stores().lock().unwrap().get(path)?.upgrade()?;
+    let usage = store.lock().unwrap().usage();
+    Some(usage)
 }
 
 fn storage(why: String) -> RuntimeError {
@@ -366,10 +397,10 @@ impl HostApi for KvHost {
     fn call(&self, op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         // The boundary held the arity and each argument's type to `KV`.
         let text = |at: usize| args[at].as_str().unwrap_or_default();
-        let mut guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(store) = guard.as_mut() else {
+        let Some(store) = &self.store else {
             return Err(RuntimeError::new("kv: this app has no store"));
         };
+        let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
         match op {
             "get" => Ok(match store.get(text(0)).map_err(storage)? {
                 Some(value) => Value::some(Value::string(value)),

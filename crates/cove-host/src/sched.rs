@@ -49,9 +49,9 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cove_diag::render;
 use cove_runtime::trace::RunOutcome;
@@ -62,15 +62,26 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::apps::App;
+use crate::config::AppLimits;
 use crate::convert::{request_value, response_of, AppRequest, BadResponse, Reply};
 use crate::hosts::PendingWork;
+use crate::logs::LogRing;
+use crate::stats::AppCounters;
 use crate::stats::{ErrorKind, Rejection};
+
+/// The response header naming the app version that answered.
+pub const VERSION_HEADER: &str = "x-cove-app-version";
 
 /// A request in flight: which app, since when, where its answer goes, and
 /// how it is called off.
 pub struct Flight {
     pub id: u64,
+    /// The app's slot: its queue, its counters.
     pub app: usize,
+    /// The version of the app the request was admitted to. It runs on this
+    /// version to its end, whatever the slot routes to by then; and it keeps
+    /// the version — its prepared program, its registry — alive until then.
+    pub version: Arc<App>,
     pub accepted: Instant,
     pub reply: oneshot::Sender<Reply>,
     pub cancel: Cancel,
@@ -178,20 +189,10 @@ pub struct RunQueue {
 }
 
 impl RunQueue {
-    fn new(apps: &[App], max_admitted: usize) -> RunQueue {
+    fn new(max_admitted: usize) -> RunQueue {
         RunQueue {
             state: Mutex::new(QueueState {
-                apps: apps
-                    .iter()
-                    .map(|app| AppQueue {
-                        starts: VecDeque::new(),
-                        runs: VecDeque::new(),
-                        start_next: false,
-                        in_flight: 0,
-                        max_in_flight: app.limits.max_in_flight,
-                        max_queued: app.limits.max_queued,
-                    })
-                    .collect(),
+                apps: Vec::new(),
                 cursor: 0,
                 admitted: 0,
                 closed: false,
@@ -199,6 +200,30 @@ impl RunQueue {
             ready: Condvar::new(),
             max_admitted,
         }
+    }
+
+    /// A queue for one more app; its index.
+    fn add_app(&self, limits: &AppLimits) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.apps.push(AppQueue {
+            starts: VecDeque::new(),
+            runs: VecDeque::new(),
+            start_next: false,
+            in_flight: 0,
+            max_in_flight: limits.max_in_flight,
+            max_queued: limits.max_queued,
+        });
+        state.apps.len() - 1
+    }
+
+    /// An app's limits, from the version it now routes to. What is queued
+    /// stays queued.
+    fn set_limits(&self, app: usize, limits: &AppLimits) {
+        let mut state = self.state.lock().unwrap();
+        state.apps[app].max_in_flight = limits.max_in_flight;
+        state.apps[app].max_queued = limits.max_queued;
+        drop(state);
+        self.ready.notify_all();
     }
 
     /// Queues a request, or says why not.
@@ -310,16 +335,113 @@ impl RunQueue {
 
 /// The run a worker is running now, for the monitor.
 struct Running {
-    app: usize,
+    version: Arc<App>,
     since: Instant,
     signal: YieldRequest,
     asked_at: Option<Instant>,
     overdue: bool,
 }
 
+/// One app's place in the host: its name, the version it routes to, and what
+/// outlives any one version — its queue (by index), counters and log.
+pub struct Slot {
+    pub name: String,
+    /// The index of the app's queue.
+    pub index: usize,
+    /// The version new requests go to; `None` once the app is removed.
+    current: RwLock<Option<Arc<App>>>,
+    /// Every version this slot has routed to, held weakly: a version is
+    /// alive while it routes or while any request admitted to it is in
+    /// flight, and its program is dropped with it.
+    history: Mutex<Vec<VersionRecord>>,
+    pub counters: Arc<AppCounters>,
+    pub logs: Arc<LogRing>,
+    /// The number the next version of this app is given.
+    next_version: AtomicU64,
+}
+
+/// One version a slot has routed to.
+struct VersionRecord {
+    id: String,
+    loaded: SystemTime,
+    app: Weak<App>,
+    /// The lowered program its `PreparedProgram` holds: gone when the last
+    /// run of the version has ended.
+    program: Option<Weak<cove_ir::Program>>,
+}
+
+impl Slot {
+    /// The version new requests go to.
+    pub fn current(&self) -> Option<Arc<App>> {
+        self.current.read().unwrap().clone()
+    }
+
+    /// The version number to give the next version loaded into this slot.
+    pub fn next_version(&self) -> u64 {
+        self.next_version.load(Ordering::Relaxed)
+    }
+
+    /// Every version this slot has had, as JSON: id, when it was loaded,
+    /// whether it is the current one, whether it is still alive (routed to,
+    /// or with requests in flight) and whether its program is.
+    pub fn versions(&self) -> Vec<serde_json::Value> {
+        let current = self.current().map(|app| app.version.clone());
+        let mut history = self.history.lock().unwrap();
+        // Forget long-gone versions, keeping the last few for the record.
+        let gone = history
+            .iter()
+            .filter(|record| record.app.strong_count() == 0)
+            .count();
+        if gone > 8 {
+            let mut drop_first = gone - 8;
+            history.retain(|record| {
+                if drop_first > 0 && record.app.strong_count() == 0 {
+                    drop_first -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        history
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "version": record.id,
+                    "loaded_unix_s": record.loaded.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+                    "current": current.as_deref() == Some(record.id.as_str()),
+                    "alive": record.app.strong_count() > 0,
+                    "program_alive": record.program.as_ref().is_some_and(|p| p.strong_count() > 0),
+                })
+            })
+            .collect()
+    }
+
+    /// How many of this slot's versions are alive, and how many of their
+    /// prepared programs.
+    pub fn alive(&self) -> (usize, usize) {
+        let history = self.history.lock().unwrap();
+        (
+            history.iter().filter(|r| r.app.strong_count() > 0).count(),
+            history
+                .iter()
+                .filter(|r| r.program.as_ref().is_some_and(|p| p.strong_count() > 0))
+                .count(),
+        )
+    }
+}
+
+/// What installing a version came to.
+pub struct Installed {
+    pub app: String,
+    pub version: String,
+    /// The version it replaced, if any.
+    pub previous: Option<String>,
+}
+
 /// The apps, their queues, and what the workers and the monitor share.
 pub struct Engine {
-    pub apps: Vec<App>,
+    slots: RwLock<Vec<Arc<Slot>>>,
     pub queue: RunQueue,
     running: Vec<Mutex<Option<Running>>>,
     /// How long a run may hold a worker while others wait; `None` never asks.
@@ -337,14 +459,97 @@ impl Engine {
         slice: Option<Duration>,
         io: tokio::runtime::Handle,
     ) -> Engine {
-        Engine {
-            queue: RunQueue::new(&apps, max_in_flight),
-            apps,
+        let engine = Engine {
+            slots: RwLock::new(Vec::new()),
+            queue: RunQueue::new(max_in_flight),
             running: (0..workers.max(1)).map(|_| Mutex::new(None)).collect(),
             slice,
             io,
             requests: AtomicU64::new(0),
+        };
+        for app in apps {
+            engine.install(app);
         }
+        engine
+    }
+
+    /// Every slot, in the order the apps were first loaded.
+    pub fn slots(&self) -> Vec<Arc<Slot>> {
+        self.slots.read().unwrap().clone()
+    }
+
+    /// The slot named `name`, removed or not.
+    pub fn slot_named(&self, name: &str) -> Option<Arc<Slot>> {
+        self.slots
+            .read()
+            .unwrap()
+            .iter()
+            .find(|slot| slot.name == name)
+            .cloned()
+    }
+
+    fn slot(&self, index: usize) -> Arc<Slot> {
+        Arc::clone(&self.slots.read().unwrap()[index])
+    }
+
+    /// Routes `app`'s name to it from now on: a new slot for a new name, or
+    /// the next version of an existing one. Requests already admitted to the
+    /// version it replaces finish on that version; the old version — and
+    /// its prepared program — is dropped when the last of them ends.
+    ///
+    /// The caller decides whether a version is fit to install: the host
+    /// installs only a loaded one, and keeps the current one otherwise.
+    pub fn install(&self, app: App) -> Installed {
+        let app = Arc::new(app);
+        let record = VersionRecord {
+            id: app.version.clone(),
+            loaded: SystemTime::now(),
+            app: Arc::downgrade(&app),
+            program: app
+                .ready()
+                .map(|ready| Arc::downgrade(ready.program.program())),
+        };
+        let mut slots = self.slots.write().unwrap();
+        let slot = match slots.iter().find(|slot| slot.name == app.name) {
+            Some(slot) => Arc::clone(slot),
+            None => {
+                let slot = Arc::new(Slot {
+                    name: app.name.clone(),
+                    index: self.queue.add_app(&app.limits),
+                    current: RwLock::new(None),
+                    history: Mutex::new(Vec::new()),
+                    counters: Arc::clone(&app.counters),
+                    logs: Arc::clone(&app.logs),
+                    next_version: AtomicU64::new(1),
+                });
+                slots.push(Arc::clone(&slot));
+                slot
+            }
+        };
+        drop(slots);
+        slot.next_version
+            .fetch_max(app.number + 1, Ordering::Relaxed);
+        self.queue.set_limits(slot.index, &app.limits);
+        slot.history.lock().unwrap().push(record);
+        let previous = slot
+            .current
+            .write()
+            .unwrap()
+            .replace(Arc::clone(&app))
+            .map(|old| old.version.clone());
+        Installed {
+            app: app.name.clone(),
+            version: app.version.clone(),
+            previous,
+        }
+    }
+
+    /// Stops routing to `name`. Requests in flight finish; its queue, its
+    /// counters and its data stay, and loading it again resumes the slot.
+    pub fn remove(&self, name: &str) -> Option<String> {
+        let slot = self.slot_named(name)?;
+        let old = slot.current.write().unwrap().take();
+        old.map(|old| old.version.clone())
     }
 
     /// A request id.
@@ -382,11 +587,14 @@ impl Engine {
                 // The flight went down with the job, so the HTTP side sees
                 // its oneshot dropped and answers 500. The worker lives on.
                 *self.running[worker].lock().unwrap() = None;
-                self.apps[app].counters.error(ErrorKind::Internal);
+                let slot = self.slot(app);
+                slot.counters.error(ErrorKind::Internal);
+                slot.logs
+                    .push("host", "a request's run panicked in the host; answered 500");
                 self.queue.finished(app);
                 eprintln!(
                     "cove-host: [{}] a request's run panicked in the host; answered 500",
-                    self.apps[app].name
+                    slot.name
                 );
             }
         }
@@ -396,7 +604,7 @@ impl Engine {
         match job {
             Job::Start(start) => {
                 let Start { request, flight } = *start;
-                let app = &self.apps[flight.app];
+                let app = Arc::clone(&flight.version);
                 let ready = app.ready().expect("only a loaded app is admitted");
                 if flight.cancel.is_cancelled() {
                     // The client left while it waited: nothing to run.
@@ -425,7 +633,7 @@ impl Engine {
                 let budget =
                     Budget::with_cancellation(app.limits.run.clone(), flight.cancel.flag.clone());
                 let signal = vm.yield_request();
-                let step = self.sliced(worker, flight.app, signal, || {
+                let step = self.sliced(worker, &app, signal, || {
                     let argument = request_value(&request);
                     vm.invoke_within_parkable(
                         budget,
@@ -445,7 +653,8 @@ impl Engine {
                 let step = match answer {
                     Some(answer) => {
                         let signal = parked.yield_request();
-                        self.sliced(worker, flight.app, signal, || parked.resume(answer))
+                        let version = Arc::clone(&flight.version);
+                        self.sliced(worker, &version, signal, || parked.resume(answer))
                     }
                     None => {
                         let (vm, error) = parked.cancel();
@@ -457,7 +666,8 @@ impl Engine {
             Job::Continue(cont) => {
                 let Continue { yielded, flight } = *cont;
                 let signal = yielded.yield_request();
-                let step = self.sliced(worker, flight.app, signal, || yielded.resume());
+                let version = Arc::clone(&flight.version);
+                let step = self.sliced(worker, &version, signal, || yielded.resume());
                 self.settle(step, flight);
             }
         }
@@ -468,14 +678,14 @@ impl Engine {
     fn sliced(
         &self,
         worker: usize,
-        app: usize,
+        app: &Arc<App>,
         signal: YieldRequest,
         step: impl FnOnce() -> Step,
     ) -> Step {
         let since = Instant::now();
         if self.slice.is_some() {
             *self.running[worker].lock().unwrap() = Some(Running {
-                app,
+                version: Arc::clone(app),
                 since,
                 signal,
                 asked_at: None,
@@ -486,8 +696,7 @@ impl Engine {
         if self.slice.is_some() {
             *self.running[worker].lock().unwrap() = None;
         }
-        self.apps[app]
-            .counters
+        app.counters
             .worker_ns
             .fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
         step
@@ -495,7 +704,11 @@ impl Engine {
 
     /// Answers `flight` with `reply`, counted as `kind`.
     fn fail(&self, flight: Flight, kind: ErrorKind, reply: Reply) {
-        self.apps[flight.app].counters.error(kind);
+        let app = &flight.version;
+        app.counters.error(kind);
+        app.counters
+            .recent_error(kind, &app.version, reply.body.as_str());
+        let reply = reply.with_header(VERSION_HEADER, app.version.as_str());
         let _ = flight.reply.send(reply);
         self.queue.finished(flight.app);
     }
@@ -503,7 +716,7 @@ impl Engine {
     /// What a run came to: an answer to send, a park to hand on, or a yield
     /// to queue.
     fn settle(self: &Arc<Self>, step: Step, flight: Flight) {
-        let app = &self.apps[flight.app];
+        let app = Arc::clone(&flight.version);
         let counters = &app.counters;
         match step {
             Step::Answered(vm, outcome) => {
@@ -557,12 +770,18 @@ impl Engine {
                     Ok(reply) => {
                         counters.served.fetch_add(1, Ordering::Relaxed);
                         counters.ok.fetch_add(1, Ordering::Relaxed);
+                        let reply = reply.with_header(VERSION_HEADER, app.version.as_str());
                         let _ = flight.reply.send(reply);
                         self.queue.finished(flight.app);
                     }
                     Err((kind, body)) => {
-                        let line =
-                            format!("{} {}: {}", kind.status(), kind.name(), first_line(&body));
+                        let line = format!(
+                            "{} {} ({}): {}",
+                            kind.status(),
+                            kind.name(),
+                            app.version,
+                            first_line(&body)
+                        );
                         app.logs.push("host", &line);
                         if kind != ErrorKind::Cancelled {
                             eprintln!("cove-host: [{}] {line}", app.name);
@@ -618,7 +837,8 @@ impl Engine {
         flight: Flight,
     ) {
         let app = flight.app;
-        self.apps[app]
+        flight
+            .version
             .counters
             .parked
             .fetch_sub(1, Ordering::Relaxed);
@@ -656,7 +876,7 @@ impl Engine {
                 let Some(run) = running.as_mut() else {
                     continue;
                 };
-                let counters = &self.apps[run.app].counters;
+                let counters = &run.version.counters;
                 match run.asked_at {
                     None if waiting && now.duration_since(run.since) >= slice => {
                         run.signal.request();
@@ -672,9 +892,9 @@ impl Engine {
                              callee of compiled code); its deadline still bounds it ({n} so far)",
                             now.duration_since(asked).as_millis()
                         );
-                        self.apps[run.app].logs.push("host", &line);
+                        run.version.logs.push("host", &line);
                         if n.is_power_of_two() {
-                            eprintln!("cove-host: [{}] {line}", self.apps[run.app].name);
+                            eprintln!("cove-host: [{}] {line}", run.version.name);
                         }
                     }
                     _ => {}

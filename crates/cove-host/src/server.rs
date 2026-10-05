@@ -19,6 +19,10 @@
 //! | body that is not UTF-8 | 400 |
 //! | the app has `max_queued` requests waiting | 429, `Retry-After: 1` |
 //! | the server has `--max-in-flight` requests admitted | 503, `Retry-After: 1` |
+//!
+//! A second listener, the **admin** one ([`crate::admin`]), takes updates.
+//! An update loads the new version off the request path and switches the
+//! app's route to it only if it loaded; see [`Host::update`].
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -36,15 +40,16 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use serde_json::{json, Map, Value as Json};
+use serde_json::Value as Json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, Semaphore};
 
-use crate::apps::{list, load_all, App, AppState, Backend, LoadOptions};
+use crate::apps::{load_all, load_as, App, AppState, Backend, Lineage, LoadOptions};
 use crate::convert::{AppRequest, Reply};
 use crate::hosts::HostModules;
+use crate::ops::{self, OpsContext};
 use crate::router::{PathPrefix, Router};
-use crate::sched::{Cancel, Engine, Flight, Start};
+use crate::sched::{Cancel, Engine, Flight, Installed, Start};
 use crate::stats::{Rejection, ServerCounters};
 
 /// How to start a host.
@@ -71,6 +76,12 @@ pub struct ServeOptions {
     /// Where apps keep their state, one directory per app; `None` keeps it
     /// in memory, gone at exit.
     pub data: Option<PathBuf>,
+    /// Where the admin listener listens; `None` has none (no updates but a
+    /// restart).
+    pub admin: Option<String>,
+    /// The admin token. `None` reads `<data>/admin.token`, writing a fresh
+    /// random one there first if there is none.
+    pub admin_token: Option<String>,
 }
 
 impl ServeOptions {
@@ -88,24 +99,46 @@ impl ServeOptions {
             quiet: false,
             modules: HostModules::standard(),
             data: Some(PathBuf::from("data")),
+            admin: Some("127.0.0.1:8081".to_string()),
+            admin_token: None,
         }
     }
 }
 
 /// What the connection tasks share.
-struct Front {
-    engine: Arc<Engine>,
+pub(crate) struct Front {
+    pub(crate) engine: Arc<Engine>,
     router: Box<dyn Router>,
     counters: ServerCounters,
     connections: Arc<Semaphore>,
     started: Instant,
-    options: ServeOptions,
+    pub(crate) options: ServeOptions,
+    /// How an update loads a version: the options the first load had.
+    load: LoadOptions,
+    /// One update at a time, so that two cannot race for a version number.
+    updating: tokio::sync::Mutex<()>,
+    pub(crate) admin_token: String,
+}
+
+/// Why an update did not happen.
+#[derive(Debug)]
+pub enum UpdateError {
+    /// No directory with an `app.toml` by that name.
+    NotFound(String),
+    /// The new version did not load; the current one still serves. The
+    /// reason, with the diagnostics.
+    Refused {
+        current: Option<String>,
+        why: String,
+    },
 }
 
 /// A running host.
 pub struct Host {
     /// Where it listens.
     pub addr: SocketAddr,
+    /// Where the admin listener listens, if there is one.
+    pub admin_addr: Option<SocketAddr>,
     front: Arc<Front>,
     runtime: Option<tokio::runtime::Runtime>,
     _workers: Vec<JoinHandle<()>>,
@@ -130,7 +163,7 @@ impl Host {
             io: runtime.handle().clone(),
         };
         let apps = load_all(&options.apps, &load)?;
-        Host::launch(runtime, apps, options)
+        Host::launch(runtime, apps, options, load)
     }
 
     /// Starts a host over apps already loaded on `runtime`.
@@ -138,12 +171,31 @@ impl Host {
         runtime: tokio::runtime::Runtime,
         apps: Vec<App>,
         options: ServeOptions,
+        load: LoadOptions,
     ) -> Result<Host, String> {
         let listener = std::net::TcpListener::bind(&options.addr)
             .map_err(|e| format!("cannot listen on `{}`: {e}", options.addr))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        let router = PathPrefix::new(apps.iter().map(|app| app.name.as_str()));
+        let admin = match &options.admin {
+            Some(at) => {
+                let admin = std::net::TcpListener::bind(at)
+                    .map_err(|e| format!("cannot listen on `{at}` for the admin: {e}"))?;
+                admin.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Some(admin)
+            }
+            None => None,
+        };
+        let admin_addr = admin
+            .as_ref()
+            .map(|admin| admin.local_addr().map_err(|e| e.to_string()))
+            .transpose()?;
+        let admin_token = match (&options.admin_token, &options.admin) {
+            (Some(token), _) => token.clone(),
+            (None, None) => String::new(),
+            (None, Some(_)) => crate::admin::token_file(options.data.as_deref())?,
+        };
+        let router = PathPrefix;
         let engine = Arc::new(Engine::new(
             apps,
             options.workers,
@@ -160,28 +212,66 @@ impl Host {
             connections: Arc::new(Semaphore::new(options.max_connections.max(1))),
             started: Instant::now(),
             options,
+            load,
+            updating: tokio::sync::Mutex::new(()),
+            admin_token,
         });
-        let listener = {
+        let (listener, admin) = {
             let _entered = runtime.enter();
-            tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?
+            (
+                tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?,
+                admin
+                    .map(tokio::net::TcpListener::from_std)
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
+            )
         };
         runtime.spawn(Arc::clone(&front).accept(listener));
+        if let Some(admin) = admin {
+            runtime.spawn(crate::admin::serve(Arc::clone(&front), admin));
+        }
         Ok(Host {
             addr,
+            admin_addr,
             front,
             runtime: Some(runtime),
             _workers: workers,
         })
     }
 
-    /// Every app, loaded or refused.
-    pub fn apps(&self) -> &[App] {
-        &self.front.engine.apps
+    /// The version each app routes to now, loaded or refused; removed apps
+    /// are left out.
+    pub fn apps(&self) -> Vec<Arc<App>> {
+        self.front
+            .engine
+            .slots()
+            .iter()
+            .filter_map(|slot| slot.current())
+            .collect()
     }
 
     /// What `GET /_host/stats` answers.
     pub fn stats(&self) -> Json {
-        self.front.stats()
+        ops::stats(&self.front.ops())
+    }
+
+    /// What `GET /_host/apps/<app>` answers.
+    pub fn app_detail(&self, name: &str) -> Option<Json> {
+        let slot = self.front.engine.slot_named(name)?;
+        Some(ops::app_detail(&self.front.ops(), &slot))
+    }
+
+    /// Loads the app `name` again from its directory and, if it loads,
+    /// routes to the new version: what `POST /apps/<name>/update` on the
+    /// admin listener does.
+    pub fn update(&self, name: &str) -> Result<Installed, UpdateError> {
+        let runtime = self.runtime.as_ref().expect("running");
+        runtime.block_on(self.front.update(name))
+    }
+
+    /// The admin token.
+    pub fn admin_token(&self) -> &str {
+        &self.front.admin_token
     }
 
     /// The startup banner: one line per app, and where to look.
@@ -205,9 +295,19 @@ impl Host {
             },
         ));
         out.push_str(&format!(
-            "  stats: curl -s http://{}/_host/stats\n",
-            self.addr
+            "  stats: curl -s http://{}/_host/stats   ops page: http://{}/_host/ui\n",
+            self.addr, self.addr
         ));
+        if let Some(admin) = self.admin_addr {
+            out.push_str(&format!(
+                "  admin: http://{admin} (token in {}); update with `cove-host update <app>`\n",
+                match (&self.front.options.admin_token, &self.front.options.data) {
+                    (Some(_), _) => "--admin-token".to_string(),
+                    (None, Some(data)) => data.join("admin.token").display().to_string(),
+                    (None, None) => "admin.token".to_string(),
+                }
+            ));
+        }
         out
     }
 
@@ -283,12 +383,13 @@ impl Front {
     async fn reply(&self, request: Request<Incoming>) -> Reply {
         let path = request.uri().path().to_string();
         if path == "/_host/stats" {
-            let mut body = serde_json::to_string_pretty(&self.stats()).unwrap_or_default();
-            body.push('\n');
+            return json_reply(&ops::stats(&self.ops()));
+        }
+        if path == "/_host/ui" {
             return Reply {
                 status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body,
+                headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+                body: ops::page(&self.ops()),
             };
         }
         if path == "/" {
@@ -296,9 +397,18 @@ impl Front {
         }
         if let Some(name) = path
             .strip_prefix("/_host/apps/")
+            .filter(|n| !n.contains('/'))
+        {
+            return match self.engine.slot_named(name) {
+                Some(slot) => json_reply(&ops::app_detail(&self.ops(), &slot)),
+                None => Reply::text(404, format!("no app named `{name}`\n")),
+            };
+        }
+        if let Some(name) = path
+            .strip_prefix("/_host/apps/")
             .and_then(|rest| rest.strip_suffix("/logs"))
         {
-            let Some(app) = self.engine.apps.iter().find(|app| app.name == name) else {
+            let Some(app) = self.engine.slot_named(name) else {
                 return Reply::text(404, format!("no app named `{name}`\n"));
             };
             let lines = request
@@ -322,10 +432,16 @@ impl Front {
             .map(|host| host.split(':').next().unwrap_or(host).to_string());
         let Some(route) = self.router.route(host.as_deref(), &path) else {
             self.counters.not_found.fetch_add(1, Ordering::Relaxed);
-            let name = self.router.asked_for(host.as_deref(), &path);
-            return Reply::text(404, format!("no app named `{name}`\n"));
+            return Reply::text(404, "no app here; try /\n");
         };
-        let app = &self.engine.apps[route.app];
+        let found = self
+            .engine
+            .slot_named(&route.app)
+            .and_then(|slot| Some((slot.index, slot.current()?)));
+        let Some((index, app)) = found else {
+            self.counters.not_found.fetch_add(1, Ordering::Relaxed);
+            return Reply::text(404, format!("no app named `{}`\n", route.app));
+        };
         if let AppState::Refused(why) = &app.state {
             return Reply::text(503, format!("app `{}` was not loaded: {why}\n", app.name));
         }
@@ -395,13 +511,14 @@ impl Front {
             },
             flight: Flight {
                 id: self.engine.next_id(),
-                app: route.app,
+                app: index,
+                version: Arc::clone(&app),
                 accepted: Instant::now(),
                 reply,
                 cancel: cancel.clone(),
             },
         });
-        if let Err(why) = self.engine.queue.admit(route.app, start) {
+        if let Err(why) = self.engine.queue.admit(index, start) {
             app.counters.rejected(why);
             return match why {
                 Rejection::QueueFull => Reply::text(
@@ -441,82 +558,113 @@ impl Front {
 
     fn index(&self) -> String {
         let mut out = String::from("cove-host: Cove apps, one isolate per request\n\n");
-        for app in &self.engine.apps {
+        for app in self.engine.slots().iter().filter_map(|slot| slot.current()) {
             out.push_str(&format!("  /{}/  {}\n", app.name, app.describe()));
         }
-        out.push_str("\n  /_host/stats  per-app counters, queues and work, as JSON\n");
+        out.push_str("\n  /_host/ui  the operations page\n");
+        out.push_str("  /_host/stats  per-app counters, queues and work, as JSON\n");
+        out.push_str("  /_host/apps/<app>  one app, its versions and recent errors, as JSON\n");
         out.push_str("  /_host/apps/<app>/logs?n=200  an app's recent log lines\n");
         out
     }
 
-    fn stats(&self) -> Json {
-        let engine = &self.engine;
-        let mut apps = Map::new();
-        let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
-        for (at, app) in engine.apps.iter().enumerate() {
-            let (in_flight, queued) = engine.queue.gauges(at);
-            let mut entry = app.counters.to_json(in_flight, queued);
-            for key in [
-                "served",
-                "ok",
-                "in_flight",
-                "queued",
-                "parked",
-                "parks",
-                "yields",
-                "yield_requests",
-                "yields_declined",
-                "overdue_yields",
-                "blocking_host_calls",
-                "instructions",
-                "fuel",
-                "worker_ms",
-            ] {
-                *totals.entry(key).or_default() += entry[key].as_f64().unwrap_or_default();
-            }
-            for group in ["errors", "rejected"] {
-                let sum: f64 = entry[group]
-                    .as_object()
-                    .map(|counts| counts.values().filter_map(Json::as_f64).sum())
-                    .unwrap_or_default();
-                *totals.entry(group).or_default() += sum;
-            }
-            let object = entry.as_object_mut().expect("an object");
-            let (state, tier, reason) = match &app.state {
-                AppState::Ready(ready) => ("ready", Json::from(ready.tier), Json::Null),
-                AppState::Refused(why) => ("refused", Json::Null, Json::from(why.as_str())),
-            };
-            object.insert("state".into(), json!(state));
-            object.insert("tier".into(), tier);
-            object.insert("refused".into(), reason);
-            object.insert("required".into(), json!(list(&app.required)));
-            object.insert("granted".into(), json!(list(&app.granted)));
-            apps.insert(app.name.clone(), entry);
+    pub(crate) fn ops_context(&self) -> OpsContext<'_> {
+        self.ops()
+    }
+
+    fn ops(&self) -> OpsContext<'_> {
+        OpsContext {
+            engine: &self.engine,
+            counters: &self.counters,
+            started: self.started,
+            max_in_flight: self.options.max_in_flight,
+            data: self.options.data.as_deref(),
         }
-        let totals: Map<String, Json> = totals
-            .into_iter()
-            .map(|(key, value)| {
-                let value = if key == "worker_ms" {
-                    json!(value)
-                } else {
-                    json!(value as u64)
-                };
-                (key.to_string(), value)
-            })
-            .collect();
-        let read = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
-        json!({
-            "uptime_s": self.started.elapsed().as_secs_f64(),
-            "workers": engine.workers(),
-            "slice_ms": engine.slice.map(|slice| slice.as_secs_f64() * 1e3),
-            "connections": read(&self.counters.connections),
-            "rejected_connections": read(&self.counters.rejected_connections),
-            "not_found": read(&self.counters.not_found),
-            "admitted": engine.queue.admitted(),
-            "max_in_flight": self.options.max_in_flight,
-            "totals": totals,
-            "apps": apps,
-        })
+    }
+
+    /// Loads `name` from `<apps>/<name>` as the app's next version, off the
+    /// request path (on a blocking thread, neither a worker nor the I/O
+    /// runtime's), and routes to it only if it loaded. A new name is a new
+    /// app. Requests already admitted — queued, running, yielded or parked —
+    /// finish on the version they were admitted to.
+    pub(crate) async fn update(&self, name: &str) -> Result<Installed, UpdateError> {
+        let _one_at_a_time = self.updating.lock().await;
+        let dir = self.options.apps.join(name);
+        if !dir.join("app.toml").is_file() {
+            return Err(UpdateError::NotFound(format!(
+                "no app named `{name}` in `{}` (an app is a directory with an `app.toml`)",
+                self.options.apps.display()
+            )));
+        }
+        let slot = self.engine.slot_named(name);
+        let current = slot
+            .as_ref()
+            .and_then(|slot| slot.current())
+            .map(|app| app.version.clone());
+        let lineage = match &slot {
+            Some(slot) => Lineage {
+                counters: Arc::clone(&slot.counters),
+                logs: Arc::clone(&slot.logs),
+                number: slot.next_version(),
+            },
+            None => Lineage::first(),
+        };
+        let load = self.load.clone();
+        let owned = name.to_string();
+        let app = tokio::task::spawn_blocking(move || load_as(&owned, &dir, &load, lineage))
+            .await
+            .map_err(|e| UpdateError::Refused {
+                current: current.clone(),
+                why: format!("the load failed: {e}"),
+            })?;
+        if let AppState::Refused(why) = &app.state {
+            app.counters.updates_refused.fetch_add(1, Ordering::Relaxed);
+            let line = format!(
+                "update to {} refused, still serving {}: {}",
+                app.version,
+                current.as_deref().unwrap_or("nothing"),
+                why.lines().next().unwrap_or_default()
+            );
+            app.logs.push("host", &line);
+            eprintln!("cove-host: [{name}] {line}");
+            return Err(UpdateError::Refused {
+                current,
+                why: why.clone(),
+            });
+        }
+        let counters = Arc::clone(&app.counters);
+        let logs = Arc::clone(&app.logs);
+        let installed = self.engine.install(app);
+        counters.updates.fetch_add(1, Ordering::Relaxed);
+        let line = format!(
+            "updated: {} -> {}",
+            installed.previous.as_deref().unwrap_or("nothing"),
+            installed.version
+        );
+        logs.push("host", &line);
+        eprintln!("cove-host: [{name}] {line}");
+        Ok(installed)
+    }
+
+    /// Stops routing to `name`; what is in flight finishes.
+    pub(crate) fn remove(&self, name: &str) -> Option<String> {
+        let removed = self.engine.remove(name)?;
+        if let Some(slot) = self.engine.slot_named(name) {
+            slot.logs.push("host", &format!("removed (was {removed})"));
+        }
+        eprintln!("cove-host: [{name}] removed (was {removed})");
+        Some(removed)
+    }
+}
+
+/// A JSON reply.
+pub(crate) fn json_reply(value: &Json) -> Reply {
+    let mut body = serde_json::to_string_pretty(value).unwrap_or_default();
+    body.push('\n');
+    Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body,
     }
 }
 
@@ -539,7 +687,7 @@ impl Drop for CancelOnDrop {
 }
 
 /// A reply as the hyper response.
-fn to_response(reply: Reply) -> Response<Full<Bytes>> {
+pub(crate) fn to_response(reply: Reply) -> Response<Full<Bytes>> {
     let mut builder = Response::builder().status(reply.status);
     for (name, value) in &reply.headers {
         builder = builder.header(name.as_str(), value.as_str());
