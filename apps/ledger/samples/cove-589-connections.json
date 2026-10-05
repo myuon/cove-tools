@@ -1,0 +1,757 @@
+{
+ "schema": 1,
+ "id": "cove-589-connections",
+ "repository": "myuon/cove",
+ "commit": "fcf64a9",
+ "measuredAt": "2026-10-04T22:29:20+09:00",
+ "source": "examples/edge/compare/results/connections.jsonl",
+ "note": "#589's comparison of the edge server against the same service in Go. Measured on 2026-10-04 before this commit (the rows carry no time); the time is the commit's.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "hello-connections",
+   "input": "pool=64 rate=10000",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.46484375,
+    3.3212890625,
+    3.6728515625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9990.16,
+      9993.91,
+      9987.65
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.3769,
+      1.3934,
+      1.5321
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.3294,
+      2.3412,
+      2.4744
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.9323,
+      2.9346,
+      3.0051
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3.7664,
+      3.7096,
+      3.8285
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      2.6500000000000004,
+      2.67,
+      2.5300000000000002
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      31860,
+      33000,
+      31088
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=64 rate=10000",
+   "inputSize": 64,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.7001953125,
+    3.4443359375,
+    3.7353515625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9992.51,
+      9993.48,
+      9991.89
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.3363,
+      1.3497,
+      1.4235
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.2945,
+      2.3183,
+      2.383
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.9,
+      2.9204,
+      2.9464
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3.6975,
+      3.5769,
+      3.9468
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      1.88,
+      1.84,
+      1.82
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      12652,
+      12624,
+      12628
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=256 rate=10000",
+   "inputSize": 256,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.72412109375,
+    3.24853515625,
+    3.51611328125
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9992.19,
+      9993.3,
+      9992.76
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.1937,
+      1.2304,
+      1.2395
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.1943,
+      2.2201,
+      2.2142
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.9318,
+      2.9182,
+      2.911
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      4.5244,
+      4.4768,
+      4.3029
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      3.74,
+      3.77,
+      3.76
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      32624,
+      32524,
+      30364
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=256 rate=10000",
+   "inputSize": 256,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.5859375,
+    3.62890625,
+    3.875
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9992.86,
+      9993.27,
+      9991.38
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.2698,
+      1.3214,
+      1.3326
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.2366,
+      2.2893,
+      2.3072
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.8996,
+      2.9249,
+      2.9549
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3.8056,
+      3.6386,
+      3.6575
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      1.92,
+      1.88,
+      1.89
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      15296,
+      15760,
+      15320
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=1000 rate=10000",
+   "inputSize": 1000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    3.09912109375,
+    3.578125,
+    3.64453125
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9979.45,
+      9988.05,
+      9983.68
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.2638,
+      1.3711,
+      1.3319
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.4273,
+      2.5372,
+      2.5363
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      3.9367,
+      4.1701,
+      4.2736
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      7.5004,
+      6.0655,
+      6.7435
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      5.31,
+      5.4,
+      5.4799999999999995
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      36732,
+      35804,
+      34900
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=1000 rate=10000",
+   "inputSize": 1000,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.92333984375,
+    3.482421875,
+    3.46484375
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9988.07,
+      9989.85,
+      9990.94
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.3069,
+      1.2916,
+      1.3325
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.2947,
+      2.2732,
+      2.3046
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.9512,
+      2.9418,
+      2.9396
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      3.8835,
+      4.4653,
+      4.1144
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      2.0500000000000003,
+      2.0500000000000003,
+      1.9999999999999998
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      34228,
+      34316,
+      34756
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=4000 rate=10000",
+   "inputSize": 4000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    2.76904296875,
+    3.283203125,
+    3.98779296875
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9953.56,
+      9958.82,
+      9962.56
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3.529,
+      3.8619,
+      3.8196
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      6.8588,
+      7.7395,
+      7.6121
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      11.0006,
+      11.8225,
+      11.8838
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      19.8583,
+      16.9723,
+      16.432
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      5.68,
+      5.67,
+      5.67
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      46372,
+      47764,
+      44748
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=4000 rate=10000",
+   "inputSize": 4000,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    3.34765625,
+    3.90087890625,
+    3.90869140625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9970.35,
+      9976.54,
+      9976.4
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      0.7097,
+      0.7366,
+      0.759
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      2.0414,
+      2.0643,
+      2.1052
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.9913,
+      2.9906,
+      3.0101
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      11.7871,
+      7.4825,
+      6.8162
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      2.4400000000000004,
+      2.4400000000000004,
+      2.4200000000000004
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      110056,
+      109908,
+      110624
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=10000 rate=10000",
+   "inputSize": 10000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    3.29345703125,
+    3.89013671875,
+    3.9765625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9905.78,
+      9914.52,
+      9910.31
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      7.7874,
+      8.1608,
+      8.4657
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      14.3256,
+      14.9341,
+      15.724
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      20.8252,
+      22.0483,
+      23.9399
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      44.1165,
+      42.4251,
+      39.7622
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      5.7,
+      5.71,
+      5.72
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      62192,
+      61696,
+      63292
+     ]
+    }
+   }
+  },
+  {
+   "case": "hello-connections",
+   "input": "pool=10000 rate=10000",
+   "inputSize": 10000,
+   "backend": "go",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    3.349609375,
+    3.81884765625,
+    3.97802734375
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      9973.22,
+      9974.78,
+      9966.85
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      0.0642,
+      0.0639,
+      0.0628
+     ]
+    },
+    "p90": {
+     "unit": "ms",
+     "values": [
+      1.1958,
+      1.1881,
+      1.2028
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.7187,
+      2.6371,
+      2.5348
+     ]
+    },
+    "max": {
+     "unit": "ms",
+     "values": [
+      6.4999,
+      5.037,
+      5.298
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      2.4600000000000004,
+      2.5100000000000002,
+      2.4400000000000004
+     ]
+    },
+    "memory": {
+     "unit": "KiB",
+     "values": [
+      148028,
+      147288,
+      141272
+     ]
+    }
+   }
+  }
+ ]
+}

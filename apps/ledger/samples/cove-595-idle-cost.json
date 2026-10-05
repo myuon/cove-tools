@@ -1,0 +1,287 @@
+{
+ "schema": 1,
+ "id": "cove-595-idle-cost",
+ "repository": "myuon/cove",
+ "commit": "92c0ef0",
+ "measuredAt": "2026-10-05T10:02:33+09:00",
+ "source": "examples/edge/compare/results/idle-cost.jsonl",
+ "note": "#595's count of the idle poller's cost, on a build with wake-up counters (`scratch/cove-edge-lotkq-stats`). Measured before the commit; the time is the commit's.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "hello-idle",
+   "input": "rate=10000 conns=64",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    6.42236328125,
+    7.20556640625
+   ],
+   "metrics": {
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.3671,
+      1.5539
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.8778,
+      2.9583
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      2.7600000000000002,
+      2.54
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      69.0,
+      63.5
+     ]
+    },
+    "idleWakes": {
+     "unit": "/s",
+     "values": [
+      6878.794693051495,
+      6254.402837800704
+     ],
+     "better": "lower"
+    }
+   }
+  },
+  {
+   "case": "hello-idle",
+   "input": "rate=10000 conns=256",
+   "inputSize": 256,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    7.02880859375,
+    6.86865234375
+   ],
+   "metrics": {
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.1592,
+      1.2295
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      2.8386,
+      2.8558
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      4.15,
+      3.84
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      103.75000000000001,
+      96.0
+     ]
+    },
+    "idleWakes": {
+     "unit": "/s",
+     "values": [
+      4990.5080681420795,
+      4468.754683051101
+     ],
+     "better": "lower"
+    }
+   }
+  },
+  {
+   "case": "hello-idle",
+   "input": "rate=10000 conns=1000",
+   "inputSize": 1000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    6.5458984375,
+    6.3984375
+   ],
+   "metrics": {
+    "p50": {
+     "unit": "ms",
+     "values": [
+      1.2962,
+      1.3972
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      4.1663,
+      4.2355
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      5.97,
+      5.47
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      149.25,
+      136.75
+     ]
+    },
+    "idleWakes": {
+     "unit": "/s",
+     "values": [
+      2051.1796280114845,
+      2073.8373979680987
+     ],
+     "better": "lower"
+    }
+   }
+  },
+  {
+   "case": "hello-idle",
+   "input": "rate=10000 conns=4000",
+   "inputSize": 4000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    6.90234375,
+    6.3662109375
+   ],
+   "metrics": {
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3.855,
+      3.9908
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      11.5547,
+      12.9198
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      6.02,
+      5.69
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      150.5,
+      142.25
+     ]
+    },
+    "idleWakes": {
+     "unit": "/s",
+     "values": [
+      500.90870615181615,
+      506.5428450823132
+     ],
+     "better": "lower"
+    }
+   }
+  },
+  {
+   "case": "hello-idle",
+   "input": "rate=10000 conns=10000",
+   "inputSize": 10000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    7.310546875,
+    6.73193359375
+   ],
+   "metrics": {
+    "p50": {
+     "unit": "ms",
+     "values": [
+      7.9898,
+      8.1767
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      23.0923,
+      22.143
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      5.79,
+      5.79
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      144.75,
+      144.75
+     ]
+    },
+    "idleWakes": {
+     "unit": "/s",
+     "values": [
+      350.2588119299975,
+      336.6051953202459
+     ],
+     "better": "lower"
+    }
+   }
+  }
+ ]
+}

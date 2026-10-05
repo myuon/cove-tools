@@ -1,0 +1,227 @@
+# The bench ledger
+
+A Cove app on cove-host (issue #3). Benchmark runs are **posted as JSON**,
+checked, kept in the app's key-value store, and shown as pages: the run list
+and each run in full. Validation, unit conversion, the stored layout and the
+HTML are Cove; the host supplies the store, the log and the credential check.
+
+| path (below `/ledger`) | what | auth |
+| --- | --- | --- |
+| `POST /api/runs` | stores a run (`content-type: application/json`). `201` stored, `200` the same run was already stored, `400` with every problem, `409` another run has this ID | `post` secret |
+| `DELETE /api/runs/<id>` | deletes a run and everything kept for it | `post` secret |
+| `GET /api/runs`, `GET /api/runs/<id>` | the run list's summaries, and a run as stored, as JSON | none |
+| `GET /` | the runs, newest measured first, 50 a page (`?before=`; `?format=json`) | none |
+| `GET /runs/<id>` | one run: where and how it was measured, and every result's median and spread (`?format=json`: as stored) | none |
+
+Reading is open — a ledger of benchmark numbers is meant to be looked at;
+put the host behind something that asks for a login if yours is not.
+
+## Posting a run
+
+```console
+$ export LEDGER_TOKEN=change-me            # the post secret; the app is refused without it
+$ ./target/checked/cove-host serve --apps apps
+$ curl -s -H "authorization: Bearer $LEDGER_TOKEN" -H 'content-type: application/json' \
+    --data @apps/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
+{"ok":true,"results":12,"run":"cove-593-capacity","stored":true,"url":"/ledger/runs/cove-593-capacity"}
+$ curl -s -H "authorization: Bearer $LEDGER_TOKEN" -H 'content-type: application/json' \
+    --data @apps/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
+{"duplicate":true,"ok":true,"run":"cove-593-capacity","stored":false}
+```
+
+Then open `http://127.0.0.1:8080/ledger/`. Stop the host and start it again:
+the runs are still there, in `data/ledger/kv.sqlite3`.
+
+### The sample data: the existing Cove results
+
+`apps/ledger/samples/` holds the existing measurements converted to runs —
+22 of them — and `importer/ledger_import.py` is what converted them and what
+posts them:
+
+```console
+$ python3 apps/ledger/importer/ledger_import.py post --url http://127.0.0.1:8080/ledger apps/ledger/samples/*.json
+201 apps/ledger/samples/cove-589-capacity.json: {"ok":true,"results":20,…}
+…
+$ python3 apps/ledger/importer/ledger_import.py convert --cove ../cove --tools . --out apps/ledger/samples   # to convert again
+```
+
+| runs | from | commit |
+| --- | --- | --- |
+| `cove-589-capacity`, `-sweep`, `-connections`, `-waiting` | cove `examples/edge/compare/results/*.jsonl`: #589, the edge server against the same service in Go (VM and Go) | `fcf64a9` |
+| `cove-593-capacity`, `cove-593-sweep` | `results/native/*.jsonl`: #593, the native tier re-measured against the VM and Go | `11ce12f` |
+| `cove-595-ab-<experiment>-<build>` (13), `cove-595-idle-cost` | `results/ab-*.jsonl`, `idle-cost.jsonl`: #595's A/B rounds of scratch builds, one run per build (`base` is `fcf64a9`; `sock`, `wake` and `kqueue2` are the branches later merged as #597, #598 and #599) | per build |
+| `cove-host-perf-2026-10-05`, `-noslice` | this repository's `bench/results/perf-*.txt` (`bench/perf.sh`, cove-host under the same kinds of load) | `00b397e` |
+
+The converter reads exactly those formats; it is not a general importer. A
+new kind of result gets a converter there, or its script writes the schema
+below itself. The edge rows carry no time of day, so #589's runs carry the
+time of the commit that added them (each run's `note` says so).
+
+## The schema
+
+```json
+{
+  "schema": 1,
+  "id": "cove-593-capacity",
+  "repository": "myuon/cove",
+  "commit": "11ce12f",
+  "measuredAt": "2026-10-05T02:09:26+09:00",
+  "source": "examples/edge/compare/results/native/capacity.jsonl",
+  "note": "anything worth knowing about the run",
+  "environment": {"cpu": "Intel i7-10700K, 8 cores / 16 threads", "memory": "32 GB", "os": "macOS 26.6.2", "arch": "x86_64"},
+  "toolchain": {"rustc": "1.98.1", "go": "1.23.2", "profile": "release"},
+  "conditions": {"server": "cove-edge", "workers": "4", "generator": "cove-edge-load"},
+  "results": [
+    {
+      "case": "crunch",
+      "input": "c=16",
+      "inputSize": 16,
+      "backend": "native",
+      "conditions": {"latency": "from the send"},
+      "load": [2.6, 2.6, 2.5],
+      "metrics": {
+        "throughput": {"unit": "req/s", "values": [2769.67, 2783.08, 2784.37]},
+        "p99": {"unit": "ms", "values": [8.86, 8.8, 8.7]},
+        "memory": {"unit": "KiB", "values": [33212, 32412, 32161]}
+      }
+    }
+  ]
+}
+```
+
+- **Required**: `id` (letters, digits, `.`, `_`, `-`; at most 100 — it is
+  part of a URL), `repository`, `commit`, `measuredAt` (ISO 8601 with a zone),
+  `environment` (at least one entry) and `results` (1–5000). Each result
+  needs `case`, `backend` and `metrics`; each metric `unit` and `values`.
+- **Optional**: `schema` (1), `source`, `note`, `toolchain`, `conditions`
+  (run-wide; a result's own are laid over them), and per result `input` (a
+  label), `inputSize` (a number) and `load` (the load average before each
+  repetition). A metric may say `"better": "higher"` or `"lower"`; by default
+  a rate is better higher and everything else lower.
+- **`values` are the raw repetitions**, one number each, and are stored as
+  sent. The page shows their median with the least and the most.
+- `environment`, `toolchain` and `conditions` are text (`"4"`, not `4`):
+  they are compared as written.
+- A case is measured once per run on each backend at each input: the same
+  `case`, `input` and `backend` twice is an error (the repetitions go in
+  `values`).
+
+### Validation
+
+A post that breaks any rule stores nothing and is answered `400` with
+**every** problem, each with the path of the field it is about:
+
+```console
+$ curl -s -H "authorization: Bearer $LEDGER_TOKEN" -H 'content-type: application/json' \
+    -d '{"id":"x y","repository":"r","commit":"c","measured_at":"now","environment":{"cores":8},
+         "results":[{"case":"a","backend":"vm","metrics":{"p99":{"unit":"mss","values":[1,null]}}}]}' \
+    http://127.0.0.1:8080/ledger/api/runs
+{
+  "error": "the run was not stored: 6 problem(s)",
+  "ok": false,
+  "problems": [
+    { "message": "unknown field; the fields here are `schema`, `id`, …", "path": "measured_at" },
+    { "message": "a run ID is letters, digits, `.`, `_` and `-` (it is part of a URL)", "path": "id" },
+    { "message": "missing: `measuredAt` is required", "path": "measuredAt" },
+    { "message": "write it as text (`\"4\"`): these are compared as written", "path": "environment.cores" },
+    { "message": "`mss` is not a unit this ledger knows; it knows `ns`, `us`, …", "path": "results[0].metrics.p99.unit" },
+    { "message": "a repetition that was not measured is left out, not written `null` (and not 0)", "path": "results[0].metrics.p99.values[1]" }
+  ]
+}
+```
+
+Unknown fields are refused (a misspelt `measured_at` would otherwise be a run
+with no time), and so is a JSON object that names a field twice.
+
+### Units
+
+Every value is kept **as sent** and, beside it, **in the canonical unit of
+its dimension**, which is what pages show and what is compared:
+
+| dimension | canonical | accepted |
+| --- | --- | --- |
+| duration | `ms` | `ns`, `us`, `µs`, `ms`, `s`, `min` |
+| rate | `/s` | `/s`, `req/s`, `ops/s`, `req/min` |
+| memory | `MiB` | `B`, `KiB`, `MiB`, `GiB`, `kB`, `MB`, `GB` |
+| count | `count` | `count` |
+| percent | `%` | `%` |
+
+A metric keeps the dimension it was first posted with: once `p99` is a
+duration, a `p99` in `KiB` is refused (`400`, naming the field), so that a
+chart of `p99` never mixes times and sizes. The page's tooltip on a value
+shows the unit and numbers that were sent.
+
+### Unmeasured is absent, never zero
+
+A value that was not measured is **left out**: the metric is absent from the
+result, or the repetition from `values`. `null` and an empty `values` are
+refused, because either would have to become something, and a zero is a
+measurement. On the pages an absent metric is a dash (`–`, "not measured"),
+and a measured zero is `0`.
+
+### Duplicates
+
+The run ID is what makes posting safe to repeat. A post whose ID is already
+stored is compared with what is stored, after normalisation (so formatting
+and field order do not matter):
+
+- **the same run** is answered `200` with `"duplicate": true` and changes
+  nothing — a CI job that retries, or posting a whole directory again, is
+  harmless;
+- **a different run** is answered `409`, saying how it differs (`` `commit`
+  is `abc1234`, not `def5678` ``, `results[3] (…) differs`). Post it under a
+  new ID, or `DELETE /api/runs/<id>` first.
+
+Two posts of different content racing under one new ID are not detected:
+the store has no compare-and-set, and the last one wins.
+
+## What is stored
+
+| key | what |
+| --- | --- |
+| `run:<id>` | the run as normalised: every value as sent and in its canonical unit |
+| `index:<time>:<id>` | its summary, for the run list (newest first by `listDesc`) |
+| `commit:<repository>\|<commit>:<time>:<id>` | the runs of a commit |
+| `metric:<name>` | the dimension a metric has |
+| `case:<case>\|<input>`, `point:<case>\|<input>:<time>:<id>:<backend>` | a case, and each measurement of it with every metric's median and spread: what a case's trend reads without opening every run |
+
+`<time>` is `measuredAt` in milliseconds, zero-padded to 16 digits. Text from
+a poster that is part of a key has `%`, `:` and `|` escaped. `run:<id>` is
+written last, so a post that fails halfway (a quota) leaves no run, and what
+it wrote is deleted again.
+
+Limits (`app.toml`): a body up to 4 MiB, a stored run up to 8 MiB, a million
+keys and 1 GiB in all. The converted samples are 1.5–70 KiB each.
+
+## Access and escaping
+
+`POST` and `DELETE` need `Authorization: Bearer <secret>` (or a Basic login
+with the secret as the password), the `post` secret of `app.toml`'s
+`[secrets]`, here `LEDGER_TOKEN`. The secret never enters the app's run:
+`auth.check` compares it in the host. A post must be
+`content-type: application/json`, and a request whose `Origin` or
+`Sec-Fetch-Site` says it came from another site is refused (403), so a form
+on another page cannot use a browser's stored login.
+
+Every value a poster controls — the run ID, repository, commit, note,
+source, environment, toolchain, conditions, case, input and backend — goes
+through `text.escapeHtml` before it is part of a page, and every page is sent
+with a `Content-Security-Policy` that allows no script.
+
+## Layout
+
+| file | what |
+| --- | --- |
+| `ledger.cove` | routing, the API, access |
+| `store.cove` | the records in `kv` |
+| `pages.cove` | the HTML |
+| `schema/` | reading and checking a posted run; the stored form |
+| `units/` | the units, their dimensions and the canonical unit of each |
+| `stats/` | medians and spreads; numbers written for people |
+| `json/`, `text/` | the webhook lab's JSON and text helpers (the JSON parser here also refuses a field named twice; `text` also reads ISO 8601 times) |
+| `importer/ledger_import.py` | converts the existing results, and posts runs |
+| `samples/` | the converted runs |
+
+`cove-host test ledger` runs the Cove tests in `schema/`, `stats/`, `json/`
+and `text/`. The Rust tests in `crates/cove-host/tests/ledger.rs` drive the
+app over HTTP.

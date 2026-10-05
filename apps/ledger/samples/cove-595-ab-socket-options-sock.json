@@ -1,0 +1,126 @@
+{
+ "schema": 1,
+ "id": "cove-595-ab-socket-options-sock",
+ "repository": "myuon/cove",
+ "commit": "64c666b",
+ "measuredAt": "2026-10-04T22:54:53+09:00",
+ "source": "examples/edge/compare/results/ab-socket-options.jsonl (variant `sock`)",
+ "note": "#595's A/B `socket-options`, build `sock`: the branch that set a connection's socket options once, later merged as #597 (64c666b). Rounds interleaved with the other builds of the same file.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "hello",
+   "input": "c=64",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "yes"
+   },
+   "load": [
+    7.009765625,
+    2.30517578125,
+    6.7685546875,
+    2.5205078125,
+    6.71044921875,
+    3.6953125,
+    6.4931640625,
+    3.63916015625,
+    6.36279296875,
+    4.0947265625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      84046.59,
+      90438.47,
+      84911.23,
+      88051.5,
+      83919.01,
+      90438.07,
+      83976.84,
+      92366.66,
+      85970.46,
+      87833.78
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      0.58,
+      0.4909,
+      0.5746,
+      0.5039,
+      0.5637,
+      0.485,
+      0.5631,
+      0.4768,
+      0.5507,
+      0.5235
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      1.951,
+      1.9564,
+      1.9584,
+      2.0709,
+      1.9581,
+      1.9764,
+      1.9473,
+      1.9545,
+      1.9443,
+      1.9307
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      8.45,
+      7.57,
+      8.48,
+      7.58,
+      8.16,
+      7.37,
+      8.14,
+      7.41,
+      8.09,
+      7.91
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      42.25,
+      37.85,
+      42.4,
+      37.9,
+      40.8,
+      36.85,
+      40.7,
+      37.05,
+      40.45,
+      39.55
+     ]
+    }
+   }
+  }
+ ]
+}

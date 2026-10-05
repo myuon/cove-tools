@@ -1,0 +1,84 @@
+{
+ "schema": 1,
+ "id": "cove-595-ab-hello-low-load-wake",
+ "repository": "myuon/cove",
+ "commit": "bb13e6f",
+ "measuredAt": "2026-10-05T01:43:54+09:00",
+ "source": "examples/edge/compare/results/ab-hello-low-load.jsonl (variant `wake`)",
+ "note": "#595's A/B `hello-low-load`, build `wake`: the branch with one waker byte per idle wake-up, on top of `sock`, later merged as #598 (bb13e6f). Rounds interleaved with the other builds of the same file.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "hello",
+   "input": "c=64",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "yes"
+   },
+   "load": [
+    3.7119140625,
+    3.81494140625,
+    3.82373046875
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      98748.54,
+      95299.85,
+      96353.97
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      0.4227,
+      0.4452,
+      0.4321
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      1.9719,
+      1.9625,
+      1.9635
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      6.74,
+      7.01,
+      6.71
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      33.7,
+      35.05,
+      33.55
+     ]
+    }
+   }
+  }
+ ]
+}

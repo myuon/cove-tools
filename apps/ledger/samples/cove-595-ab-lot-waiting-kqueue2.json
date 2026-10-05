@@ -1,0 +1,84 @@
+{
+ "schema": 1,
+ "id": "cove-595-ab-lot-waiting-kqueue2",
+ "repository": "myuon/cove",
+ "commit": "9272282",
+ "measuredAt": "2026-10-04T23:27:21+09:00",
+ "source": "examples/edge/compare/results/ab-lot-waiting.jsonl (variant `kqueue2`)",
+ "note": "#595's A/B `lot-waiting`, build `kqueue2`: the parking lot waiting in kevent, later merged as #599 (9272282). Rounds interleaved with the other builds of the same file.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "aggregate",
+   "input": "c=1000 no keep-alive",
+   "inputSize": 1000,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "no"
+   },
+   "load": [
+    4.65869140625,
+    4.525390625,
+    4.09130859375
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      330.79,
+      330.49,
+      330.59
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      3000.748,
+      3000.965,
+      3000.6836
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      3001.8987,
+      3002.1421,
+      3002.1054
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      0.17000000000000004,
+      0.18999999999999997,
+      0.18000000000000002
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      170.00000000000003,
+      189.99999999999997,
+      180.00000000000003
+     ]
+    }
+   }
+  }
+ ]
+}

@@ -1,0 +1,107 @@
+// The units a measurement may be posted in, the dimension each measures, and
+// the one canonical unit per dimension that the ledger stores beside what was
+// sent. Two values are only ever compared in their canonical unit, so `850
+// µs` and `0.9 ms` are 0.85 against 0.9, not 850 against 0.9.
+
+/// One unit a value may be sent in.
+export struct Scale {
+  /// As written in a posted result: `ms`, `KiB`, `req/s`.
+  name: String
+  /// `duration`, `rate`, `memory`, `count` or `percent`.
+  dimension: String
+  /// A value in this unit times `times` over `per` is the value in the
+  /// dimension's canonical unit. A ratio rather than one factor, so
+  /// that microseconds to milliseconds is a division by 1000, which is
+  /// exact for every value that has an exact answer, rather than a
+  /// multiplication by an inexact 0.001.
+  times: Float
+  per: Float
+}
+
+/// Every unit the ledger reads.
+export fn known() -> Array<Scale> {
+  [
+    Scale(name: "ns", dimension: "duration", times: 1.0, per: 1000000.0),
+    Scale(name: "us", dimension: "duration", times: 1.0, per: 1000.0),
+    Scale(name: "µs", dimension: "duration", times: 1.0, per: 1000.0),
+    Scale(name: "ms", dimension: "duration", times: 1.0, per: 1.0),
+    Scale(name: "s", dimension: "duration", times: 1000.0, per: 1.0),
+    Scale(name: "min", dimension: "duration", times: 60000.0, per: 1.0),
+    Scale(name: "/s", dimension: "rate", times: 1.0, per: 1.0),
+    Scale(name: "req/s", dimension: "rate", times: 1.0, per: 1.0),
+    Scale(name: "ops/s", dimension: "rate", times: 1.0, per: 1.0),
+    Scale(name: "req/min", dimension: "rate", times: 1.0, per: 60.0),
+    Scale(name: "B", dimension: "memory", times: 1.0, per: 1048576.0),
+    Scale(name: "KiB", dimension: "memory", times: 1.0, per: 1024.0),
+    Scale(name: "MiB", dimension: "memory", times: 1.0, per: 1.0),
+    Scale(name: "GiB", dimension: "memory", times: 1024.0, per: 1.0),
+    Scale(name: "kB", dimension: "memory", times: 1000.0, per: 1048576.0),
+    Scale(name: "MB", dimension: "memory", times: 1000000.0, per: 1048576.0),
+    Scale(name: "GB", dimension: "memory", times: 1000000000.0, per: 1048576.0),
+    Scale(name: "count", dimension: "count", times: 1.0, per: 1.0),
+    Scale(name: "%", dimension: "percent", times: 1.0, per: 1.0),
+  ]
+}
+
+/// The unit called `name`, if the ledger knows it.
+export fn find(name: String) -> Option<Scale> {
+  for unit in known() {
+    if unit.name == name {
+      return Some(unit)
+    }
+  }
+  None
+}
+
+/// The canonical unit of `dimension`: what every value of it is stored and
+/// compared in.
+export fn canonical(dimension: String) -> String {
+  if dimension == "duration" {
+    "ms"
+  } else if dimension == "rate" {
+    "/s"
+  } else if dimension == "memory" {
+    "MiB"
+  } else if dimension == "count" {
+    "count"
+  } else {
+    "%"
+  }
+}
+
+/// `value`, sent in `unit`, in its dimension's canonical unit.
+export fn toCanonical(value: Float, unit: Scale) -> Float {
+  if unit.per == 1.0 {
+    value * unit.times
+  } else if unit.times == 1.0 {
+    value / unit.per
+  } else {
+    value * unit.times / unit.per
+  }
+}
+
+/// The names of the units of `dimension`, for an error that lists them.
+export fn namesOf(dimension: String) -> String {
+  var names = Vector.of()
+  for unit in known() {
+    if unit.dimension == dimension {
+      names.push("`{unit.name}`")
+    }
+  }
+  ", ".join(names.freeze())
+}
+
+/// Every unit's name, for an error that lists them.
+export fn allNames() -> String {
+  var names = Vector.of()
+  for unit in known() {
+    names.push("`{unit.name}`")
+  }
+  ", ".join(names.freeze())
+}
+
+/// Which way is better for a value of `dimension` when the poster does not
+/// say: more of a rate, less of everything else.
+export fn defaultBetter(dimension: String) -> String {
+  if dimension == "rate" { "higher" } else { "lower" }
+}

@@ -1,0 +1,23 @@
+# The bench ledger (issue #3): benchmark results posted as JSON, kept in the
+# app's own key-value store, and pages to read and compare them.
+grant = ["kv", "log", "auth"]
+
+[limits]
+deadline = "10s"
+# A run of a few hundred measurements is a few hundred kilobytes of JSON,
+# read, checked and stored in one request; a page reads every run it lists.
+fuel = 500000000
+max_host_calls = 20000
+max_request_bytes = 4194304
+max_response_bytes = 8388608
+
+[kv]
+max_value_bytes = 8388608
+max_keys = 1000000
+max_bytes = 1073741824
+
+# The secret a poster presents: `Authorization: Bearer <secret>` (or the
+# password of a Basic login). Set it in the environment the host runs in; the
+# app is refused at load without it.
+[secrets]
+post = { env = "LEDGER_TOKEN" }

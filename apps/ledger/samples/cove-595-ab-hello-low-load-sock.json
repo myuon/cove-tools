@@ -1,0 +1,84 @@
+{
+ "schema": 1,
+ "id": "cove-595-ab-hello-low-load-sock",
+ "repository": "myuon/cove",
+ "commit": "64c666b",
+ "measuredAt": "2026-10-05T01:43:50+09:00",
+ "source": "examples/edge/compare/results/ab-hello-low-load.jsonl (variant `sock`)",
+ "note": "#595's A/B `hello-low-load`, build `sock`: the branch that set a connection's socket options once, later merged as #597 (64c666b). Rounds interleaved with the other builds of the same file.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "hello",
+   "input": "c=64",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the send",
+    "keepAlive": "yes"
+   },
+   "load": [
+    3.16455078125,
+    3.81494140625,
+    3.68994140625
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      91736.09,
+      94464.61,
+      93360.6
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      0.4658,
+      0.4586,
+      0.4602
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      1.9754,
+      1.9636,
+      1.953
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      7.23,
+      7.2700000000000005,
+      7.16
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      36.15,
+      36.35,
+      35.8
+     ]
+    }
+   }
+  }
+ ]
+}

@@ -1,0 +1,102 @@
+{
+ "schema": 1,
+ "id": "cove-595-ab-lot-aggregate-base",
+ "repository": "myuon/cove",
+ "commit": "fcf64a9",
+ "measuredAt": "2026-10-04T23:21:48+09:00",
+ "source": "examples/edge/compare/results/ab-lot-aggregate.jsonl (variant `base`)",
+ "note": "#595's A/B `lot-aggregate`, build `base`: the build the comparison was made with (#589). Rounds interleaved with the other builds of the same file.",
+ "environment": {
+  "cpu": "Intel i7-10700K, 8 cores / 16 threads",
+  "memory": "32 GB",
+  "os": "macOS 26.6.2",
+  "arch": "x86_64"
+ },
+ "toolchain": {
+  "rustc": "1.98.1",
+  "go": "1.23.2",
+  "profile": "release"
+ },
+ "conditions": {
+  "server": "cove-edge",
+  "workers": "4",
+  "generator": "cove-edge-load"
+ },
+ "results": [
+  {
+   "case": "aggregate",
+   "input": "rate=50 c=64",
+   "inputSize": 64,
+   "backend": "vm",
+   "conditions": {
+    "latency": "from the intended start",
+    "keepAlive": "yes"
+   },
+   "load": [
+    6.8330078125,
+    7.3876953125,
+    6.66259765625,
+    7.455078125,
+    6.4609375,
+    6.0732421875
+   ],
+   "metrics": {
+    "throughput": {
+     "unit": "req/s",
+     "values": [
+      47.88,
+      47.72,
+      48.06,
+      47.76,
+      47.16,
+      47.53
+     ]
+    },
+    "p50": {
+     "unit": "ms",
+     "values": [
+      201.8648,
+      201.9001,
+      202.1848,
+      202.4306,
+      202.523,
+      202.1206
+     ]
+    },
+    "p99": {
+     "unit": "ms",
+     "values": [
+      301.5891,
+      339.6312,
+      339.2071,
+      312.2983,
+      302.8945,
+      321.2305
+     ]
+    },
+    "cpu": {
+     "unit": "s",
+     "values": [
+      0.24,
+      0.25,
+      0.25,
+      0.26,
+      0.25,
+      0.25
+     ]
+    },
+    "cpuPerRequest": {
+     "unit": "us",
+     "values": [
+      480.0,
+      500.0,
+      500.0,
+      520.0,
+      500.0,
+      500.0
+     ]
+    }
+   }
+  }
+ ]
+}
