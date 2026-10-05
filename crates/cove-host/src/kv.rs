@@ -1,0 +1,521 @@
+//! `kv`: each app's persistent key-value store.
+//!
+//! | operation | answers |
+//! | --- | --- |
+//! | `kv.get(key)` | `Option<String>` |
+//! | `kv.put(key, value)` | `Result<Unit, Error>`: an `Err` past a quota |
+//! | `kv.delete(key)` | `Bool`, whether the key was there |
+//! | `kv.list(prefix, after, limit)` | `Array<kv.Entry>`: keys starting with `prefix` and greater than `after` (`""` for the first page), ascending, at most `limit` (1–1000) |
+//! | `kv.listDesc(prefix, before, limit)` | the same, descending, keys less than `before` (`""` for the last page) |
+//!
+//! `kv.Entry` is `{ key: String, value: String }`. Paging is by key: the last
+//! key of one page is the `after` (or `before`) of the next, so an app that
+//! writes `event:<zero-padded time>` lists its newest events with
+//! `listDesc("event:", "", 50)`.
+//!
+//! # Storage
+//!
+//! SQLite (bundled, through `rusqlite`), one database file per app at
+//! `<data>/<app>/kv.sqlite3`. One file per app is the namespace: an app's
+//! module instance holds its own connection and nothing else, so no key it
+//! can write names another app's data. SQLite is the boring choice — one
+//! file, a format that outlives this program, crash-safe by design. The
+//! database runs in WAL mode with `synchronous = NORMAL`: a committed write
+//! survives the host process crashing; a power loss may lose the last
+//! transactions but never corrupts the file.
+//!
+//! # Answered at once, on the worker
+//!
+//! Every call answers `Ready`, on the worker thread that made it — never on
+//! the async runtime's threads, so HTTP is never blocked behind a write.
+//! Parking would cost more than the call: a get or put on a local SQLite in
+//! WAL mode is a few microseconds (`kv_call_cost`, an ignored test that
+//! prints them), against a park, a hand-off to the I/O runtime, a resume job
+//! and a resume. A store on the network would answer pending instead; the
+//! scheduler supports both.
+//!
+//! # Quotas
+//!
+//! `[kv]` in `app.toml`: `max_key_bytes`, `max_value_bytes`, `max_keys` and
+//! `max_bytes` (keys and values summed). A `put` past one is the app's `Err`
+//! to handle, naming the quota; the store is unchanged.
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use cove_runtime::{
+    Effect, FieldSchema, HostApi, HostType, ModuleSchema, OperationSchema, RuntimeError,
+    TypeSchema, Value,
+};
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::config::KvLimits;
+use crate::hosts::{AppContext, HostModule};
+
+/// The most entries one `list` answers.
+pub const MAX_LIST: i64 = 1000;
+
+const fn op(
+    name: &'static str,
+    params: &'static [HostType],
+    result: HostType,
+    effect: Effect,
+) -> OperationSchema {
+    OperationSchema {
+        name,
+        params,
+        variadic: false,
+        result,
+        capability: "kv",
+        effect,
+        cancellable: false,
+        recordable: true,
+        result_is_task_safe: true,
+    }
+}
+
+const STR: HostType = HostType::String;
+const ENTRIES: HostType = HostType::Array(&HostType::Named("kv.Entry"));
+
+/// The `kv` module.
+pub const KV: ModuleSchema = ModuleSchema {
+    name: "kv",
+    capability: "kv",
+    operations: &[
+        op("get", &[STR], HostType::Option(&STR), Effect::Read),
+        op(
+            "put",
+            &[STR, STR],
+            HostType::Result(&HostType::Unit, &HostType::Error),
+            Effect::ReversibleWrite,
+        ),
+        op("delete", &[STR], HostType::Bool, Effect::ReversibleWrite),
+        op("list", &[STR, STR, HostType::Int], ENTRIES, Effect::Read),
+        op(
+            "listDesc",
+            &[STR, STR, HostType::Int],
+            ENTRIES,
+            Effect::Read,
+        ),
+    ],
+    types: &[TypeSchema {
+        name: "Entry",
+        cases: &[],
+        fields: &[
+            FieldSchema {
+                name: "key",
+                ty: HostType::String,
+            },
+            FieldSchema {
+                name: "value",
+                ty: HostType::String,
+            },
+        ],
+    }],
+    resources: &[],
+};
+
+pub(crate) struct KvModule;
+
+impl HostModule for KvModule {
+    fn schema(&self) -> ModuleSchema {
+        KV
+    }
+
+    fn instantiate(&self, app: &AppContext) -> Result<Box<dyn HostApi>, String> {
+        // An app not granted `kv` can never reach the store, so it gets
+        // none: no file is created for it.
+        let store = if !app.granted.contains("kv") {
+            None
+        } else {
+            Some(
+                match &app.data {
+                    Some(dir) => Store::open(&dir.join("kv.sqlite3"), app.kv.clone()),
+                    None => Store::in_memory(app.kv.clone()),
+                }
+                .map_err(|why| format!("cannot open its kv store: {why}"))?,
+            )
+        };
+        Ok(Box::new(KvHost {
+            store: Mutex::new(store),
+        }))
+    }
+}
+
+/// One app's store and what it holds now.
+pub struct Store {
+    conn: Connection,
+    limits: KvLimits,
+    keys: u64,
+    bytes: u64,
+}
+
+/// Why a `put` was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PutError {
+    /// Past a quota: the app's `Err`.
+    Quota(String),
+    /// The database failed: the host's error.
+    Storage(String),
+}
+
+impl Store {
+    /// The store at `path`, created if it is not there.
+    pub fn open(path: &Path, limits: KvLimits) -> Result<Store, String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create `{}`: {e}", dir.display()))?;
+        }
+        let conn = Connection::open(path).map_err(|e| format!("`{}`: {e}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        Store::with(conn, limits)
+    }
+
+    /// A store that lives as long as the process.
+    pub fn in_memory(limits: KvLimits) -> Result<Store, String> {
+        Store::with(
+            Connection::open_in_memory().map_err(|e| e.to_string())?,
+            limits,
+        )
+    }
+
+    fn with(conn: Connection, limits: KvLimits) -> Result<Store, String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        )
+        .map_err(|e| e.to_string())?;
+        let (keys, bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(length(CAST(key AS BLOB)) + length(CAST(value AS BLOB))), 0) FROM kv",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(Store {
+            conn,
+            limits,
+            keys: keys as u64,
+            bytes: bytes as u64,
+        })
+    }
+
+    pub fn get(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn put(&mut self, key: &str, value: &str) -> Result<(), PutError> {
+        let limits = &self.limits;
+        if key.len() > limits.max_key_bytes {
+            return Err(PutError::Quota(format!(
+                "kv.put: a key of {} bytes is above this app's max_key_bytes of {}",
+                key.len(),
+                limits.max_key_bytes
+            )));
+        }
+        if value.len() > limits.max_value_bytes {
+            return Err(PutError::Quota(format!(
+                "kv.put: a value of {} bytes is above this app's max_value_bytes of {}",
+                value.len(),
+                limits.max_value_bytes
+            )));
+        }
+        let old: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT length(CAST(value AS BLOB)) FROM kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| PutError::Storage(e.to_string()))?;
+        let entry = (key.len() + value.len()) as u64;
+        let (keys, bytes) = match old {
+            Some(old) => (
+                self.keys,
+                self.bytes - (key.len() as u64 + old as u64) + entry,
+            ),
+            None => (self.keys + 1, self.bytes + entry),
+        };
+        if keys > limits.max_keys {
+            return Err(PutError::Quota(format!(
+                "kv.put: this app holds {} keys already, its max_keys",
+                self.keys
+            )));
+        }
+        if bytes > limits.max_bytes {
+            return Err(PutError::Quota(format!(
+                "kv.put: this write would hold {bytes} bytes, above this app's max_bytes of {}",
+                limits.max_bytes
+            )));
+        }
+        self.conn
+            .execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| PutError::Storage(e.to_string()))?;
+        self.keys = keys;
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub fn delete(&mut self, key: &str) -> Result<bool, String> {
+        let old: Option<i64> = self
+            .conn
+            .query_row(
+                "DELETE FROM kv WHERE key = ?1 RETURNING length(CAST(value AS BLOB))",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(old) = old {
+            self.keys -= 1;
+            self.bytes -= key.len() as u64 + old as u64;
+        }
+        Ok(old.is_some())
+    }
+
+    /// Keys starting with `prefix`, beyond `from` in the direction asked
+    /// (`""` from the start), at most `limit`.
+    pub fn list(
+        &self,
+        prefix: &str,
+        from: &str,
+        limit: i64,
+        descending: bool,
+    ) -> Result<Vec<(String, String)>, String> {
+        // Every key starting with `prefix` is at least `prefix` and below
+        // `upper`: UTF-8 orders bytewise as code points do, and SQLite's
+        // BINARY collation compares bytes.
+        let upper = successor(prefix);
+        let mut sql = String::from("SELECT key, value FROM kv WHERE key >= ?1");
+        if upper.is_some() {
+            sql.push_str(" AND key < ?2");
+        }
+        if !from.is_empty() {
+            sql.push_str(if descending {
+                " AND key < ?3"
+            } else {
+                " AND key > ?3"
+            });
+        }
+        sql.push_str(if descending {
+            " ORDER BY key DESC LIMIT ?4"
+        } else {
+            " ORDER BY key LIMIT ?4"
+        });
+        let mut statement = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+        // Unused numbered parameters are fine to bind; SQLite needs every
+        // number up to the highest named.
+        let rows = statement
+            .query_map(
+                params![prefix, upper.unwrap_or_default(), from, limit],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    /// `(keys, bytes)` held now.
+    pub fn usage(&self) -> (u64, u64) {
+        (self.keys, self.bytes)
+    }
+}
+
+/// The least string greater than every string starting with `prefix`, or
+/// `None` when there is none (an empty prefix, or one of only U+10FFFF).
+fn successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        if (0xD800..0xE000).contains(&next) {
+            next = 0xE000;
+        }
+        if let Some(next) = char::from_u32(next) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+struct KvHost {
+    /// `None` for an app not granted `kv`, whose calls the boundary refuses.
+    store: Mutex<Option<Store>>,
+}
+
+fn storage(why: String) -> RuntimeError {
+    RuntimeError::new(format!("kv: the store failed: {why}"))
+}
+
+impl HostApi for KvHost {
+    fn module_schema(&self) -> ModuleSchema {
+        KV
+    }
+
+    fn call(&self, op: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        // The boundary held the arity and each argument's type to `KV`.
+        let text = |at: usize| args[at].as_str().unwrap_or_default();
+        let mut guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(store) = guard.as_mut() else {
+            return Err(RuntimeError::new("kv: this app has no store"));
+        };
+        match op {
+            "get" => Ok(match store.get(text(0)).map_err(storage)? {
+                Some(value) => Value::some(Value::string(value)),
+                None => Value::none(),
+            }),
+            "put" => match store.put(text(0), text(1)) {
+                Ok(()) => Ok(Value::ok(Value::unit())),
+                Err(PutError::Quota(why)) => Ok(Value::err(Value::error(why))),
+                Err(PutError::Storage(why)) => Err(storage(why)),
+            },
+            "delete" => Ok(Value::bool(store.delete(text(0)).map_err(storage)?)),
+            "list" | "listDesc" => {
+                let limit = args[2].as_int().unwrap_or_default();
+                if !(1..=MAX_LIST).contains(&limit) {
+                    return Err(RuntimeError::new(format!(
+                        "kv.{op}: a limit of {limit} is not 1 to {MAX_LIST}"
+                    )));
+                }
+                let entries = store
+                    .list(text(0), text(1), limit, op == "listDesc")
+                    .map_err(storage)?;
+                Ok(Value::array(entries.into_iter().map(|(key, value)| {
+                    Value::structure(
+                        "kv.Entry",
+                        vec![("key", Value::string(key)), ("value", Value::string(value))],
+                    )
+                })))
+            }
+            other => Err(RuntimeError::new(format!(
+                "`kv` declares no operation `{other}`"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(limits: KvLimits) -> Store {
+        Store::in_memory(limits).unwrap()
+    }
+
+    #[test]
+    fn put_get_delete() {
+        let mut kv = store(KvLimits::default());
+        assert_eq!(kv.get("a").unwrap(), None);
+        kv.put("a", "1").unwrap();
+        kv.put("a", "22").unwrap();
+        assert_eq!(kv.get("a").unwrap().as_deref(), Some("22"));
+        assert_eq!(kv.usage(), (1, 3));
+        assert!(kv.delete("a").unwrap());
+        assert!(!kv.delete("a").unwrap());
+        assert_eq!(kv.usage(), (0, 0));
+    }
+
+    #[test]
+    fn lists_by_prefix_in_pages_both_ways() {
+        let mut kv = store(KvLimits::default());
+        for key in ["e:1", "e:2", "e:3", "e;", "d:9", "e:"] {
+            kv.put(key, key).unwrap();
+        }
+        let keys = |entries: Vec<(String, String)>| -> Vec<String> {
+            entries.into_iter().map(|(k, _)| k).collect()
+        };
+        assert_eq!(
+            keys(kv.list("e:", "", 10, false).unwrap()),
+            ["e:", "e:1", "e:2", "e:3"]
+        );
+        assert_eq!(
+            keys(kv.list("e:", "e:1", 2, false).unwrap()),
+            ["e:2", "e:3"]
+        );
+        assert_eq!(keys(kv.list("e:", "", 2, true).unwrap()), ["e:3", "e:2"]);
+        assert_eq!(keys(kv.list("e:", "e:2", 10, true).unwrap()), ["e:1", "e:"]);
+        assert_eq!(kv.list("", "", 100, false).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn quotas_refuse_and_change_nothing() {
+        let mut kv = store(KvLimits {
+            max_key_bytes: 4,
+            max_value_bytes: 4,
+            max_keys: 2,
+            max_bytes: 12,
+        });
+        let quota = |result| matches!(result, Err(PutError::Quota(_)));
+        assert!(quota(kv.put("toolong", "v")));
+        assert!(quota(kv.put("k", "toolong")));
+        kv.put("a", "1234").unwrap();
+        kv.put("b", "1234").unwrap();
+        assert!(quota(kv.put("c", "1")));
+        // Replacing a key is not a new key, but its bytes still count.
+        assert!(quota(kv.put("a", "12345")));
+        kv.put("a", "1").unwrap();
+        assert_eq!(kv.usage(), (2, 7));
+    }
+
+    #[test]
+    fn a_store_survives_reopening() {
+        let dir = std::env::temp_dir().join(format!("cove-host-kv-{}", std::process::id()));
+        let path = dir.join("kv.sqlite3");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut kv = Store::open(&path, KvLimits::default()).unwrap();
+            kv.put("kept", "yes").unwrap();
+        }
+        let kv = Store::open(&path, KvLimits::default()).unwrap();
+        assert_eq!(kv.get("kept").unwrap().as_deref(), Some("yes"));
+        assert_eq!(kv.usage(), (1, 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successor_bounds_a_prefix() {
+        assert_eq!(successor("e:").as_deref(), Some("e;"));
+        assert_eq!(successor(""), None);
+        assert_eq!(successor("a\u{10FFFF}").as_deref(), Some("b"));
+    }
+
+    /// What a call costs, printed: `cargo t -- --ignored kv_call_cost --nocapture`.
+    #[test]
+    #[ignore]
+    fn kv_call_cost() {
+        let dir = std::env::temp_dir().join(format!("cove-host-kv-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut kv = Store::open(&dir.join("kv.sqlite3"), KvLimits::default()).unwrap();
+        let n = 20_000;
+        let started = std::time::Instant::now();
+        for i in 0..n {
+            kv.put(&format!("key:{i:08}"), "a value of some thirty bytes..")
+                .unwrap();
+        }
+        let put = started.elapsed() / n;
+        let started = std::time::Instant::now();
+        for i in 0..n {
+            kv.get(&format!("key:{i:08}")).unwrap().unwrap();
+        }
+        let get = started.elapsed() / n;
+        let started = std::time::Instant::now();
+        for i in 0..1000 {
+            kv.list("key:", &format!("key:{:08}", i * 10), 50, false)
+                .unwrap();
+        }
+        let list = started.elapsed() / 1000;
+        println!("kv on disk: put {put:?}, get {get:?}, list of 50 {list:?} per call");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

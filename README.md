@@ -6,8 +6,9 @@ that runs them on one machine.
 - **`crates/cove-host`** — a self-hosted function host: loads `apps/<name>/`,
   checks, prepares and compiles each app once, and runs every request in its
   own Cove isolate on a shared worker pool (issue #1).
-- **`apps/`** — the sample apps: `hello` (pure), `crunch` (CPU-heavy) and
-  `slow` (waits on a timer that parks the run). The real apps — a webhook lab
+- **`apps/`** — the sample apps: `hello` (pure), `crunch` (CPU-heavy),
+  `slow` (waits on a timer that parks the run), `notes` (the persistent
+  key-value store) and `proxy` (allowlisted outbound HTTP). The real apps — a webhook lab
   (#2), a benchmark ledger (#3) and an algorithm playground (#4) — come next.
 
 The host is Rust; the apps are Cove. Cove is a git dependency pinned to one
@@ -32,7 +33,8 @@ listening on http://127.0.0.1:8080 — 16 worker thread(s), a run yields after 2
 back on; `--release` works as well. The tests use the same profile — see
 [Tests](#tests).)
 
-`serve` takes `--addr` (default `127.0.0.1:8080`), `--workers N` (threads
+`serve` takes `--data DIR` (where apps keep their state, one directory per
+app; default `./data`), `--addr` (default `127.0.0.1:8080`), `--workers N` (threads
 that run Cove; default one per hardware thread), `--io-threads N` (HTTP and
 pending host work; default 2), `--slice MS` (default 2; `0` never asks a run
 to yield), `--max-connections N` and `--max-in-flight N` (default 10,000
@@ -95,12 +97,61 @@ error[cove::runtime]: execution stopped: wall-clock deadline of 3s exceeded
 The second one was parked when its deadline passed: the host cancelled it
 (`ParkedVm::cancel`, Cove ADR 0082) rather than wait the five seconds.
 
+### State and outbound calls
+
+`notes` keeps one note per path in its own store, which survives a restart:
+
+```console
+$ curl -s -X PUT --data 'buy milk' http://127.0.0.1:8080/notes/todo
+stored todo
+$ curl -s -X PUT --data 'x' http://127.0.0.1:8080/notes/zeta
+stored zeta
+$ curl -s http://127.0.0.1:8080/notes/todo
+buy milk
+$ curl -s 'http://127.0.0.1:8080/notes/?order=desc&limit=1'
+zeta
+$ ls data/
+notes
+```
+
+`proxy` forwards the request — method, body, `content-type` and `x-*`
+headers — to `?url=`, which has to be on its allowlist (here it may reach
+this host itself on port 8080, and `https://example.com`):
+
+```console
+$ curl -s 'http://127.0.0.1:8080/proxy/?url=http://127.0.0.1:8080/hello/?name=proxy'
+Hello, proxy! (GET /)
+$ curl -s -X POST -H 'x-test: yes' --data 'posted' 'http://127.0.0.1:8080/proxy/?url=http://127.0.0.1:8080/hello/echo'
+posted
+$ curl -s 'http://127.0.0.1:8080/proxy/?url=http://example.org/'
+`http://example.org:80` is not on app `proxy`'s fetch allowlist (http://127.0.0.1:8080, http://localhost:8080, https://example.com:443)
+```
+
+The last was refused before anything was sent, and the run never parked.
+
+A client that goes away cancels its request: `curl -m 0.3
+'http://127.0.0.1:8080/slow/?ms=2000'` gives up after 0.3 s, and the parked
+run is cancelled then rather than two seconds later (`errors.cancelled` in
+the stats).
+
+`GET /_host/apps/<app>/logs?n=200` answers an app's recent log lines — its
+`log.*` and the host's own lines about it (a failed request, a run that
+would not yield), the last 1,000 kept in memory:
+
+```console
+$ curl -s http://127.0.0.1:8080/_host/apps/notes/logs
+1791168727.534 info: stored todo (8 bytes)
+1791168727.547 info: stored zeta (1 bytes)
+```
+
+### Stats
+
 `GET /` lists the apps; `GET /_host/stats` is JSON — per app: `state`
 (`ready` or `refused`, with the reason), `tier`, `required` and `granted`,
 `served`, `ok`, `errors` by kind, `rejected` by reason, `in_flight`,
 `queued`, `parked`, `parks`, `yields`, `yield_requests`, `yields_declined`,
-`overdue_yields`, `blocking_host_calls`, `instructions`, `fuel`, `worker_ms`
-and `heap_peak_words`; and the server's `connections`,
+`overdue_yields`, `blocking_host_calls`, `instructions`, `fuel`, `worker_ms`,
+`heap_peak_words` and `fetch` (`calls`, `refused`, `errors`); and the server's `connections`,
 `rejected_connections`, `not_found`, `admitted` and `totals`.
 
 ### Checking and testing an app
@@ -186,7 +237,73 @@ do, and an app may use only what `app.toml` grants:
 | --- | --- | --- |
 | `web` | — | the `Request` and `Response` types |
 | `log` | `log` | `info`, `warn`, `error` (`String`): a line on stdout, `[app] level: line` |
-| `timer` | `timer` | `sleep(millis: Int)`: parks the run for that long (at most 60 s) |
+| `timer` | `timer` | `sleep(millis: Int)`: parks the run for that long (at most 60 s; `0` parks and comes straight back) |
+| `kv` | `kv` | `get(key) -> Option<String>`, `put(key, value) -> Result<Unit, Error>`, `delete(key) -> Bool`, `list(prefix, after, limit) -> Array<kv.Entry>`, `listDesc(prefix, before, limit) -> Array<kv.Entry>` |
+| `fetch` | `fetch` | `get(url)` and `request(method, url, headers: Map<String, String>, body)`, each `-> Result<fetch.Response, Error>` |
+
+### `kv`: the app's persistent store
+
+Each app has its own store, `<data>/<app>/kv.sqlite3`, opened only for an app
+granted `kv`. One database per app is the namespace: an app's `kv` holds its
+own connection and nothing else, so no key it can write reaches another
+app's data.
+
+- `list(prefix, after, limit)` answers the entries (`kv.Entry { key, value
+  }`) whose key starts with `prefix` and is greater than `after` (`""` for the
+  first page), ascending, at most `limit` (1–1000); `listDesc(prefix, before,
+  limit)` the same descending, keys less than `before`. The last key of a page
+  is where the next one starts, so an app that writes `event:<zero-padded
+  time>` lists its newest events with `kv.listDesc("event:", "", 50)` — the
+  shape the webhook lab's history (#2) and the benchmark ledger's runs by
+  prefix (#3) need.
+- A `put` past a quota is the app's `Err`, naming the quota, and the store is
+  unchanged: `max_key_bytes`, `max_value_bytes`, `max_keys`, `max_bytes` (keys
+  and values summed) under `[kv]`.
+
+**Why SQLite**: it is the boring choice — one file per app, a format that
+outlives this program, crash-safe by design — and `rusqlite`'s `bundled`
+feature builds it in, with no system library. It runs in WAL mode with
+`synchronous = NORMAL`: a committed write survives the host process
+crashing; a power loss may lose the last transactions, never the file.
+
+**Why every call answers at once, on the worker**: a call into a local
+SQLite is cheaper than parking. Measured on the macOS x86-64 development
+machine, `--profile checked`: a `put` 34 µs, a `get` 5 µs, a list of 50 entries
+250 µs (`cargo t --lib -- --ignored kv_call_cost --nocapture`), against **15
+µs** for a park and resume end to end (`cargo t --test host -- --ignored
+park_cost --nocapture`: a request of sixteen zero-length sleeps against one).
+Parking a `get` would triple its cost, and parking a `put` would only move
+its write to another thread. The call runs on the worker, never on the
+async runtime's threads, so HTTP is not blocked behind a write; a worker held
+34 µs is far inside a 2 ms slice.
+
+### `fetch`: outbound HTTP to an allowlist
+
+`[fetch] allow` in `app.toml` lists where the app may call:
+`scheme://host` (the scheme's port), `scheme://host:port`, or
+`scheme://host:*` (any port), `http` or `https`. The `fetch` capability says
+an app may call out at all; the allowlist says where, and the host holds
+every call to it at the boundary:
+
+- a URL off the list is answered `Err` **at once, before anything is
+  sent**, without parking (counted in `fetch.refused`);
+- redirects are not followed — a 3xx is answered as the response it is — so
+  an allowed host cannot send the request elsewhere;
+- hosts match by name as written; what a name resolves to is the system
+  resolver's, so this is no defence against DNS rebinding.
+
+A fetch parks the run. It is a future on the I/O runtime (reqwest over
+hyper) raced against the run's deadline and against the client going away;
+whichever ends first drops the future, which closes the outbound
+connection, so the upstream sees the request abandoned. Each fetch is also
+bounded by `[fetch] timeout` (default 10 s), `max_request_bytes` (its body,
+default 1 MiB) and `max_response_bytes` (default 4 MiB). Any response is
+`Ok`, whatever its status; an `Err` is a fetch that got none.
+
+**https** is supported, with rustls and the Mozilla root set
+(`webpki-roots`), so there is no dependency on the system's OpenSSL. Inbound
+TLS stays the reverse proxy's job, but outbound calls have no proxy to do it
+for them.
 
 ### `app.toml`
 
@@ -204,6 +321,18 @@ max_in_flight = 64              # this app's runs started and not answered
 max_queued = 256                # this app's requests waiting to start
 max_request_bytes = 1048576     # request body
 max_response_bytes = 4194304    # response body
+
+[kv]                            # the app's store; see `kv` above
+max_key_bytes = 1024
+max_value_bytes = 1048576
+max_keys = 100000
+max_bytes = 67108864            # keys and values, summed
+
+[fetch]                         # outbound HTTP; see `fetch` above
+allow = []                      # e.g. ["https://api.github.com", "http://127.0.0.1:*"]
+timeout = "10s"                 # one fetch, connect to last byte
+max_request_bytes = 1048576
+max_response_bytes = 4194304
 ```
 
 An unknown key is refused, so a misspelt limit is never silently not
@@ -229,6 +358,8 @@ reason, and every other app starts.
 | other runtime error (an assertion, an overflow, out of memory) | 500, the runtime's diagnostic |
 | the run's heap above `max_heap_words` when it answered | 500 |
 | response body over `max_response_bytes`, or not a valid response | 500, saying which |
+| the client went away before the answer | the run is cancelled (queued, running, yielded or parked) and counted as `errors.cancelled`; 499 in the app's log |
+| a `kv.put` past a quota, a `fetch` off the allowlist or past its limits | not a status: the app's `Err` to answer as it likes |
 
 429 and 503 are deliberately different: 429 is *this app* at its own limit
 (its neighbours are unaffected, and the client of that app should back off);
@@ -273,8 +404,9 @@ reason, and every other app starts.
   `YieldedVm`, which any worker continues.
 - **Apps are served round robin.** Each app has its own queue: runs to resume
   or continue, and requests waiting to start. A worker takes one job from the
-  next app in turn that has work it may run, finishing an app's started runs
-  before starting more. A job is at most one slice of a run while others
+  next app in turn that has work it may run; within an app, turns alternate
+  between its started runs and its new requests, so a long run of an app
+  does not hold back that app's own new requests either. A job is at most one slice of a run while others
   wait, so an app with hundreds of requests queued gets one turn in N like
   every other busy app: its backlog costs itself, not its neighbours. An app
   at `max_in_flight` has its starts held back (its started runs still
@@ -320,8 +452,14 @@ never by trusting it:
   says once, on stderr, that it falls back to the encoded VM elsewhere;
   `--backend vm` forces the VM, `--backend native` refuses apps where there is
   no native tier. `tier` in the stats says which each app got.
-- **A client that disconnects is not yet noticed.** Its run finishes and the
-  answer is dropped. (Cancellation on disconnect is the next pull request's.)
+- **A client that disconnects cancels its run.** hyper drops the request's
+  future when the connection closes, and a guard on it raises the request's
+  cancellation: the runtime's `Cancellation` in the run's budget stops a
+  running run at its next safepoint and a yielded one when it is continued;
+  a token wakes a parked run's wait, which cancels the run and drops its
+  pending work (a fetch's connection with it); a request still queued is
+  dropped when a worker reaches it. A run that cannot yield stops at its next
+  safepoint all the same, since cancellation is checked there.
 
 ## Security
 
@@ -344,7 +482,7 @@ $ cargo t     # = cargo test --workspace --profile checked
 
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
-integration tests (`crates/cove-host/tests/host.rs`) start the host
+integration tests (`crates/cove-host/tests/host.rs` and `services.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
 so, and what it asserts is counted.
@@ -363,7 +501,17 @@ so, and what it asserts is counted.
 - with one app flooding its queue on a single worker, another app's five
   requests are all served while the flood still has requests queued;
 - on x86-64 Unix, the apps run on the native tier and a compiled run still
-  yields.
+  yields;
+- two apps' stores are separate (and separate files); a store survives
+  stopping the host and starting another over the same data directory;
+  quotas answer the app's `Err`; listing pages both ways;
+- `fetch` reaches an allowed local upstream with GET and with POST carrying
+  a header and a body, exactly as the upstream records them; a target off
+  the allowlist is refused with the upstream seeing no connection at all;
+- a fetch is abandoned — the upstream sees its connection closed — at the
+  run's deadline, and when the client goes away;
+- a client going away cancels a spinning run that is running or yielded, one
+  still queued (without running it), and a parked one, each counted.
 
 `COVE_HOST_TEST_BACKEND=vm cargo t` runs the same suite on the encoded VM,
 as CI does on its second pass.

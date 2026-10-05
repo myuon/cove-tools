@@ -55,20 +55,55 @@ use std::time::{Duration, Instant};
 
 use cove_diag::render;
 use cove_runtime::trace::RunOutcome;
-use cove_runtime::{Budget, ParkedVm, RuntimeError, Step, Transfer, YieldRequest, YieldedVm};
+use cove_runtime::{
+    Budget, Cancellation, ParkedVm, RuntimeError, Step, Transfer, YieldRequest, YieldedVm,
+};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::apps::App;
 use crate::convert::{request_value, response_of, AppRequest, BadResponse, Reply};
 use crate::hosts::PendingWork;
 use crate::stats::{ErrorKind, Rejection};
 
-/// A request in flight: which app, since when, and where its answer goes.
+/// A request in flight: which app, since when, where its answer goes, and
+/// how it is called off.
 pub struct Flight {
     pub id: u64,
     pub app: usize,
     pub accepted: Instant,
     pub reply: oneshot::Sender<Reply>,
+    pub cancel: Cancel,
+}
+
+/// Calls a request off: raised by the HTTP side when the client goes away
+/// before its answer.
+///
+/// Two halves, for the two places a run can be. The runtime's
+/// [`Cancellation`] is in the run's budget, so a running run stops at its
+/// next safepoint and a yielded one stops when it is continued; the token
+/// wakes a parked run's wait on the I/O runtime, which cancels the run and
+/// drops its pending host work (an outbound fetch's connection with it). A
+/// request still queued is dropped when a worker takes it.
+#[derive(Clone, Debug, Default)]
+pub struct Cancel {
+    flag: Cancellation,
+    token: CancellationToken,
+}
+
+impl Cancel {
+    pub fn new() -> Cancel {
+        Cancel::default()
+    }
+
+    pub fn cancel(&self) {
+        self.flag.cancel();
+        self.token.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.is_cancelled()
+    }
 }
 
 /// A request waiting to start.
@@ -102,13 +137,22 @@ struct AppQueue {
     /// Requests admitted and not started.
     starts: VecDeque<Box<Start>>,
     /// Runs already started: resumed after a park, or continued after a
-    /// yield. Always eligible, and taken before a start, so that an app
-    /// finishes what it began before it begins more.
+    /// yield. Always eligible. When an app has both, its turns alternate
+    /// between a run and a start, so that one long run of an app does not
+    /// hold back the app's own new requests either.
     runs: VecDeque<Job>,
+    /// Whether this app's next turn, when it has both, is a start.
+    start_next: bool,
     /// Runs started and not answered.
     in_flight: usize,
     max_in_flight: usize,
     max_queued: usize,
+}
+
+impl AppQueue {
+    fn may_start(&self) -> bool {
+        !self.starts.is_empty() && self.in_flight < self.max_in_flight
+    }
 }
 
 impl AppQueue {
@@ -142,6 +186,7 @@ impl RunQueue {
                     .map(|app| AppQueue {
                         starts: VecDeque::new(),
                         runs: VecDeque::new(),
+                        start_next: false,
                         in_flight: 0,
                         max_in_flight: app.limits.max_in_flight,
                         max_queued: app.limits.max_queued,
@@ -196,12 +241,13 @@ impl RunQueue {
                 }
                 state.cursor = (at + 1) % n;
                 let queue = &mut state.apps[at];
-                let job = match queue.runs.pop_front() {
-                    Some(job) => job,
-                    None => {
-                        queue.in_flight += 1;
-                        Job::Start(queue.starts.pop_front().expect("eligible"))
-                    }
+                let start = queue.may_start() && (queue.runs.is_empty() || queue.start_next);
+                queue.start_next = !start;
+                let job = if start {
+                    queue.in_flight += 1;
+                    Job::Start(queue.starts.pop_front().expect("eligible"))
+                } else {
+                    queue.runs.pop_front().expect("eligible")
                 };
                 return Some((at, job));
             }
@@ -352,6 +398,11 @@ impl Engine {
                 let Start { request, flight } = *start;
                 let app = &self.apps[flight.app];
                 let ready = app.ready().expect("only a loaded app is admitted");
+                if flight.cancel.is_cancelled() {
+                    // The client left while it waited: nothing to run.
+                    self.fail(flight, ErrorKind::Cancelled, Reply::text(499, ""));
+                    return;
+                }
                 if let Some(deadline) = app.limits.run.deadline {
                     let waited = flight.accepted.elapsed();
                     if waited > deadline {
@@ -371,7 +422,8 @@ impl Engine {
                     }
                 }
                 let vm = ready.isolate();
-                let budget = Budget::new(app.limits.run.clone());
+                let budget =
+                    Budget::with_cancellation(app.limits.run.clone(), flight.cancel.flag.clone());
                 let signal = vm.yield_request();
                 let step = self.sliced(worker, flight.app, signal, || {
                     let argument = request_value(&request);
@@ -509,13 +561,12 @@ impl Engine {
                         self.queue.finished(flight.app);
                     }
                     Err((kind, body)) => {
-                        eprintln!(
-                            "cove-host: [{}] {} {}: {}",
-                            app.name,
-                            kind.status(),
-                            kind.name(),
-                            first_line(&body)
-                        );
+                        let line =
+                            format!("{} {}: {}", kind.status(), kind.name(), first_line(&body));
+                        app.logs.push("host", &line);
+                        if kind != ErrorKind::Cancelled {
+                            eprintln!("cove-host: [{}] {line}", app.name);
+                        }
                         self.fail(flight, kind, Reply::text(kind.status(), body));
                     }
                 }
@@ -525,16 +576,18 @@ impl Engine {
                 counters.parked.fetch_add(1, Ordering::Relaxed);
                 match parked.take_request().map(|r| r.downcast::<PendingWork>()) {
                     Some(Ok(work)) => {
-                        let left = parked.time_left();
+                        // The deadline, or "never" for a run without one.
+                        let left = parked.time_left().unwrap_or(Duration::MAX);
+                        let cancelled = flight.cancel.token.clone();
                         let engine = Arc::clone(self);
                         self.io.spawn(async move {
                             let work = *work;
-                            let answer = match left {
-                                Some(left) => tokio::select! {
-                                    answer = work.answer => Some(answer),
-                                    () = tokio::time::sleep(left) => None,
-                                },
-                                None => Some(work.answer.await),
+                            // Whichever comes first. The losers are dropped:
+                            // a fetch's connection is closed with its future.
+                            let answer = tokio::select! {
+                                answer = work.answer => Some(answer),
+                                () = sleep_at_most(left) => None,
+                                () = cancelled.cancelled() => None,
                             };
                             engine.resume(parked, answer, flight);
                         });
@@ -613,15 +666,15 @@ impl Engine {
                     Some(asked) if !run.overdue && now.duration_since(asked) >= overdue_after => {
                         run.overdue = true;
                         let n = counters.overdue_yields.fetch_add(1, Ordering::Relaxed) + 1;
+                        let line = format!(
+                            "a run still holds its worker {} ms after it was asked to yield: it \
+                             is where the runtime cannot yield (a host call, or below an encoded \
+                             callee of compiled code); its deadline still bounds it ({n} so far)",
+                            now.duration_since(asked).as_millis()
+                        );
+                        self.apps[run.app].logs.push("host", &line);
                         if n.is_power_of_two() {
-                            eprintln!(
-                                "cove-host: [{}] a run still holds its worker {} ms after it was \
-                                 asked to yield: it is where the runtime cannot yield (a host \
-                                 call, or below an encoded callee of compiled code); its \
-                                 deadline still bounds it ({n} so far)",
-                                self.apps[run.app].name,
-                                now.duration_since(asked).as_millis()
-                            );
+                            eprintln!("cove-host: [{}] {line}", self.apps[run.app].name);
                         }
                     }
                     _ => {}
@@ -639,7 +692,18 @@ fn kind_of(error: &RuntimeError) -> ErrorKind {
         RunOutcome::HostCalls => ErrorKind::HostCalls,
         RunOutcome::CallDepth => ErrorKind::CallDepth,
         RunOutcome::Concurrency => ErrorKind::Concurrency,
+        RunOutcome::Cancelled => ErrorKind::Cancelled,
         _ => ErrorKind::Runtime,
+    }
+}
+
+/// Sleeps for `left`, or forever for a duration no timer can hold.
+async fn sleep_at_most(left: Duration) {
+    match tokio::time::Instant::now().checked_add(left) {
+        Some(at) if left < Duration::from_secs(365 * 24 * 3600) => {
+            tokio::time::sleep_until(at).await
+        }
+        _ => std::future::pending().await,
     }
 }
 

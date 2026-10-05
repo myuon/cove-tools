@@ -1,0 +1,11 @@
+# Forwards a request to `?url=`, which must be on the allowlist below: the
+# `fetch` capability says the app may call out, the allowlist says where.
+grant = ["fetch", "log"]
+
+[limits]
+deadline = "5s"
+
+[fetch]
+allow = ["http://127.0.0.1:8080", "http://localhost:8080", "https://example.com"]
+timeout = "3s"
+max_response_bytes = 1048576

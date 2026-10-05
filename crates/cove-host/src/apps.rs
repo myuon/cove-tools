@@ -24,8 +24,9 @@ use cove_sema::package::{Module, Package, Unit};
 use cove_sema::resolve::Program;
 use cove_sema::{Compiler, Config, HostSchemas};
 
-use crate::config::{read_app, AppConfig, AppLimits};
+use crate::config::{read_app, AppConfig, AppLimits, FetchPolicy, KvLimits};
 use crate::hosts::{AppContext, HostModules};
+use crate::logs::LogRing;
 use crate::stats::AppCounters;
 
 /// Which tier runs an app's requests.
@@ -57,9 +58,14 @@ impl std::str::FromStr for Backend {
 #[derive(Clone)]
 pub struct LoadOptions {
     pub backend: Backend,
-    /// Whether `log` prints nothing.
+    /// Whether `log` prints nothing to standard output.
     pub quiet: bool,
     pub modules: HostModules,
+    /// The data directory; each app's state is under `<data>/<app>/`.
+    /// `None` keeps every app's state in memory.
+    pub data: Option<PathBuf>,
+    /// The I/O runtime the modules wait on.
+    pub io: tokio::runtime::Handle,
 }
 
 /// One app, ready or refused.
@@ -77,7 +83,11 @@ pub struct App {
     /// graph cannot follow.
     pub open: bool,
     pub limits: AppLimits,
+    pub kv: KvLimits,
+    pub fetch: FetchPolicy,
     pub counters: Arc<AppCounters>,
+    /// The app's recent log lines: its `log.*` and the host's lines about it.
+    pub logs: Arc<LogRing>,
     pub state: AppState,
 }
 
@@ -126,6 +136,26 @@ impl Ready {
 }
 
 impl App {
+    /// What the app's module instances are built with.
+    pub fn context(
+        &self,
+        quiet: bool,
+        data: Option<&Path>,
+        io: &tokio::runtime::Handle,
+    ) -> AppContext {
+        AppContext {
+            app: self.name.clone(),
+            quiet,
+            counters: Arc::clone(&self.counters),
+            logs: Arc::clone(&self.logs),
+            granted: self.granted.clone(),
+            data: data.map(|root| root.join(&self.name)),
+            kv: self.kv.clone(),
+            fetch: self.fetch.clone(),
+            io: io.clone(),
+        }
+    }
+
     pub fn ready(&self) -> Option<&Ready> {
         match &self.state {
             AppState::Ready(ready) => Some(ready),
@@ -214,7 +244,10 @@ pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
         required: BTreeSet::new(),
         open: false,
         limits: AppLimits::default(),
+        kv: KvLimits::default(),
+        fetch: FetchPolicy::default(),
         counters: Arc::new(AppCounters::default()),
+        logs: Arc::new(LogRing::default()),
         state: AppState::Refused(String::new()),
     };
     if let Err(why) = valid_name(name) {
@@ -226,6 +259,8 @@ pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
             app.entry = config.entry.clone();
             app.granted = config.granted.clone();
             app.limits = config.limits.clone();
+            app.kv = config.kv.clone();
+            app.fetch = config.fetch.clone();
             (app, Some(config))
         }
         Err(why) => {
@@ -420,12 +455,8 @@ fn prepare(app: &mut App, options: &LoadOptions) -> Result<Ready, String> {
 
     let (module, function) = app.entry.split_once('.').unwrap_or_default();
     let (module, function) = (module.to_string(), function.to_string());
-    let context = AppContext {
-        app: app.name.clone(),
-        quiet: options.quiet,
-        counters: Arc::clone(&app.counters),
-    };
-    let hosts = Arc::new(options.modules.registry(&app.granted, &context));
+    let context = app.context(options.quiet, options.data.as_deref(), &options.io);
+    let hosts = Arc::new(options.modules.registry(&app.granted, &context)?);
     let sources = Arc::new(compiled.sources);
     let runtime = Arc::new(Runtime::new(
         Arc::new(compiled.program),

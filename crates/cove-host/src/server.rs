@@ -44,7 +44,7 @@ use crate::apps::{list, load_all, App, AppState, Backend, LoadOptions};
 use crate::convert::{AppRequest, Reply};
 use crate::hosts::HostModules;
 use crate::router::{PathPrefix, Router};
-use crate::sched::{Engine, Flight, Start};
+use crate::sched::{Cancel, Engine, Flight, Start};
 use crate::stats::{Rejection, ServerCounters};
 
 /// How to start a host.
@@ -68,6 +68,9 @@ pub struct ServeOptions {
     /// Whether `log` prints nothing.
     pub quiet: bool,
     pub modules: HostModules,
+    /// Where apps keep their state, one directory per app; `None` keeps it
+    /// in memory, gone at exit.
+    pub data: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -84,6 +87,7 @@ impl ServeOptions {
             backend: Backend::Auto,
             quiet: false,
             modules: HostModules::standard(),
+            data: Some(PathBuf::from("data")),
         }
     }
 }
@@ -112,23 +116,29 @@ impl Host {
     /// is accepting. An app that is refused is reported and not served; the
     /// error is only for a host that cannot start at all.
     pub fn start(options: ServeOptions) -> Result<Host, String> {
-        let load = LoadOptions {
-            backend: options.backend,
-            quiet: options.quiet,
-            modules: options.modules.clone(),
-        };
-        let apps = load_all(&options.apps, &load)?;
-        Host::with_apps(apps, options)
-    }
-
-    /// Starts a host over apps already loaded.
-    pub fn with_apps(apps: Vec<App>, options: ServeOptions) -> Result<Host, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(options.io_threads.max(1))
             .thread_name("cove-host-io")
             .enable_all()
             .build()
             .map_err(|e| format!("cannot start the I/O runtime: {e}"))?;
+        let load = LoadOptions {
+            backend: options.backend,
+            quiet: options.quiet,
+            modules: options.modules.clone(),
+            data: options.data.clone(),
+            io: runtime.handle().clone(),
+        };
+        let apps = load_all(&options.apps, &load)?;
+        Host::launch(runtime, apps, options)
+    }
+
+    /// Starts a host over apps already loaded on `runtime`.
+    fn launch(
+        runtime: tokio::runtime::Runtime,
+        apps: Vec<App>,
+        options: ServeOptions,
+    ) -> Result<Host, String> {
         let listener = std::net::TcpListener::bind(&options.addr)
             .map_err(|e| format!("cannot listen on `{}`: {e}", options.addr))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -284,6 +294,24 @@ impl Front {
         if path == "/" {
             return Reply::text(200, self.index());
         }
+        if let Some(name) = path
+            .strip_prefix("/_host/apps/")
+            .and_then(|rest| rest.strip_suffix("/logs"))
+        {
+            let Some(app) = self.engine.apps.iter().find(|app| app.name == name) else {
+                return Reply::text(404, format!("no app named `{name}`\n"));
+            };
+            let lines = request
+                .uri()
+                .query()
+                .and_then(|query| {
+                    form_urlencoded::parse(query.as_bytes())
+                        .find(|(key, _)| key == "n")
+                        .and_then(|(_, n)| n.parse().ok())
+                })
+                .unwrap_or(200);
+            return Reply::text(200, app.logs.tail(lines));
+        }
         if path == "/_host" || path.starts_with("/_host/") {
             return Reply::text(404, format!("cove-host has nothing at `{path}`\n"));
         }
@@ -356,6 +384,7 @@ impl Front {
         };
 
         let (reply, answer) = oneshot::channel();
+        let cancel = Cancel::new();
         let start = Box::new(Start {
             request: AppRequest {
                 method,
@@ -369,6 +398,7 @@ impl Front {
                 app: route.app,
                 accepted: Instant::now(),
                 reply,
+                cancel: cancel.clone(),
             },
         });
         if let Err(why) = self.engine.queue.admit(route.app, start) {
@@ -391,7 +421,12 @@ impl Front {
             }
             .with_header("retry-after", "1");
         }
-        match answer.await {
+        // hyper drops this future when the client closes its connection
+        // before the answer; the guard turns that drop into a cancellation.
+        let guard = CancelOnDrop(Some(cancel));
+        let answered = answer.await;
+        guard.disarm();
+        match answered {
             Ok(reply) => reply,
             Err(_) => Reply::text(
                 500,
@@ -410,6 +445,7 @@ impl Front {
             out.push_str(&format!("  /{}/  {}\n", app.name, app.describe()));
         }
         out.push_str("\n  /_host/stats  per-app counters, queues and work, as JSON\n");
+        out.push_str("  /_host/apps/<app>/logs?n=200  an app's recent log lines\n");
         out
     }
 
@@ -481,6 +517,24 @@ impl Front {
             "totals": totals,
             "apps": apps,
         })
+    }
+}
+
+/// Cancels its request when dropped armed: when the connection's task drops
+/// the request's future because the client went away.
+struct CancelOnDrop(Option<Cancel>);
+
+impl CancelOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel.cancel();
+        }
     }
 }
 
