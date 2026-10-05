@@ -1,0 +1,201 @@
+//! Counters, per app and for the server, and the `/_host/stats` body.
+//!
+//! Everything is a relaxed atomic: a counter is read by a person or a test,
+//! never used to decide anything, so no ordering between two of them is
+//! promised.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::{json, Map, Value as Json};
+
+/// Why a request that reached its app was not answered by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The run spent its fuel (500).
+    Fuel,
+    /// The run passed its deadline, running or parked (504).
+    Deadline,
+    /// The run made more host calls than it may (500).
+    HostCalls,
+    /// The run nested calls deeper than it may (500).
+    CallDepth,
+    /// The run tried to `spawn` past its task limit (500).
+    Concurrency,
+    /// The run answered with a heap larger than `max_heap_words` (500).
+    Heap,
+    /// Any other runtime error: a failed assertion, an overflow, a host
+    /// that failed, a run out of the runtime's own memory (500).
+    Runtime,
+    /// The handler answered something that is not a valid response (500).
+    BadResponse,
+    /// The response body was larger than `max_response_bytes` (500).
+    ResponseTooLarge,
+    /// The request waited in the queue for longer than its deadline (503).
+    QueueTimeout,
+    /// The host itself failed while running the request (500).
+    Internal,
+}
+
+impl ErrorKind {
+    /// Every kind, in the order the stats list them.
+    pub const ALL: [ErrorKind; 11] = [
+        ErrorKind::Fuel,
+        ErrorKind::Deadline,
+        ErrorKind::HostCalls,
+        ErrorKind::CallDepth,
+        ErrorKind::Concurrency,
+        ErrorKind::Heap,
+        ErrorKind::Runtime,
+        ErrorKind::BadResponse,
+        ErrorKind::ResponseTooLarge,
+        ErrorKind::QueueTimeout,
+        ErrorKind::Internal,
+    ];
+
+    /// The name the stats use.
+    pub fn name(self) -> &'static str {
+        match self {
+            ErrorKind::Fuel => "fuel",
+            ErrorKind::Deadline => "deadline",
+            ErrorKind::HostCalls => "host_calls",
+            ErrorKind::CallDepth => "call_depth",
+            ErrorKind::Concurrency => "concurrency",
+            ErrorKind::Heap => "heap",
+            ErrorKind::Runtime => "runtime",
+            ErrorKind::BadResponse => "bad_response",
+            ErrorKind::ResponseTooLarge => "response_too_large",
+            ErrorKind::QueueTimeout => "queue_timeout",
+            ErrorKind::Internal => "internal",
+        }
+    }
+
+    /// The status a request that failed this way is answered with.
+    pub fn status(self) -> u16 {
+        match self {
+            ErrorKind::Deadline => 504,
+            ErrorKind::QueueTimeout => 503,
+            _ => 500,
+        }
+    }
+}
+
+/// Why a request was turned away before it reached its app's queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejection {
+    /// The app's queue held `max_queued` requests already (429).
+    QueueFull,
+    /// The server held `--max-in-flight` requests already (503).
+    ServerBusy,
+    /// The request body was larger than `max_request_bytes` (413).
+    TooLarge,
+    /// The request was malformed: a body that is not UTF-8 (400).
+    BadRequest,
+}
+
+/// One app's counters.
+#[derive(Default)]
+pub struct AppCounters {
+    /// Requests the app answered, with any status.
+    pub served: AtomicU64,
+    /// Requests answered 2xx–4xx by the app itself.
+    pub ok: AtomicU64,
+    errors: [AtomicU64; ErrorKind::ALL.len()],
+    pub rejected_queue_full: AtomicU64,
+    pub rejected_server_busy: AtomicU64,
+    pub rejected_too_large: AtomicU64,
+    pub rejected_bad_request: AtomicU64,
+    /// Runs parked at a host call, now.
+    pub parked: AtomicU64,
+    /// Parks, summed over every run.
+    pub parks: AtomicU64,
+    /// Yields at a safepoint, summed over every run.
+    pub yields: AtomicU64,
+    /// Times the monitor asked a run of this app to yield.
+    pub yield_requests: AtomicU64,
+    /// Safepoints that were asked to yield and could not (the runtime's
+    /// `OwnedVm::yields_declined`), summed over every answered run.
+    pub yields_declined: AtomicU64,
+    /// Runs still holding their worker well after being asked to yield: a
+    /// run that cannot yield where it is (see the README's runtime
+    /// constraints). Its deadline still bounds it.
+    pub overdue_yields: AtomicU64,
+    /// Host calls answered by blocking the worker because the run could not
+    /// park where the call was made.
+    pub blocking_host_calls: AtomicU64,
+    /// Instructions the encoded VM dispatched, summed over answered runs.
+    /// Compiled code dispatches none, so on the native tier this undercounts
+    /// the work; `fuel` does not.
+    pub instructions: AtomicU64,
+    /// Fuel spent, summed over answered runs.
+    pub fuel: AtomicU64,
+    /// Nanoseconds workers spent running this app's code.
+    pub worker_ns: AtomicU64,
+    /// The largest heap an answered run had, in words.
+    pub heap_peak_words: AtomicU64,
+}
+
+impl AppCounters {
+    pub fn error(&self, kind: ErrorKind) {
+        self.served.fetch_add(1, Ordering::Relaxed);
+        self.errors[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn errors(&self, kind: ErrorKind) -> u64 {
+        self.errors[kind as usize].load(Ordering::Relaxed)
+    }
+
+    pub fn rejected(&self, why: Rejection) {
+        let counter = match why {
+            Rejection::QueueFull => &self.rejected_queue_full,
+            Rejection::ServerBusy => &self.rejected_server_busy,
+            Rejection::TooLarge => &self.rejected_too_large,
+            Rejection::BadRequest => &self.rejected_bad_request,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// As the JSON object `/_host/stats` lists under the app, with the
+    /// scheduler's gauges beside the counters.
+    pub fn to_json(&self, in_flight: usize, queued: usize) -> Json {
+        let read = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let mut errors = Map::new();
+        for kind in ErrorKind::ALL {
+            errors.insert(kind.name().to_string(), json!(self.errors(kind)));
+        }
+        json!({
+            "served": read(&self.served),
+            "ok": read(&self.ok),
+            "errors": errors,
+            "rejected": {
+                "queue_full": read(&self.rejected_queue_full),
+                "server_busy": read(&self.rejected_server_busy),
+                "too_large": read(&self.rejected_too_large),
+                "bad_request": read(&self.rejected_bad_request),
+            },
+            "in_flight": in_flight,
+            "queued": queued,
+            "parked": read(&self.parked),
+            "parks": read(&self.parks),
+            "yields": read(&self.yields),
+            "yield_requests": read(&self.yield_requests),
+            "yields_declined": read(&self.yields_declined),
+            "overdue_yields": read(&self.overdue_yields),
+            "blocking_host_calls": read(&self.blocking_host_calls),
+            "instructions": read(&self.instructions),
+            "fuel": read(&self.fuel),
+            "worker_ms": read(&self.worker_ns) as f64 / 1e6,
+            "heap_peak_words": read(&self.heap_peak_words),
+        })
+    }
+}
+
+/// The server's own counters.
+#[derive(Default)]
+pub struct ServerCounters {
+    /// Connections accepted.
+    pub connections: AtomicU64,
+    /// Connections refused because `--max-connections` were open.
+    pub rejected_connections: AtomicU64,
+    /// Requests that named no app.
+    pub not_found: AtomicU64,
+}
