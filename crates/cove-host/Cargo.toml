@@ -1,0 +1,9 @@
+[package]
+name = "cove-host"
+description = "Hosts many small Cove web apps on one machine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
