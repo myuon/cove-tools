@@ -199,6 +199,8 @@ fn pointJson(run: Run, result: Measurement) -> Json {
       MapEntry(key: "case", value: Json.Text(result.case)),
       MapEntry(key: "input", value: Json.Text(result.input)),
       MapEntry(key: "backend", value: Json.Text(result.backend)),
+      MapEntry(key: "conditions", value: json.fromTextMap(result.conditions)),
+      MapEntry(key: "environment", value: json.fromTextMap(run.environment)),
       MapEntry(key: "metrics", value: Json.Fields(metrics)),
     ),
   )

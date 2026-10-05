@@ -1,0 +1,24 @@
+test fn ticksAreRoundNumbersCoveringTheRange() -> Result<Unit, Error> {
+  let wide = scale(81574.0, 124000.0)
+  assertEqual(wide.step, 10000.0)?
+  assertEqual(wide.low, 80000.0)?
+  assertEqual(wide.high, 130000.0)?
+  let small = scale(0.36, 0.67)
+  assertEqual(small.step, 0.1)?
+  assert(small.low <= 0.36 && small.high >= 0.67)?
+  // A value that cannot be negative keeps the axis at or above zero.
+  let one = scale(0.5, 0.5)
+  assert(one.low >= 0.0 && one.high > 0.5)?
+  Ok(())
+}
+
+test fn aGapBreaksTheLine() -> Result<Unit, Error> {
+  let point = Some(Point(median: 1.0, least: 1.0, most: 1.0, count: 1, tip: "t", href: "/r"))
+  let ticks = [Tick(label: "a", sub: "", id: "a"), Tick(label: "b", sub: "", id: "b"), Tick(label: "c", sub: "", id: "c")]
+  let gapped = trend("p99", "ms", ticks, [Series(name: "vm", points: [point, None, point])])
+  assert(!gapped.contains("class=line"))?
+  assert(!gapped.contains("class=legend"))?
+  let joined = trend("p99", "ms", ticks, [Series(name: "vm", points: [point, point, None])])
+  assert(joined.contains("class=line"))?
+  Ok(())
+}

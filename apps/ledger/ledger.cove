@@ -17,6 +17,8 @@ use text
 ///   one.
 /// - `GET /compare?a=…&b=…` compares two runs, or the runs of two commits
 ///   (`commit:<sha>`), case by case.
+/// - `GET /cases` lists the cases; `GET /cases/trend?case=…&input=…` draws
+///   one's trend over runs, a chart per metric.
 export fn handle(request: web.Request) -> web.Response {
   let parts = request.path.split("/")
   let first = parts.get(1).unwrapOr("")
@@ -40,6 +42,12 @@ export fn handle(request: web.Request) -> web.Response {
       ""
     }
     return htmlResponse(200, runsPage(at, runs, older))
+  }
+  if first == "cases" && get {
+    if parts.get(2).unwrapOr("") == "trend" {
+      return trendPage(request)
+    }
+    return htmlResponse(200, casesPage(at))
   }
   if first == "compare" && get {
     return comparePage(request)

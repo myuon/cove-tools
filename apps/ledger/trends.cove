@@ -1,0 +1,408 @@
+use web
+use kv
+use json
+use json.Json
+use chart
+use chart.Point
+use chart.Series
+use chart.Tick
+use stats
+use text
+
+// `GET /cases` lists every case measured; `GET /cases/trend?case=…&input=…`
+// draws its trend over runs: one chart per metric, one series per backend,
+// read from the `point:` records (`store.cove`) without opening a run.
+
+/// One stored point: a measurement's spreads, and the run it is from.
+struct Stored {
+  run: String
+  commit: String
+  measuredAt: Int
+  backend: String
+  /// The measurement's conditions and its run's environment, which the
+  /// series are told apart by where they vary.
+  conditions: Map<String, String>
+  environment: Map<String, String>
+  metrics: Map<String, Json>
+  /// The series it belongs to (`seriesNames`).
+  series: String
+}
+
+/// Every point of the case `case` at `input`, oldest measured first.
+fn pointsOf(case: String, input: String) -> Array<Stored> {
+  let prefix = "point:{caseKey(case, input)}:"
+  var out = Vector.of()
+  var after = ""
+  var more = true
+  while more {
+    let page = kv.list(prefix, after, 500)
+    for entry in page {
+      match json.parse(entry.value) {
+        Ok(value) => {
+          let metrics: Map<String, Json> = match json.field(value, "metrics") {
+            Some(Json.Fields(fields)) => fields
+            _ => Map.of()
+          }
+          out.push(
+            Stored(
+              run: json.text(value, "run"),
+              commit: json.text(value, "commit"),
+              measuredAt: json.int(value, "measuredAtMs", 0),
+              backend: json.text(value, "backend"),
+              conditions: json.textMap(value, "conditions"),
+              environment: json.textMap(value, "environment"),
+              metrics: metrics,
+              series: json.text(value, "backend"),
+            ),
+          )
+        }
+        Err(_) => {}
+      }
+      after = entry.key
+    }
+    more = page.length() == 500
+  }
+  labelled(out.freeze())
+}
+
+/// `points`, each with the name of its series: its backend, and every
+/// condition or part of the environment that is not the same for every
+/// point — so that the same case on another server, or with another slice,
+/// is a line of its own rather than a step in this one.
+fn labelled(points: Array<Stored>) -> Array<Stored> {
+  var names = Vector.of()
+  for point in points {
+    for entry in point.conditions {
+      if !names.contains(entry.key) {
+        names.push(entry.key)
+      }
+    }
+    for entry in point.environment {
+      if !names.contains(entry.key) {
+        names.push(entry.key)
+      }
+    }
+  }
+  var varying = Vector.of()
+  for name in names.freeze().sorted(by: fn(a, b) { a < b }) {
+    var first = ""
+    var any = false
+    var differs = false
+    for point in points {
+      let value = point.conditions.get(name).unwrapOr(point.environment.get(name).unwrapOr("–"))
+      if !any {
+        first = value
+        any = true
+      } else if value != first {
+        differs = true
+      }
+    }
+    if differs {
+      varying.push(name)
+    }
+  }
+  let keys = varying.freeze()
+  var out = Vector.of()
+  for point in points {
+    var parts = Vector.of()
+    parts.push(point.backend)
+    for name in keys {
+      parts.push("{name}={point.conditions.get(name).unwrapOr(point.environment.get(name).unwrapOr("–"))}")
+    }
+    out.push(
+      Stored(
+        run: point.run,
+        commit: point.commit,
+        measuredAt: point.measuredAt,
+        backend: point.backend,
+        conditions: point.conditions,
+        environment: point.environment,
+        metrics: point.metrics,
+        series: " · ".join(parts.freeze()),
+      ),
+    )
+  }
+  out.freeze()
+}
+
+/// A case measured at an input.
+struct CaseName {
+  case: String
+  input: String
+}
+
+/// Every case, by name and input.
+fn allCases() -> Array<CaseName> {
+  var out = Vector.of()
+  var after = ""
+  var more = true
+  while more {
+    let page = kv.list("case:", after, 500)
+    for entry in page {
+      match json.parse(entry.value) {
+        Ok(value) => out.push(CaseName(case: json.text(value, "case"), input: json.text(value, "input")))
+        Err(_) => {}
+      }
+      after = entry.key
+    }
+    more = page.length() == 500
+  }
+  out.freeze()
+}
+
+/// The link to a case's trend.
+fn trendHref(at: String, case: String, input: String) -> String {
+  "{at}/cases/trend?case={text.urlEncode(case)}&input={text.urlEncode(input)}"
+}
+
+fn casesPage(at: String) -> String {
+  let cases = allCases().sorted(by: fn(x, y) { x.case < y.case || (x.case == y.case && x.input < y.input) })
+  var rows = Vector.of()
+  var index = 0
+  while index < cases.length() {
+    let first = cases.get(index).unwrapOr(CaseName(case: "", input: ""))
+    var links = Vector.of()
+    while index < cases.length() && cases.get(index).unwrapOr(first).case == first.case {
+      let one = cases.get(index).unwrapOr(first)
+      let label = if one.input == "" { "(no input)" } else { one.input }
+      links.push("<a href=\"{h(trendHref(at, one.case, one.input))}\">{h(label)}</a>")
+      index += 1
+    }
+    rows.push("<tr><td>{h(first.case)}</td><td>{" · ".join(links.freeze())}</td></tr>")
+  }
+  let table = if rows.length() == 0 {
+    "<p class=muted>No runs yet.</p>"
+  } else {
+    "<table><tr><th>case</th><th>inputs (each a trend over runs)</th></tr>{"".join(rows.freeze())}</table>"
+  }
+  layout(at, "cases", "<h1>Cases</h1>{table}")
+}
+
+/// The metrics `points` measured, the usual ones first.
+fn trendMetrics(points: Array<Stored>) -> Array<String> {
+  var names = Vector.of()
+  for point in points {
+    for entry in point.metrics {
+      if !names.contains(entry.key) {
+        names.push(entry.key)
+      }
+    }
+  }
+  let preferred = ["throughput", "time", "p50", "p90", "p99", "max", "cpu", "cpuPerRequest", "memory"]
+  var ordered = Vector.of()
+  for name in preferred {
+    if names.contains(name) {
+      ordered.push(name)
+    }
+  }
+  for name in names.freeze().sorted(by: fn(a, b) { a < b }) {
+    if !preferred.contains(name) {
+      ordered.push(name)
+    }
+  }
+  ordered.freeze()
+}
+
+/// The point of `metric` in `stored`, if it was measured.
+fn pointOf(at: String, stored: Stored, metric: String) -> Option<Point> {
+  match stored.metrics.get(metric) {
+    Some(value) => {
+      let median = numberIn(value, "median")
+      let least = numberIn(value, "least")
+      let most = numberIn(value, "most")
+      let count = json.int(value, "count", 0)
+      let unit = json.text(value, "unit")
+      let range = if count > 1 { " ({stats.show(least)}–{stats.show(most)}, ×{count})" } else { " (×1)" }
+      Some(
+        Point(
+          median: median,
+          least: least,
+          most: most,
+          count: count,
+          tip: "{stored.series} · {metric} {stats.show(median)} {unit}{range} · {stored.run} · {stored.commit} · {when(stored.measuredAt)} UTC",
+          href: "{at}/runs/{stored.run}",
+        ),
+      )
+    }
+    None => None
+  }
+}
+
+fn numberIn(value: Json, name: String) -> Float {
+  match json.field(value, name) {
+    Some(Json.Number(number)) => number
+    _ => 0.0
+  }
+}
+
+/// A metric's unit in `points`.
+fn unitIn(points: Array<Stored>, metric: String) -> String {
+  for point in points {
+    match point.metrics.get(metric) {
+      Some(value) => return json.text(value, "unit")
+      None => {}
+    }
+  }
+  ""
+}
+
+/// The runs `points` come from, oldest measured first, and the series, by
+/// name (so that a series' colour is the same on every chart of the page).
+struct Axes {
+  ticks: Array<Tick>
+  backends: Array<String>
+}
+
+fn axesOf(points: Array<Stored>) -> Axes {
+  var ticks = Vector.of()
+  var seen = Vector.of()
+  var backends = Vector.of()
+  for point in points {
+    if !seen.contains(point.run) {
+      seen.push(point.run)
+      let short = if point.commit.length() > 9 { point.commit.slice(0, 7) } else { point.commit }
+      ticks.push(Tick(label: short, sub: when(point.measuredAt).slice(5, 10), id: point.run))
+    }
+    if !backends.contains(point.series) {
+      backends.push(point.series)
+    }
+  }
+  Axes(ticks: ticks.freeze(), backends: backends.freeze().sorted(by: fn(a, b) { a < b }))
+}
+
+/// The series of `metric`: one per backend, a slot per run.
+fn seriesOf(at: String, points: Array<Stored>, axes: Axes, metric: String) -> Array<Series> {
+  var out = Vector.of()
+  for backend in axes.backends {
+    var slots = Vector.of()
+    for tick in axes.ticks {
+      var found: Option<Point> = None
+      for point in points {
+        if point.run == tick.id && point.series == backend {
+          found = pointOf(at, point, metric)
+        }
+      }
+      slots.push(found)
+    }
+    out.push(Series(name: backend, points: slots.freeze()))
+  }
+  out.freeze()
+}
+
+/// The same numbers as the chart, as a table: a row per run, a column per
+/// backend.
+fn tableOf(axes: Axes, series: Array<Series>, unit: String) -> String {
+  var head = Vector.of()
+  for one in series {
+    head.push("<th class=num>{h(one.name)} <span class=unit>{h(unit)}</span></th>")
+  }
+  var rows = Vector.of()
+  var index = 0
+  for tick in axes.ticks {
+    var cells = Vector.of()
+    for one in series {
+      match one.points.get(index).unwrapOr(None) {
+        Some(point) => {
+          let range = if point.count > 1 { "<br><span class=range>{stats.show(point.least)}–{stats.show(point.most)} ×{point.count}</span>" } else { "" }
+          cells.push("<td class=num>{stats.show(point.median)}{range}</td>")
+        }
+        None => cells.push("<td class=\"num absent\" title=\"not measured\">–</td>")
+      }
+    }
+    rows.push("<tr><td><code>{h(tick.label)}</code></td><td>{h(tick.id)}</td>{"".join(cells.freeze())}</tr>")
+    index += 1
+  }
+  "<details class=table><summary>table</summary><table><tr><th>commit</th><th>run</th>{"".join(head.freeze())}</tr>{"".join(rows.freeze())}</table></details>"
+}
+
+fn trendPage(request: web.Request) -> web.Response {
+  let at = base(request)
+  let case = request.query.get("case").unwrapOr("")
+  let input = request.query.get("input").unwrapOr("")
+  let only = request.query.get("metric").unwrapOr("")
+  let points = pointsOf(case, input)
+  if points.length() == 0 {
+    return textResponse(404, "no measurement of case `{case}` at `{input}`\n")
+  }
+  let axes = axesOf(points)
+  var metrics = trendMetrics(points)
+  if only != "" {
+    metrics = metrics.filter(fn(name) { name == only })
+  }
+  if request.query.get("format").unwrapOr("") == "json" {
+    return jsonResponse(200, json.renderPretty(trendJson(at, points, axes, metrics)))
+  }
+  var charts = Vector.of()
+  for metric in metrics {
+    let unit = unitIn(points, metric)
+    let series = seriesOf(at, points, axes, metric)
+    charts.push(
+      "<section class=trend id=\"m-{h(metric)}\"><h2>{h(metric)} <span class=unit>{h(unit)}</span></h2><p class=note>Median of each run's repetitions, with whiskers from the least to the most; a gap is a run that did not measure it. Hover a point for its numbers; click it for the run.</p>{chart.trend(metric, unit, axes.ticks, series)}{tableOf(axes, series, unit)}</section>",
+    )
+  }
+  var jump = Vector.of()
+  for metric in metrics {
+    jump.push("<a href=\"#m-{h(metric)}\">{h(metric)}</a>")
+  }
+  let label = if input == "" { h(case) } else { "{h(case)} <span class=muted>{h(input)}</span>" }
+  htmlResponse(
+    200,
+    layout(
+      at,
+      "{case} {input}",
+      "<h1>{label}</h1><p class=note>{axes.ticks.length()} runs · series {h(" / ".join(axes.backends))} · {" · ".join(jump.freeze())}</p>{"".join(charts.freeze())}",
+    ),
+  )
+}
+
+fn trendJson(at: String, points: Array<Stored>, axes: Axes, metrics: Array<String>) -> Json {
+  var runs = Vector.of()
+  for tick in axes.ticks {
+    runs.push(Json.Text(tick.id))
+  }
+  var charts = Vector.of()
+  for metric in metrics {
+    var series = Vector.of()
+    for one in seriesOf(at, points, axes, metric) {
+      var slots = Vector.of()
+      for slot in one.points {
+        match slot {
+          Some(point) => slots.push(
+            Json.Fields(
+              Map.of(
+                MapEntry(key: "median", value: Json.Number(point.median)),
+                MapEntry(key: "least", value: Json.Number(point.least)),
+                MapEntry(key: "most", value: Json.Number(point.most)),
+                MapEntry(key: "count", value: Json.Number(point.count.toFloat())),
+              ),
+            ),
+          )
+          None => slots.push(Json.Null)
+        }
+      }
+      series.push(
+        Json.Fields(
+          Map.of(
+            MapEntry(key: "backend", value: Json.Text(one.name)),
+            MapEntry(key: "points", value: Json.Items(slots.freeze())),
+          ),
+        ),
+      )
+    }
+    charts.push(
+      Json.Fields(
+        Map.of(
+          MapEntry(key: "metric", value: Json.Text(metric)),
+          MapEntry(key: "unit", value: Json.Text(unitIn(points, metric))),
+          MapEntry(key: "series", value: Json.Items(series.freeze())),
+        ),
+      ),
+    )
+  }
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "runs", value: Json.Items(runs.freeze())),
+      MapEntry(key: "charts", value: Json.Items(charts.freeze())),
+    ),
+  )
+}

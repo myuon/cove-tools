@@ -427,8 +427,14 @@ fn an_unmeasured_metric_is_absent_not_zero() {
     );
     let html = page(addr, "/ledger/runs/gaps").body;
     // `a` measured a p99 of zero; `b` did not measure one.
-    let row_a = html.split("<tr><td>a</td>").nth(1).unwrap();
-    let row_b = html.split("<tr><td>b</td>").nth(1).unwrap();
+    let row_a = html
+        .split("title=\"the trend over runs\">a</a>")
+        .nth(1)
+        .unwrap();
+    let row_b = html
+        .split("title=\"the trend over runs\">b</a>")
+        .nth(1)
+        .unwrap();
     assert!(
         row_a.split("</tr>").next().unwrap().contains(">0</td>"),
         "{html}"
@@ -509,6 +515,14 @@ fn real_runs_survive_a_restart() {
     )
     .body
     .contains("Largest differences"));
+    // And the trend of a case both measured: two runs, a point each.
+    let trend = page(addr, "/ledger/cases/trend?case=crunch&input=c%3D16").body;
+    for id in ["cove-589-capacity", "cove-593-capacity"] {
+        assert!(
+            trend.contains(&format!("data-series=\"vm\" data-run=\"{id}\"")),
+            "{id}"
+        );
+    }
     // Reposting after the restart is still a duplicate.
     let again = post_run(addr, &sample_run("cove-589-capacity"));
     assert_eq!(again.status, 200, "{again:?}");
@@ -540,6 +554,8 @@ fn everything_a_poster_controls_is_escaped() {
         "/ledger/runs/escape",
         "/ledger/compare?a=escape&b=plain&all=1",
         "/ledger/compare?a=plain&b=escape&all=1",
+        "/ledger/cases",
+        "/ledger/cases/trend?case=%3Cscript%3Ealert(1)%3C%2Fscript%3E&input=%3Cimg%20src%3Dx%20onerror%3Dalert(2)%3E",
     ] {
         let answer = page(addr, path);
         assert!(!answer.body.contains("<script>"), "{path}");
@@ -753,6 +769,164 @@ fn a_commit_is_compared_by_all_its_runs() {
     )
     .body
     .contains("Only in A (1)"));
+}
+
+#[test]
+fn a_trend_draws_every_run_and_leaves_gaps() {
+    let apps = ledger();
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let both = |id: &str, at: &str, vm: [f64; 2], go: Option<[f64; 2]>| {
+        variant(id, &format!("{id}0000"), at, |r| {
+            let mut results = vec![json!({
+                "case": "hello", "input": "c=64", "backend": "vm",
+                "metrics": {"p99": {"unit": "ms", "values": vm}}
+            })];
+            if let Some(go) = go {
+                results.push(json!({
+                    "case": "hello", "input": "c=64", "backend": "go",
+                    "metrics": {"p99": {"unit": "us", "values": [go[0] * 1000.0, go[1] * 1000.0]}}
+                }));
+            }
+            results.push(json!({
+                "case": "solo", "backend": "vm",
+                "metrics": {"p99": {"unit": "ms", "values": [1.0]}}
+            }));
+            r["results"] = json!(results);
+        })
+    };
+    for run in [
+        both("r1", "2026-10-01T00:00:00Z", [2.0, 3.0], Some([1.0, 1.5])),
+        // Go was not measured in r2.
+        both("r2", "2026-10-02T00:00:00Z", [4.0, 5.0], None),
+        both("r3", "2026-10-03T00:00:00Z", [3.0, 3.0], Some([1.0, 2.0])),
+    ] {
+        assert_eq!(post_run(addr, &run).status, 201);
+    }
+    let cases = page(addr, "/ledger/cases").body;
+    assert!(
+        cases.contains("/ledger/cases/trend?case=hello&amp;input=c%3D64"),
+        "{cases}"
+    );
+    let data: Json = serde_json::from_str(
+        &page(
+            addr,
+            "/ledger/cases/trend?case=hello&input=c%3D64&format=json",
+        )
+        .body,
+    )
+    .unwrap();
+    assert_eq!(data["runs"], json!(["r1", "r2", "r3"]));
+    let p99 = &data["charts"][0];
+    assert_eq!(p99["metric"], "p99");
+    assert_eq!(p99["unit"], "ms");
+    let series = p99["series"].as_array().unwrap();
+    assert_eq!(series[0]["backend"], "go");
+    assert_eq!(series[1]["backend"], "vm");
+    // Go's microseconds are on the same millisecond axis, and r2 is a gap.
+    let go = series[0]["points"].as_array().unwrap();
+    assert_eq!(go[0]["median"].as_f64(), Some(1.25));
+    assert!(go[1].is_null());
+    assert_eq!(go[2]["least"].as_f64(), Some(1.0));
+    let vm: Vec<f64> = series[1]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["median"].as_f64().unwrap())
+        .collect();
+    assert_eq!(vm, [2.5, 4.5, 3.0]);
+
+    let html = page(addr, "/ledger/cases/trend?case=hello&input=c%3D64").body;
+    let svg = html
+        .split("<svg")
+        .nth(1)
+        .unwrap()
+        .split("</svg>")
+        .next()
+        .unwrap();
+    for (series, run, median) in [
+        ("vm", "r1", "2.5"),
+        ("vm", "r2", "4.5"),
+        ("vm", "r3", "3.0"),
+        ("go", "r1", "1.25"),
+        ("go", "r3", "1.5"),
+    ] {
+        assert!(
+            svg.contains(&format!(
+                "data-series=\"{series}\" data-run=\"{run}\" data-median=\"{median}\""
+            )),
+            "{series} {run}: {svg}"
+        );
+    }
+    // The gap: no go point for r2, and go's two points are not joined.
+    assert!(!svg.contains("class=point data-series=\"go\" data-run=\"r2\""));
+    assert_eq!(svg.matches("class=line data-series=\"vm\"").count(), 1);
+    assert_eq!(svg.matches("class=line data-series=\"go\"").count(), 0);
+    // Whiskers from the least to the most; none where the two are equal.
+    assert!(svg.contains(
+        "class=whisker data-series=\"vm\" data-run=\"r1\" data-least=\"2.0\" data-most=\"3.0\""
+    ));
+    assert!(!svg.contains("class=whisker data-series=\"vm\" data-run=\"r3\""));
+    // One axis, named with its unit; the legend for two series; colours in
+    // the fixed order; tooltips; text in ink, not series colours.
+    assert_eq!(svg.matches("rotate(-90)").count(), 1);
+    assert!(svg.contains(">p99 (ms)</text>"));
+    assert!(svg.contains("class=legend data-series=\"go\""));
+    assert!(svg.contains("class=legend data-series=\"vm\""));
+    assert!(svg.contains("class=line data-series=\"vm\" d=\"M"));
+    assert!(
+        svg.contains("stroke=\"#eb6834\" stroke-width=\"2\""),
+        "vm is the second colour"
+    );
+    assert!(svg.contains("fill=\"#2a78d6\""), "go is the first");
+    assert!(
+        svg.contains("<title>vm · p99 2.5 ms (2–3, ×2) · r1 · r10000"),
+        "{svg}"
+    );
+    for colour in ["#2a78d6", "#eb6834"] {
+        assert!(!svg.contains(&format!("<text fill=\"{colour}\"")));
+        assert!(
+            !svg.contains(&format!("fill=\"{colour}\">")),
+            "text in {colour}"
+        );
+    }
+    // The table view says the same, with a dash for the gap.
+    let table = html.split("<details class=table>").nth(1).unwrap();
+    assert!(
+        table.contains("<td>r2</td><td class=\"num absent\" title=\"not measured\">–</td>"),
+        "{table}"
+    );
+    // One series: no legend.
+    let solo = page(addr, "/ledger/cases/trend?case=solo&input=").body;
+    assert!(
+        solo.contains("<svg") && !solo.contains("class=legend"),
+        "{solo}"
+    );
+    // A run deleted is a run gone from the trend.
+    assert_eq!(
+        request(addr, "DELETE", "/ledger/api/runs/r2", &[&bearer()], "").status,
+        200
+    );
+    let data: Json = serde_json::from_str(
+        &page(
+            addr,
+            "/ledger/cases/trend?case=hello&input=c%3D64&format=json",
+        )
+        .body,
+    )
+    .unwrap();
+    assert_eq!(data["runs"], json!(["r1", "r3"]));
+    assert_eq!(
+        request(
+            addr,
+            "GET",
+            "/ledger/cases/trend?case=nothing&input=",
+            &[],
+            ""
+        )
+        .status,
+        404
+    );
 }
 
 /// A JSON array of numbers, as numbers (`2` and `2.0` alike).

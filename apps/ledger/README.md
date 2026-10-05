@@ -12,6 +12,7 @@ HTML are Cove; the host supplies the store, the log and the credential check.
 | `GET /api/runs`, `GET /api/runs/<id>` | the run list's summaries, and a run as stored, as JSON | none |
 | `GET /` | the runs, newest measured first, 50 a page (`?before=`; `?format=json`) | none |
 | `GET /runs/<id>` | one run: where and how it was measured, and every result's median and spread (`?format=json`: as stored) | none |
+| `GET /cases`, `GET /cases/trend?case=…&input=…` | every case measured; one case's trend over runs, a chart per metric with a table view (`metric=`, `format=json`) | none |
 | `GET /compare?a=…&b=…` | two runs, or the runs of two commits (`commit:<sha>`), case by case: absolute and relative differences, the spread on each side, and whether the two may be compared at all (`metric=`, `all=1`, `format=json`) | none |
 
 Reading is open — a ledger of benchmark numbers is meant to be looked at;
@@ -224,6 +225,40 @@ machine, server and generator). `cove-host-perf-2026-10-05` against
 `…-noslice` is not: its `slice` condition is `2 ms` against `0 ms`, and the
 page says so.
 
+## Trends
+
+`/cases` lists every case and input measured; each links to its trend,
+`/cases/trend?case=hello&input=c%3D64` (a case's name on a run page links
+there too). The trend is one chart per metric, as inline SVG generated in
+Cove (`chart/`), read from the `point:` records without opening a run:
+
+- **x**: the runs that measured the case, oldest measured first, labelled
+  with the commit and the date. **y**: the metric in its canonical unit,
+  named on the axis (`p99 (ms)`), with round-number ticks. **One y-axis per
+  chart**: a second metric is the next chart down, never a second scale.
+- **A series per backend**, and, where they vary between the points, the
+  conditions and environment that tell them apart (`native · server=cove-host
+  · slice=2 ms`). The same case on another server is a line of its own, not
+  a step in this one.
+- Each point is the **median**, with a **whisker from the least to the most**
+  repetition. A run that did not measure a series is a **gap**: no marker,
+  and the line is broken there rather than drawn across.
+- Series colours in a fixed order (`#2a78d6`, `#eb6834`, `#1baf7a`,
+  `#eda100`, `#e87ba4`, …) by series name, so a backend has the same colour on
+  every chart of a page. Each series also has its own marker shape (circle,
+  square, diamond, triangle), so colour is never the only identity. There is a
+  legend when there are two or more series. Lines are 2px, markers 9px with
+  a ring in the surface colour, and the grid is a hairline. Text is in
+  neutral ink (`#0b0b0b`, `#52514e`), never in a series colour.
+- **Hover** a point for its numbers (an SVG `<title>`: series, median, range,
+  repetitions, run, commit, time). **Click** it for the run. Under each chart,
+  **table** gives the same numbers as a table, with a dash for a gap.
+
+The palette was checked with the dataviz validator: lightness, chroma, and
+colour-blind separation of adjacent pairs all pass. Three colours are below
+3:1 contrast on the light surface, which is why there are shapes, a legend
+and the table. The pages are light only.
+
 ## What is stored
 
 | key | what |
@@ -263,16 +298,35 @@ with a `Content-Security-Policy` that allows no script.
 | --- | --- |
 | `ledger.cove` | routing, the API, access |
 | `comparing.cove` | the comparison page and its JSON |
+| `trends.cove` | the case list and the trend pages |
 | `store.cove` | the records in `kv` |
 | `pages.cove` | the HTML |
 | `schema/` | reading and checking a posted run; the stored form |
 | `units/` | the units, their dimensions and the canonical unit of each |
 | `stats/` | medians and spreads; numbers written for people |
 | `compare/` | matching two sides' measurements, the comparability verdict, differences, the largest ones |
+| `chart/` | the trend chart as SVG: scale, ticks, series, gaps, whiskers, legend |
 | `json/`, `text/` | the webhook lab's JSON and text helpers (the JSON parser here also refuses a field named twice; `text` also reads ISO 8601 times) |
 | `importer/ledger_import.py` | converts the existing results, and posts runs |
 | `samples/` | the converted runs |
 
 `cove-host test ledger` runs the Cove tests in `schema/`, `stats/`,
-`compare/`, `json/` and `text/`. The Rust tests in `crates/cove-host/tests/ledger.rs` drive the
+`compare/`, `chart/`, `json/` and `text/`. The Rust tests in `crates/cove-host/tests/ledger.rs` drive the
 app over HTTP.
+
+## Issue #3's completion criteria
+
+| criterion | test (`crates/cove-host/tests/ledger.rs`) | README |
+| --- | --- | --- |
+| at least two real Cove measurement results registered | `real_runs_survive_a_restart` posts three converted real runs (`cove-589-capacity`, `cove-593-capacity`, `cove-host-perf-2026-10-05`); `samples/` holds 22 | [The sample data](#the-sample-data-the-existing-cove-results) |
+| after a restart, comparisons and graphs still work | `real_runs_survive_a_restart`: a new host over the same data lists the runs, compares #589 with #593 and draws `crunch c=16`'s trend | [Posting a run](#posting-a-run) |
+| schema validation | `an_invalid_run_is_refused_with_every_reason` (one case per rule, each with its path; nothing stored), plus `schema/schema_test.cove` | [Validation](#validation) |
+| units | `a_valid_run_is_stored_as_sent_and_in_canonical_units` (us, s, KiB, ns, req/min; a metric keeps its dimension); go's µs on the ms axis in `a_trend_draws_every_run_and_leaves_gaps` | [Units](#units) |
+| duplicates | `reposting_a_run_is_idempotent_and_a_conflict_is_refused` (same content → no duplicate, conflicting → 409 saying how) | [Duplicates](#duplicates) |
+| comparison conditions | `a_comparison_marks_measurements_that_are_not_comparable` (environment, conditions → not comparable; toolchain, load → warning; hidden unless asked; the comparable runs offered), `a_commit_is_compared_by_all_its_runs` | [What may be compared](#what-may-be-compared) |
+| unmeasured is never zero | `an_unmeasured_metric_is_absent_not_zero` (pages), `a_metric_one_side_did_not_measure_is_not_compared_with_zero` (comparison), the gap in `a_trend_draws_every_run_and_leaves_gaps` (graphs) | [Unmeasured is absent](#unmeasured-is-absent-never-zero) |
+| graphs: points, spread, gaps, units, legend, table | `a_trend_draws_every_run_and_leaves_gaps`, plus `chart/chart_test.cove` | [Trends](#trends) |
+| access and escaping | `posting_needs_the_secret_and_reading_does_not`, `everything_a_poster_controls_is_escaped` (run list, run, compare, cases, trend) | [Access and escaping](#access-and-escaping) |
+| browsable sample data and a posting procedure | `samples/` and `importer/ledger_import.py post` | [Posting a run](#posting-a-run) |
+
+Notifications and automatic PR comments are out of scope for this version.
