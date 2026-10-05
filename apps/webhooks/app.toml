@@ -1,7 +1,7 @@
 # The webhook lab (issue #2): receive URLs that keep every request sent to
 # them, and admin pages to read them. Everything is stored in the app's own
 # key-value store, so it survives a restart.
-grant = ["kv", "log", "time", "random", "auth"]
+grant = ["kv", "log", "time", "random", "auth", "fetch"]
 
 [limits]
 deadline = "10s"
@@ -14,6 +14,15 @@ max_response_bytes = 4194304
 max_value_bytes = 4194304
 max_keys = 1000000
 max_bytes = 1073741824
+
+# Where a stored request may be resent: this host's own receive URLs, as
+# the walkthrough serves them. Add the services you resend to.
+[fetch]
+allow = ["http://127.0.0.1:8080", "http://localhost:8080"]
+# Below the run's deadline, so that a slow target is a stored failure rather
+# than a 504.
+timeout = "8s"
+max_response_bytes = 1048576
 
 # The admin pages' secret: `Authorization: Bearer <secret>`, or the password
 # of a browser's login prompt (any user name). Set it in the environment the

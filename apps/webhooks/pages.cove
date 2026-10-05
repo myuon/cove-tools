@@ -134,7 +134,7 @@ fn pairs(entries: Map<String, String>, none: String) -> String {
 }
 
 /// One received request.
-fn eventPage(base: String, endpoint: Endpoint, event: Event) -> String {
+fn eventPage(base: String, endpoint: Endpoint, event: Event, attempts: Array<Attempt>) -> String {
   let at = "{base}/admin/e/{endpoint.id}/events/{event.id}"
   let size = if event.truncated {
     "{text.bytes(event.bytes)}, <span class=danger>stored truncated to {text.bytes(event.body.byteLength())}</span>"
@@ -166,8 +166,39 @@ fn eventPage(base: String, endpoint: Endpoint, event: Event) -> String {
   layout(
     base,
     "{event.method} {event.path}",
-    "{actions}<h1>{h(event.method)} <code>{h(event.path)}</code></h1>{summary}<h2>Query</h2>{pairs(event.query, "No query.")}<h2>Headers</h2>{masked}{pairs(event.headers, "No headers.")}<h2>Body</h2>{body}",
+    "{actions}<h1>{h(event.method)} <code>{h(event.path)}</code></h1>{summary}<h2>Query</h2>{pairs(event.query, "No query.")}<h2>Headers</h2>{masked}{pairs(event.headers, "No headers.")}<h2>Body</h2>{body}{resends(at, event, attempts)}",
   )
+}
+
+/// The resend form, and what earlier resends came to.
+fn resends(at: String, event: Event, attempts: Array<Attempt>) -> String {
+  let skipped = if event.masked.length() == 0 {
+    ""
+  } else {
+    " Masked headers ({h(", ".join(event.masked))}) are not sent: only a placeholder was stored."
+  }
+  let form = "<form method=post action=\"{h(at)}/resend\"><p><label>URL <input name=url size=60 required value=\"{h(lastTarget(attempts))}\" placeholder=\"http://127.0.0.1:8080/webhooks/in/…\"></label> <button>Resend</button></p></form><p class=muted>Sends the same method, body and headers (less the connection's own) to a URL the app's <code>[fetch] allow</code> admits.{skipped}</p>"
+  if attempts.length() == 0 {
+    return "<h2 id=resends>Resend</h2>{form}"
+  }
+  var rows = Vector.of()
+  for attempt in attempts {
+    let result = if attempt.ok {
+      "<b>{attempt.status}</b>"
+    } else {
+      "<span class=danger>{h(attempt.error)}</span>"
+    }
+    let truncated = if attempt.truncated { ", stored truncated" } else { "" }
+    let answer = if attempt.ok {
+      "<details><summary>{text.bytes(attempt.bytes)}{truncated}</summary>{pairs(attempt.headers, "No headers.")}<pre>{h(attempt.body)}</pre></details>"
+    } else {
+      "–"
+    }
+    rows.push(
+      "<tr><td>{text.isoTime(attempt.at)}</td><td><code>{h(attempt.url)}</code></td><td>{result}</td><td>{attempt.millis} ms</td><td>{answer}</td></tr>",
+    )
+  }
+  "<h2 id=resends>Resend</h2>{form}<table><tr><th>sent (UTC)</th><th>to</th><th>result</th><th>took</th><th>response</th></tr>{"".join(rows.freeze())}</table><p><a href=\"{h(at)}?view=resends\">JSON</a></p>"
 }
 
 /// An endpoint's receive URL, as a client outside reaches it.

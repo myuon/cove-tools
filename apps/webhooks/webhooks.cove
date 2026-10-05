@@ -153,6 +153,12 @@ fn admin(request: web.Request, parts: Array<String>) -> web.Response {
       deleteEvent(endpoint.id, eventId)
       return redirect("{at}/admin/e/{endpoint.id}")
     }
+    if verb == "resend" && post {
+      return match loadEvent(endpoint.id, eventId) {
+        Some(event) => resendAction(request, endpoint, event)
+        None => textResponse(404, "no request `{eventId}` (deleted, or past the retention count)\n")
+      }
+    }
     if verb == "" && get {
       return match loadEvent(endpoint.id, eventId) {
         Some(event) => showEvent(request, endpoint, event)
@@ -287,5 +293,29 @@ fn showEvent(request: web.Request, endpoint: Endpoint, event: Event) -> web.Resp
   if view == "raw" {
     return textResponse(200, event.body)
   }
-  htmlResponse(200, eventPage(base(request), endpoint, event))
+  let attempts = listResends(endpoint.id, event.id)
+  if view == "resends" {
+    var items = Vector.of()
+    for attempt in attempts {
+      items.push(attemptJson(attempt))
+    }
+    return jsonResponse(200, json.renderPretty(Json.Items(items.freeze())))
+  }
+  htmlResponse(200, eventPage(base(request), endpoint, event, attempts))
+}
+
+/// Resends a stored request to the form's `url`, and shows what came back:
+/// the request's page (or, with `Accept: application/json`, the attempt).
+fn resendAction(request: web.Request, endpoint: Endpoint, event: Event) -> web.Response {
+  let url = text.parseForm(request.body).get("url").unwrapOr("").trim()
+  if url == "" {
+    return textResponse(400, "a resend needs `url`\n")
+  }
+  let attempt = resend(endpoint, event, url)
+  let outcome = if attempt.ok { "{attempt.status}" } else { "failed: {attempt.error}" }
+  log.info("{endpoint.name}: {event.id} resent to {url}: {outcome}")
+  if request.headers.get("accept").unwrapOr("").contains("application/json") {
+    return jsonResponse(200, json.renderPretty(attemptJson(attempt)))
+  }
+  redirect("{base(request)}/admin/e/{endpoint.id}/events/{event.id}#resends")
 }

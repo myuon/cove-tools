@@ -22,6 +22,10 @@ fn config(extra: &str) -> String {
         config.contains(SECRET),
         "the shipped app.toml changed shape"
     );
+    // The tests' hosts listen on a free port, not 8080.
+    let allow = "allow = [\"http://127.0.0.1:8080\", \"http://localhost:8080\"]";
+    assert!(config.contains(allow), "the shipped app.toml changed shape");
+    config = config.replace(allow, "allow = [\"http://127.0.0.1:*\"]");
     config.push_str(extra);
     config
 }
@@ -412,6 +416,192 @@ fn everything_a_sender_controls_is_escaped_on_the_pages() {
     assert!(detail
         .body
         .contains("&lt;script&gt;alert(2)&lt;/script&gt;"));
+}
+
+/// A stored request resent to `url`; the attempt as JSON.
+fn resend(addr: SocketAddr, id: &str, event: &str, url: &str) -> Json {
+    let answer = request(
+        addr,
+        "POST",
+        &format!("/webhooks/admin/e/{id}/events/{event}/resend"),
+        &[
+            &bearer(),
+            "Accept: application/json",
+            "Content-Type: application/x-www-form-urlencoded",
+        ],
+        &format!(
+            "url={}",
+            url.replace('%', "%25")
+                .replace('&', "%26")
+                .replace('?', "%3F")
+        ),
+    );
+    assert_eq!(answer.status, 200, "{answer:?}");
+    serde_json::from_str(&answer.body).unwrap()
+}
+
+/// The completion criterion of #2: curl a receive URL, restart the host,
+/// the history is still there, resend it to another endpoint.
+#[test]
+fn receive_restart_and_resend_to_another_endpoint() {
+    let apps = lab("");
+    let (github, staging, sent);
+    {
+        let host = start(&apps, 2);
+        github = endpoint(host.addr, "name=github");
+        staging = endpoint(host.addr, "name=staging");
+        let answer = request(
+            host.addr,
+            "POST",
+            &format!("/webhooks/in/{github}/push?delivery=7"),
+            &[
+                "Content-Type: application/json",
+                "X-GitHub-Event: push",
+                "Authorization: Bearer ghs_sender",
+            ],
+            r#"{"ref":"refs/heads/main"}"#,
+        );
+        let receipt: Json = serde_json::from_str(&answer.body).unwrap();
+        sent = receipt["event"].as_str().unwrap().to_string();
+    }
+    let host = start(&apps, 2);
+    let addr = host.addr;
+    assert_eq!(history(addr, &github)["events"][0]["id"], sent.as_str());
+
+    let target = format!(
+        "http://127.0.0.1:{}/webhooks/in/{staging}/replayed",
+        addr.port()
+    );
+    let attempt = resend(addr, &github, &sent, &target);
+    assert_eq!(attempt["ok"], true, "{attempt}");
+    assert_eq!(attempt["status"], 200);
+    assert_eq!(attempt["url"], target.as_str());
+    let receipt: Json = serde_json::from_str(attempt["body"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["endpoint"], staging.as_str());
+
+    // The other endpoint received it as the first one had.
+    let copy = event(addr, &staging, receipt["event"].as_str().unwrap());
+    assert_eq!(copy["method"], "POST");
+    assert_eq!(copy["path"], "/replayed");
+    assert_eq!(copy["body"], r#"{"ref":"refs/heads/main"}"#);
+    assert_eq!(copy["headers"]["x-github-event"], "push");
+    assert_eq!(copy["headers"]["content-type"], "application/json");
+    // The masked header's placeholder was not sent as if it were the value.
+    assert!(copy["headers"].get("authorization").is_none(), "{copy}");
+
+    // The attempt is kept with the request, and shown on its page.
+    let resends = request(
+        addr,
+        "GET",
+        &format!("/webhooks/admin/e/{github}/events/{sent}?view=resends"),
+        &[&bearer()],
+        "",
+    );
+    let resends: Json = serde_json::from_str(&resends.body).unwrap();
+    assert_eq!(resends.as_array().unwrap().len(), 1);
+    let page = request(
+        addr,
+        "GET",
+        &format!("/webhooks/admin/e/{github}/events/{sent}"),
+        &[&bearer()],
+        "",
+    );
+    assert!(page.body.contains("<b>200</b>"), "{}", page.body);
+    // The resend parked its run; no worker waited on it.
+    assert!(count(&host, "webhooks", "parks") >= 1);
+    assert_eq!(count(&host, "webhooks", "blocking_host_calls"), 0);
+}
+
+#[test]
+fn a_resend_that_gets_no_response_is_stored_as_a_failure() {
+    let apps = lab("");
+    let host = start(&apps, 2);
+    let addr = host.addr;
+    let id = endpoint(addr, "name=x");
+    let answer = request(
+        addr,
+        "POST",
+        &format!("/webhooks/in/{id}"),
+        &[],
+        "<script>alert(9)</script>",
+    );
+    let receipt: Json = serde_json::from_str(&answer.body).unwrap();
+    let sent = receipt["event"].as_str().unwrap();
+
+    // Off the allowlist: refused before anything is sent.
+    let refused = resend(addr, &id, sent, "http://example.org/hook");
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("not on app `webhooks`'s fetch allowlist"),
+        "{refused}"
+    );
+    // Allowed, but nothing listens there.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let unreachable = resend(addr, &id, sent, &format!("http://127.0.0.1:{port}/"));
+    assert_eq!(unreachable["ok"], false);
+    assert!(
+        unreachable["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not connect"),
+        "{unreachable}"
+    );
+
+    // A response whose body is markup is shown as text.
+    let echoed = resend(
+        addr,
+        &id,
+        sent,
+        &format!("http://127.0.0.1:{}/hello/echo", addr.port()),
+    );
+    assert_eq!(echoed["status"], 200);
+    assert_eq!(echoed["body"], "<script>alert(9)</script>");
+    let page = request(
+        addr,
+        "GET",
+        &format!("/webhooks/admin/e/{id}/events/{sent}"),
+        &[&bearer()],
+        "",
+    );
+    assert!(!page.body.contains("<script>alert(9)"));
+    assert!(page.body.contains("&lt;script&gt;alert(9)&lt;/script&gt;"));
+    assert!(page.body.contains("could not connect"));
+
+    // All three are kept, newest first; deleting the request takes them too.
+    let listed = request(
+        addr,
+        "GET",
+        &format!("/webhooks/admin/e/{id}/events/{sent}?view=resends"),
+        &[&bearer()],
+        "",
+    );
+    let listed: Json = serde_json::from_str(&listed.body).unwrap();
+    let urls: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(urls.len(), 3);
+    assert!(urls[0].ends_with("/hello/echo"));
+    assert_eq!(urls[2], "http://example.org/hook");
+    assert_eq!(count(&host, "webhooks", "fetch.refused"), 1);
+    let deleted = request(
+        addr,
+        "POST",
+        &format!("/webhooks/admin/e/{id}/events/{sent}/delete"),
+        &[&bearer()],
+        "",
+    );
+    assert_eq!(deleted.status, 303);
+    // Only the endpoint is left in the store.
+    let detail = host.app_detail("webhooks").unwrap();
+    assert_eq!(detail["kv"]["keys"], 1, "{detail}");
 }
 
 /// Standard base64, for a Basic login.
