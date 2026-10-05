@@ -1,0 +1,27 @@
+use web
+use timer
+use log
+
+/// Waits `?ms=` milliseconds (default 100), `?times=` times over (default 1),
+/// then answers how long it waited.
+///
+/// Each `timer.sleep` parks the run. A wait longer than the app's deadline is
+/// cancelled at the deadline and answered 504 by the host.
+export fn handle(request: web.Request) -> web.Response {
+  let ms = Int.parse(request.query.get("ms").unwrapOr("100")).unwrapOr(-1)
+  let times = Int.parse(request.query.get("times").unwrapOr("1")).unwrapOr(-1)
+  if ms < 0 || ms > 60000 || times < 1 || times > 16 {
+    return web.Response(
+      status: 400,
+      headers: Map.of(),
+      body: "?ms= must be 0 to 60000 and ?times= 1 to 16\n",
+    )
+  }
+  var done = 0
+  while done < times {
+    timer.sleep(ms)
+    done += 1
+  }
+  log.info("{request.method} {request.path} waited {times} x {ms} ms")
+  web.Response(status: 200, headers: Map.of(), body: "waited {times} x {ms} ms\n")
+}

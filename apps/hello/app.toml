@@ -1,0 +1,8 @@
+# Pure: granted nothing. Building a `web.Response` initializes a type the
+# `web` schema declares, which needs no capability.
+grant = []
+
+[limits]
+# `/spin` loops until this runs out: one failed request, nothing else.
+fuel = 2000000
+deadline = "2s"

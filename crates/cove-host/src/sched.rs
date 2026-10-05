@@ -1,0 +1,648 @@
+//! The scheduler: per-app queues served round robin, a shared pool of worker
+//! threads, and a monitor that slices long runs.
+//!
+//! ```text
+//!   HTTP (tokio) ──admit──▶ ┌ app A: starts ░░░ runs ░ ┐
+//!        ▲                  │ app B: starts ░   runs   │ ──take (round robin)──▶ workers × N
+//!        │ oneshot          └ app C: …                 ┘                          │
+//!        │                          ▲   ▲                                         │
+//!        │                          │   └── Continue ◀── Step::Yielded ───────────┤
+//!        │                          └────── Resume ◀── PendingWork on tokio ◀─────┤ Step::Parked
+//!        └──────────────────────────────────────────────── Step::Answered ────────┘
+//! ```
+//!
+//! **Cove never runs on the async runtime.** The HTTP side admits a request
+//! into its app's queue and awaits a oneshot; a worker — a plain thread —
+//! takes it, builds a fresh `OwnedVm` over the app's shared
+//! `PreparedProgram`, and runs it until it answers, parks or yields.
+//!
+//! **A parked run holds no thread.** A host that answers pending hands over a
+//! [`PendingWork`] future; it is spawned on the I/O runtime, raced against the
+//! run's deadline (`ParkedVm::time_left`, ADR 0082), and its answer — or the
+//! deadline — puts a resume job on the app's queue, for whichever worker is
+//! free. A run whose deadline came first is cancelled (`ParkedVm::cancel`) and
+//! answered 504, and its future is dropped, which withdraws the work.
+//!
+//! **A long run is sliced.** Each worker publishes the run it is running; the
+//! monitor raises a run's `YieldRequest` once it has held its worker for a
+//! slice (2 ms by default) *and* something else is waiting for a worker
+//! (ADR 0084, inside compiled code too by ADR 0085). The yielded run goes to
+//! the back of its app's queue.
+//!
+//! **Apps are served round robin.** Each app has its own queue — runs to
+//! resume or continue, and requests waiting to start — and a worker takes one
+//! job from the next app in turn that has work it may run. A job is at most
+//! one slice of a run while others wait, so an app with a thousand requests
+//! queued gets one turn in N like every other busy app: its depth costs
+//! itself, not its neighbours. An app at its `max_in_flight` has its starts
+//! held back (its runs still continue), and an app at `max_queued` has new
+//! requests rejected with 429; the server as a whole rejects with 503 past
+//! `--max-in-flight`.
+//!
+//! **A run that cannot yield is surfaced, not trusted.** A run below an
+//! encoded callee of compiled code, inside a host call, or beside a task
+//! declines a yield request. The monitor counts a run still holding its
+//! worker well after it was asked (`overdue_yields`) and logs it; the
+//! runtime's own `yields_declined` is summed per app; the run's deadline
+//! still ends it.
+
+use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use cove_diag::render;
+use cove_runtime::trace::RunOutcome;
+use cove_runtime::{Budget, ParkedVm, RuntimeError, Step, Transfer, YieldRequest, YieldedVm};
+use tokio::sync::oneshot;
+
+use crate::apps::App;
+use crate::convert::{request_value, response_of, AppRequest, BadResponse, Reply};
+use crate::hosts::PendingWork;
+use crate::stats::{ErrorKind, Rejection};
+
+/// A request in flight: which app, since when, and where its answer goes.
+pub struct Flight {
+    pub id: u64,
+    pub app: usize,
+    pub accepted: Instant,
+    pub reply: oneshot::Sender<Reply>,
+}
+
+/// A request waiting to start.
+pub struct Start {
+    pub request: AppRequest,
+    pub flight: Flight,
+}
+
+struct Resume {
+    parked: ParkedVm,
+    /// The host's answer, or `None` for a run whose deadline came first,
+    /// which is cancelled instead.
+    answer: Option<Result<Transfer, RuntimeError>>,
+    flight: Flight,
+}
+
+struct Continue {
+    yielded: YieldedVm,
+    flight: Flight,
+}
+
+enum Job {
+    Start(Box<Start>),
+    Resume(Box<Resume>),
+    Continue(Box<Continue>),
+}
+
+// --------------------------------------------------------------- the queue
+
+struct AppQueue {
+    /// Requests admitted and not started.
+    starts: VecDeque<Box<Start>>,
+    /// Runs already started: resumed after a park, or continued after a
+    /// yield. Always eligible, and taken before a start, so that an app
+    /// finishes what it began before it begins more.
+    runs: VecDeque<Job>,
+    /// Runs started and not answered.
+    in_flight: usize,
+    max_in_flight: usize,
+    max_queued: usize,
+}
+
+impl AppQueue {
+    fn eligible(&self) -> bool {
+        !self.runs.is_empty() || (!self.starts.is_empty() && self.in_flight < self.max_in_flight)
+    }
+}
+
+struct QueueState {
+    apps: Vec<AppQueue>,
+    /// The app the next take looks at first.
+    cursor: usize,
+    /// Requests admitted and not answered, over every app.
+    admitted: usize,
+    closed: bool,
+}
+
+/// Per-app queues, served round robin.
+pub struct RunQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    max_admitted: usize,
+}
+
+impl RunQueue {
+    fn new(apps: &[App], max_admitted: usize) -> RunQueue {
+        RunQueue {
+            state: Mutex::new(QueueState {
+                apps: apps
+                    .iter()
+                    .map(|app| AppQueue {
+                        starts: VecDeque::new(),
+                        runs: VecDeque::new(),
+                        in_flight: 0,
+                        max_in_flight: app.limits.max_in_flight,
+                        max_queued: app.limits.max_queued,
+                    })
+                    .collect(),
+                cursor: 0,
+                admitted: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+            max_admitted,
+        }
+    }
+
+    /// Queues a request, or says why not.
+    pub fn admit(&self, app: usize, start: Box<Start>) -> Result<(), Rejection> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.admitted >= self.max_admitted {
+            return Err(Rejection::ServerBusy);
+        }
+        let queue = &mut state.apps[app];
+        if queue.starts.len() >= queue.max_queued {
+            return Err(Rejection::QueueFull);
+        }
+        queue.starts.push_back(start);
+        state.admitted += 1;
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn push_run(&self, app: usize, job: Job) {
+        let mut state = self.state.lock().unwrap();
+        state.apps[app].runs.push_back(job);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// The next job, from the next app in turn that has one it may run; or
+    /// `None` once the queue is closed.
+    fn take(&self) -> Option<(usize, Job)> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.closed {
+                return None;
+            }
+            let n = state.apps.len();
+            for k in 0..n {
+                let at = (state.cursor + k) % n;
+                if !state.apps[at].eligible() {
+                    continue;
+                }
+                state.cursor = (at + 1) % n;
+                let queue = &mut state.apps[at];
+                let job = match queue.runs.pop_front() {
+                    Some(job) => job,
+                    None => {
+                        queue.in_flight += 1;
+                        Job::Start(queue.starts.pop_front().expect("eligible"))
+                    }
+                };
+                return Some((at, job));
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    /// A run of `app` answered: it no longer counts against either limit.
+    fn finished(&self, app: usize) {
+        let mut state = self.state.lock().unwrap();
+        let queue = &mut state.apps[app];
+        queue.in_flight = queue.in_flight.saturating_sub(1);
+        let wake = !queue.starts.is_empty();
+        state.admitted = state.admitted.saturating_sub(1);
+        drop(state);
+        if wake {
+            self.ready.notify_one();
+        }
+    }
+
+    /// Whether some job is waiting for a worker.
+    fn has_waiting(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .apps
+            .iter()
+            .any(AppQueue::eligible)
+    }
+
+    /// `(in_flight, queued)` for `app`.
+    pub fn gauges(&self, app: usize) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        let queue = &state.apps[app];
+        (queue.in_flight, queue.starts.len())
+    }
+
+    /// Requests admitted and not answered, over every app.
+    pub fn admitted(&self) -> usize {
+        self.state.lock().unwrap().admitted
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        for queue in &mut state.apps {
+            queue.starts.clear();
+            queue.runs.clear();
+        }
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
+}
+
+// -------------------------------------------------------------- the engine
+
+/// The run a worker is running now, for the monitor.
+struct Running {
+    app: usize,
+    since: Instant,
+    signal: YieldRequest,
+    asked_at: Option<Instant>,
+    overdue: bool,
+}
+
+/// The apps, their queues, and what the workers and the monitor share.
+pub struct Engine {
+    pub apps: Vec<App>,
+    pub queue: RunQueue,
+    running: Vec<Mutex<Option<Running>>>,
+    /// How long a run may hold a worker while others wait; `None` never asks.
+    pub slice: Option<Duration>,
+    /// Where pending host work runs.
+    io: tokio::runtime::Handle,
+    requests: AtomicU64,
+}
+
+impl Engine {
+    pub fn new(
+        apps: Vec<App>,
+        workers: usize,
+        max_in_flight: usize,
+        slice: Option<Duration>,
+        io: tokio::runtime::Handle,
+    ) -> Engine {
+        Engine {
+            queue: RunQueue::new(&apps, max_in_flight),
+            apps,
+            running: (0..workers.max(1)).map(|_| Mutex::new(None)).collect(),
+            slice,
+            io,
+            requests: AtomicU64::new(0),
+        }
+    }
+
+    /// A request id.
+    pub fn next_id(&self) -> u64 {
+        self.requests.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn workers(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Starts the worker threads.
+    pub fn start_workers(self: &Arc<Self>) -> Result<Vec<JoinHandle<()>>, String> {
+        (0..self.running.len())
+            .map(|worker| {
+                let engine = Arc::clone(self);
+                std::thread::Builder::new()
+                    .name(format!("cove-worker-{worker}"))
+                    .spawn(move || engine.run_worker(worker))
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    /// Stops taking work. Queued requests are dropped, which answers them
+    /// 503 on the HTTP side; a run on a worker finishes its step.
+    pub fn close(&self) {
+        self.queue.close();
+    }
+
+    fn run_worker(self: &Arc<Self>, worker: usize) {
+        while let Some((app, job)) = self.queue.take() {
+            let ran = catch_unwind(AssertUnwindSafe(|| self.run_job(worker, job)));
+            if ran.is_err() {
+                // The flight went down with the job, so the HTTP side sees
+                // its oneshot dropped and answers 500. The worker lives on.
+                *self.running[worker].lock().unwrap() = None;
+                self.apps[app].counters.error(ErrorKind::Internal);
+                self.queue.finished(app);
+                eprintln!(
+                    "cove-host: [{}] a request's run panicked in the host; answered 500",
+                    self.apps[app].name
+                );
+            }
+        }
+    }
+
+    fn run_job(self: &Arc<Self>, worker: usize, job: Job) {
+        match job {
+            Job::Start(start) => {
+                let Start { request, flight } = *start;
+                let app = &self.apps[flight.app];
+                let ready = app.ready().expect("only a loaded app is admitted");
+                if let Some(deadline) = app.limits.run.deadline {
+                    let waited = flight.accepted.elapsed();
+                    if waited > deadline {
+                        let reply = Reply::text(
+                            503,
+                            format!(
+                                "app `{}`: the request waited {} ms for a worker, longer than its \
+                                 {} ms deadline; it was not run\n",
+                                app.name,
+                                waited.as_millis(),
+                                deadline.as_millis()
+                            ),
+                        )
+                        .with_header("retry-after", "1");
+                        self.fail(flight, ErrorKind::QueueTimeout, reply);
+                        return;
+                    }
+                }
+                let vm = ready.isolate();
+                let budget = Budget::new(app.limits.run.clone());
+                let signal = vm.yield_request();
+                let step = self.sliced(worker, flight.app, signal, || {
+                    let argument = request_value(&request);
+                    vm.invoke_within_parkable(
+                        budget,
+                        &ready.module,
+                        &ready.function,
+                        vec![argument],
+                    )
+                });
+                self.settle(step, flight);
+            }
+            Job::Resume(resume) => {
+                let Resume {
+                    parked,
+                    answer,
+                    flight,
+                } = *resume;
+                let step = match answer {
+                    Some(answer) => {
+                        let signal = parked.yield_request();
+                        self.sliced(worker, flight.app, signal, || parked.resume(answer))
+                    }
+                    None => {
+                        let (vm, error) = parked.cancel();
+                        Step::Answered(vm, Err(error))
+                    }
+                };
+                self.settle(step, flight);
+            }
+            Job::Continue(cont) => {
+                let Continue { yielded, flight } = *cont;
+                let signal = yielded.yield_request();
+                let step = self.sliced(worker, flight.app, signal, || yielded.resume());
+                self.settle(step, flight);
+            }
+        }
+    }
+
+    /// Runs `step` as this worker's current run, where the monitor can see it,
+    /// and charges the time to the app.
+    fn sliced(
+        &self,
+        worker: usize,
+        app: usize,
+        signal: YieldRequest,
+        step: impl FnOnce() -> Step,
+    ) -> Step {
+        let since = Instant::now();
+        if self.slice.is_some() {
+            *self.running[worker].lock().unwrap() = Some(Running {
+                app,
+                since,
+                signal,
+                asked_at: None,
+                overdue: false,
+            });
+        }
+        let step = step();
+        if self.slice.is_some() {
+            *self.running[worker].lock().unwrap() = None;
+        }
+        self.apps[app]
+            .counters
+            .worker_ns
+            .fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        step
+    }
+
+    /// Answers `flight` with `reply`, counted as `kind`.
+    fn fail(&self, flight: Flight, kind: ErrorKind, reply: Reply) {
+        self.apps[flight.app].counters.error(kind);
+        let _ = flight.reply.send(reply);
+        self.queue.finished(flight.app);
+    }
+
+    /// What a run came to: an answer to send, a park to hand on, or a yield
+    /// to queue.
+    fn settle(self: &Arc<Self>, step: Step, flight: Flight) {
+        let app = &self.apps[flight.app];
+        let counters = &app.counters;
+        match step {
+            Step::Answered(vm, outcome) => {
+                let heap = vm.heap_words();
+                counters
+                    .instructions
+                    .fetch_add(vm.instructions(), Ordering::Relaxed);
+                counters
+                    .fuel
+                    .fetch_add(vm.meter().fuel_spent(), Ordering::Relaxed);
+                counters
+                    .yields_declined
+                    .fetch_add(vm.yields_declined(), Ordering::Relaxed);
+                counters.heap_peak_words.fetch_max(heap, Ordering::Relaxed);
+                let answered = match outcome {
+                    Ok(value) => match app.limits.max_heap_words {
+                        Some(limit) if heap > limit => Err((
+                            ErrorKind::Heap,
+                            format!(
+                                "app `{}`: the run's heap grew to {heap} words, above its \
+                                 max_heap_words of {limit}; its answer was discarded\n",
+                                app.name
+                            ),
+                        )),
+                        _ => match response_of(&value, app.limits.max_response_bytes) {
+                            Ok(reply) => Ok(reply),
+                            Err(BadResponse::Invalid(why)) => Err((
+                                ErrorKind::BadResponse,
+                                format!("app `{}` answered a bad response: {why}\n", app.name),
+                            )),
+                            Err(BadResponse::TooLarge { bytes, limit }) => Err((
+                                ErrorKind::ResponseTooLarge,
+                                format!(
+                                    "app `{}` answered a body of {bytes} bytes, above its \
+                                     max_response_bytes of {limit}\n",
+                                    app.name
+                                ),
+                            )),
+                        },
+                    },
+                    Err(error) => {
+                        let ready = app.ready().expect("only a loaded app runs");
+                        Err((
+                            kind_of(&error),
+                            render(&ready.sources, &error.to_diagnostic()),
+                        ))
+                    }
+                };
+                drop(vm);
+                match answered {
+                    Ok(reply) => {
+                        counters.served.fetch_add(1, Ordering::Relaxed);
+                        counters.ok.fetch_add(1, Ordering::Relaxed);
+                        let _ = flight.reply.send(reply);
+                        self.queue.finished(flight.app);
+                    }
+                    Err((kind, body)) => {
+                        eprintln!(
+                            "cove-host: [{}] {} {}: {}",
+                            app.name,
+                            kind.status(),
+                            kind.name(),
+                            first_line(&body)
+                        );
+                        self.fail(flight, kind, Reply::text(kind.status(), body));
+                    }
+                }
+            }
+            Step::Parked(mut parked) => {
+                counters.parks.fetch_add(1, Ordering::Relaxed);
+                counters.parked.fetch_add(1, Ordering::Relaxed);
+                match parked.take_request().map(|r| r.downcast::<PendingWork>()) {
+                    Some(Ok(work)) => {
+                        let left = parked.time_left();
+                        let engine = Arc::clone(self);
+                        self.io.spawn(async move {
+                            let work = *work;
+                            let answer = match left {
+                                Some(left) => tokio::select! {
+                                    answer = work.answer => Some(answer),
+                                    () = tokio::time::sleep(left) => None,
+                                },
+                                None => Some(work.answer.await),
+                            };
+                            engine.resume(parked, answer, flight);
+                        });
+                    }
+                    _ => {
+                        let answer = Err(RuntimeError::new(
+                            "the host parked with a request cove-host does not know",
+                        ));
+                        self.resume(parked, Some(answer), flight);
+                    }
+                }
+            }
+            Step::Yielded(yielded) => {
+                counters.yields.fetch_add(1, Ordering::Relaxed);
+                let app = flight.app;
+                self.queue
+                    .push_run(app, Job::Continue(Box::new(Continue { yielded, flight })));
+            }
+        }
+    }
+
+    /// A parked run, back on its app's queue with its answer — or with none,
+    /// to be cancelled.
+    fn resume(
+        &self,
+        parked: ParkedVm,
+        answer: Option<Result<Transfer, RuntimeError>>,
+        flight: Flight,
+    ) {
+        let app = flight.app;
+        self.apps[app]
+            .counters
+            .parked
+            .fetch_sub(1, Ordering::Relaxed);
+        self.queue.push_run(
+            app,
+            Job::Resume(Box::new(Resume {
+                parked,
+                answer,
+                flight,
+            })),
+        );
+    }
+
+    /// The monitor: every quarter slice, asks each run that has held its
+    /// worker for a whole slice to yield — only while something is waiting
+    /// for a worker — and notes a run that has not yielded well after it was
+    /// asked.
+    pub async fn monitor(self: Arc<Self>) {
+        let Some(slice) = self.slice else {
+            return;
+        };
+        let tick = (slice / 4).clamp(Duration::from_micros(100), Duration::from_millis(5));
+        let overdue_after = (slice * 4).max(Duration::from_millis(20));
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if self.queue.is_closed() {
+                return;
+            }
+            let waiting = self.queue.has_waiting();
+            let now = Instant::now();
+            for running in &self.running {
+                let mut running = running.lock().unwrap();
+                let Some(run) = running.as_mut() else {
+                    continue;
+                };
+                let counters = &self.apps[run.app].counters;
+                match run.asked_at {
+                    None if waiting && now.duration_since(run.since) >= slice => {
+                        run.signal.request();
+                        run.asked_at = Some(now);
+                        counters.yield_requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(asked) if !run.overdue && now.duration_since(asked) >= overdue_after => {
+                        run.overdue = true;
+                        let n = counters.overdue_yields.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            eprintln!(
+                                "cove-host: [{}] a run still holds its worker {} ms after it was \
+                                 asked to yield: it is where the runtime cannot yield (a host \
+                                 call, or below an encoded callee of compiled code); its \
+                                 deadline still bounds it ({n} so far)",
+                                self.apps[run.app].name,
+                                now.duration_since(asked).as_millis()
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// The kind of error a run stopped with.
+fn kind_of(error: &RuntimeError) -> ErrorKind {
+    match error.outcome {
+        RunOutcome::Fuel => ErrorKind::Fuel,
+        RunOutcome::Deadline => ErrorKind::Deadline,
+        RunOutcome::HostCalls => ErrorKind::HostCalls,
+        RunOutcome::CallDepth => ErrorKind::CallDepth,
+        RunOutcome::Concurrency => ErrorKind::Concurrency,
+        _ => ErrorKind::Runtime,
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
+}

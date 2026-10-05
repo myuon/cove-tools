@@ -1,0 +1,9 @@
+# I/O-bound: waits on `timer.sleep`, which the host answers pending. The run
+# parks — it holds no worker while it waits — and resumes on whichever worker
+# is free when the timer fires. A stand-in for an upstream call until the
+# host has outbound HTTP.
+grant = ["timer", "log"]
+
+[limits]
+deadline = "3s"
+max_host_calls = 32

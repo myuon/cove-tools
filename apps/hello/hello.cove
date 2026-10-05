@@ -1,0 +1,50 @@
+use web
+
+/// Greets whoever `?name=` names, and reaches nothing outside the run.
+///
+/// `/echo` answers the request body back; `/big?bytes=` answers a body of
+/// that many bytes (the response size limit is the host's to enforce);
+/// `/spin` loops until the fuel the host grants each request runs out.
+export fn handle(request: web.Request) -> web.Response {
+  if request.path == "/spin" {
+    return spin()
+  }
+  if request.path == "/echo" {
+    return text(200, request.body)
+  }
+  if request.path == "/big" {
+    let bytes = Int.parse(request.query.get("bytes").unwrapOr("1024")).unwrapOr(0)
+    return text(200, filler(bytes))
+  }
+  let name = request.query.get("name").unwrapOr("world")
+  text(200, "Hello, {name}! ({request.method} {request.path})\n")
+}
+
+/// A plain-text response.
+fn text(status: Int, body: String) -> web.Response {
+  web.Response(
+    status: status,
+    headers: Map.of(MapEntry(key: "content-type", value: "text/plain; charset=utf-8")),
+    body: body,
+  )
+}
+
+/// `bytes` bytes of `x`.
+fn filler(bytes: Int) -> String {
+  var parts = Vector.of()
+  var written = 0
+  while written < bytes {
+    parts.push("x")
+    written += 1
+  }
+  "".join(parts.freeze())
+}
+
+/// Counts for as long as the host lets it.
+fn spin() -> web.Response {
+  var turns = 0
+  while turns >= 0 {
+    turns += 1
+  }
+  text(200, "{turns}\n")
+}
