@@ -436,8 +436,8 @@ into a scratch home and runs the unit's own command line against it
 On the server, as the service's user:
 
 ```console
-$ curl -fsSLO https://github.com/myuon/cove-tools/releases/download/v0.1.1/install.sh
-$ bash install.sh v0.1.1
+$ curl -fsSLO https://github.com/myuon/cove-tools/releases/download/v0.2.0/install.sh
+$ bash install.sh v0.2.0
 ...
 first time: install the unit and start the service (needs sudo, once):
 
