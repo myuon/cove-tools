@@ -1,0 +1,4 @@
+# `cargo t`: the tests under the optimised-with-checks profile (see the
+# workspace manifest). A bare `cargo test` runs unoptimised and is slower.
+[alias]
+t = "test --workspace --profile checked"

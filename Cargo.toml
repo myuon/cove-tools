@@ -7,3 +7,24 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/myuon/cove-tools"
+
+# Cove, pinned to one commit. Every crate comes from the same revision; a
+# change the host needs from the compiler or the runtime goes to myuon/cove
+# first and is picked up here by moving `rev`.
+[workspace.dependencies]
+cove-diag = { git = "https://github.com/myuon/cove", rev = "9272282" }
+cove-ir = { git = "https://github.com/myuon/cove", rev = "9272282" }
+cove-runtime = { git = "https://github.com/myuon/cove", rev = "9272282", features = ["template"] }
+cove-sema = { git = "https://github.com/myuon/cove", rev = "9272282" }
+cove-syntax = { git = "https://github.com/myuon/cove", rev = "9272282" }
+
+# The profile the tests run under, for Cove's own reason: they run Cove
+# programs (the CPU-heavy sample app counts primes for tens of milliseconds a
+# request), and unoptimised that is several times slower. It inherits release
+# and turns the checks back on, so nothing the debug build checks is lost.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+codegen-units = 16
+incremental = true
