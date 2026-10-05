@@ -96,6 +96,7 @@ fn endpointPage(
   base: String,
   origin: String,
   endpoint: Endpoint,
+  reply: Reply,
   events: Array<Summary>,
   pageSize: Int,
 ) -> String {
@@ -104,13 +105,13 @@ fn endpointPage(
   var rows = Vector.of()
   for event in events {
     rows.push(
-      "<tr><td><a href=\"{h(at)}/events/{h(event.id)}\">{text.isoTime(event.received)}</a></td><td>{h(event.method)}</td><td><code>{h(event.path)}</code></td><td>{h(event.contentType)}</td><td>{text.bytes(event.bytes)}</td></tr>",
+      "<tr><td><a href=\"{h(at)}/events/{h(event.id)}\">{text.isoTime(event.received)}</a></td><td>{h(event.method)}</td><td><code>{h(event.path)}</code></td><td>{h(event.contentType)}</td><td>{text.bytes(event.bytes)}</td><td>{answered(event.answered)}</td></tr>",
     )
   }
   let table = if rows.length() == 0 {
     "<p class=muted>Nothing received yet. Try <code>curl -d 'hello' {h(url)}</code></p>"
   } else {
-    "<table><tr><th>received (UTC)</th><th>method</th><th>path</th><th>content type</th><th>size</th></tr>{"".join(rows.freeze())}</table>"
+    "<table><tr><th>received (UTC)</th><th>method</th><th>path</th><th>content type</th><th>size</th><th>answered</th></tr>{"".join(rows.freeze())}</table>"
   }
   let older = match events.get(pageSize - 1) {
     Some(last) => "<p><a href=\"{h(at)}?before={h(last.id)}\">older →</a></p>"
@@ -118,7 +119,7 @@ fn endpointPage(
   }
   let settings = "<p>Receive URL: <code id=url>{h(url)}</code> <button onclick=\"navigator.clipboard.writeText(document.getElementById('url').textContent)\">Copy</button></p><p class=muted>Keeps the last {endpoint.retention} requests · stores at most {text.bytes(endpoint.maxBody)} of a body · {if endpoint.mask { "masks secret headers" } else { "stores every header as sent" }} · created {text.isoTime(endpoint.created)}</p>"
   let actions = "<p>{postButton("{at}/clear", "Delete history", "Delete every stored request of this endpoint?")} {postButton("{at}/delete", "Delete endpoint", "Delete this endpoint and its history?")} <a href=\"{h(at)}?format=json\">JSON</a></p>"
-  layout(base, endpoint.name, "<h1>{h(endpoint.name)}</h1>{settings}{actions}<h2>Requests</h2>{table}{older}")
+  layout(base, endpoint.name, "<h1>{h(endpoint.name)}</h1>{settings}{actions}{settingsForm(at, reply)}<h2>Requests</h2>{table}{older}")
 }
 
 /// A two-column table of `entries`, or a note that there are none.
@@ -168,6 +169,32 @@ fn eventPage(base: String, endpoint: Endpoint, event: Event, attempts: Array<Att
     "{event.method} {event.path}",
     "{actions}<h1>{h(event.method)} <code>{h(event.path)}</code></h1>{summary}<h2>Query</h2>{pairs(event.query, "No query.")}<h2>Headers</h2>{masked}{pairs(event.headers, "No headers.")}<h2>Body</h2>{body}{resends(at, event, attempts)}",
   )
+}
+
+/// The status a request was answered with, as the history shows it.
+fn answered(status: Int) -> String {
+  if status == 0 {
+    "–"
+  } else if status >= 400 {
+    "<span class=danger>{status}</span>"
+  } else {
+    "{status}"
+  }
+}
+
+/// What the endpoint answers, and the form that changes it.
+fn settingsForm(at: String, reply: Reply) -> String {
+  let summary = if reply.errorEvery > 0 {
+    "{reply.status} (and {reply.errorStatus} to 1 in every {reply.errorEvery} requests)"
+  } else {
+    "{reply.status}"
+  }
+  let delayed = if reply.delayMs > 0 { " after {reply.delayMs} ms" } else { "" }
+  let body = if reply.body == "" { "the receipt" } else { text.bytes(reply.body.byteLength()) }
+  let customized = reply.status != 200 || reply.delayMs > 0 || reply.errorEvery > 0 ||
+    reply.body != "" || !reply.headers.isEmpty()
+  let open = if customized { " open" } else { "" }
+  "<details{open}><summary>Answers {summary}{delayed} with {body}</summary><form method=post action=\"{h(at)}/settings\"><p><label>Status <input name=status type=number min=100 max=599 value={reply.status}></label> <label>after <input name=delayMs type=number min=0 max={maxDelayMs()} value={reply.delayMs}> ms</label> (waiting parks the request: it holds no worker)</p><p><label>Headers, one <code>Name: value</code> a line<br><textarea name=headers rows=3 cols=70>{h(headerLines(reply.headers))}</textarea></label></p><p><label>Body (empty: the receipt <code>\{\"ok\":true,…\}</code>)<br><textarea name=body rows=4 cols=70>{h(reply.body)}</textarea></label></p><p><label>Fail every <input name=errorEvery type=number min=0 value={reply.errorEvery}> requests (0: never)</label> <label>with status <input name=errorStatus type=number min=100 max=599 value={reply.errorStatus}></label></p><p><label>Error body (empty: a line saying so)<br><textarea name=errorBody rows=2 cols=70>{h(reply.errorBody)}</textarea></label></p><p><button>Save</button></p></form></details>"
 }
 
 /// The resend form, and what earlier resends came to.

@@ -332,7 +332,7 @@ do, and an app may use only what `app.toml` grants:
 | `web` | — | the `Request` and `Response` types |
 | `log` | `log` | `info`, `warn`, `error` (`String`): a line on stdout, `[app] level: line` |
 | `timer` | `timer` | `sleep(millis: Int)`: parks the run for that long (at most 60 s; `0` parks and comes straight back) |
-| `kv` | `kv` | `get(key) -> Option<String>`, `put(key, value) -> Result<Unit, Error>`, `delete(key) -> Bool`, `list(prefix, after, limit) -> Array<kv.Entry>`, `listDesc(prefix, before, limit) -> Array<kv.Entry>` |
+| `kv` | `kv` | `get(key) -> Option<String>`, `put(key, value) -> Result<Unit, Error>`, `delete(key) -> Bool`, `increment(key, by) -> Result<Int, Error>` (atomic), `list(prefix, after, limit) -> Array<kv.Entry>`, `listDesc(prefix, before, limit) -> Array<kv.Entry>` |
 | `fetch` | `fetch` | `get(url)` and `request(method, url, headers: Map<String, String>, body)`, each `-> Result<fetch.Response, Error>` |
 | `time` | `time` | `nowMillis() -> Int`: the wall clock, milliseconds since the Unix epoch; `nowMicros() -> Int`: microseconds, strictly increasing across the process |
 | `random` | `random` | `hex(bytes: Int) -> String`: 1–64 random bytes from the operating system, as hex |

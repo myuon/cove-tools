@@ -1,7 +1,7 @@
 # The webhook lab (issue #2): receive URLs that keep every request sent to
 # them, and admin pages to read them. Everything is stored in the app's own
 # key-value store, so it survives a restart.
-grant = ["kv", "log", "time", "random", "auth", "fetch"]
+grant = ["kv", "log", "time", "random", "auth", "fetch", "timer"]
 
 [limits]
 deadline = "10s"

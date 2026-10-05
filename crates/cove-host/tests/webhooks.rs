@@ -599,9 +599,200 @@ fn a_resend_that_gets_no_response_is_stored_as_a_failure() {
         "",
     );
     assert_eq!(deleted.status, 303);
-    // Only the endpoint is left in the store.
+    // Only the endpoint and its request count are left in the store.
     let detail = host.app_detail("webhooks").unwrap();
-    assert_eq!(detail["kv"]["keys"], 1, "{detail}");
+    assert_eq!(detail["kv"]["keys"], 2, "{detail}");
+}
+
+/// Saves endpoint `id`'s response settings from `form`; the status.
+fn settings(addr: SocketAddr, id: &str, form: &str) -> Answer {
+    request(
+        addr,
+        "POST",
+        &format!("/webhooks/admin/e/{id}/settings"),
+        &[&bearer(), "Content-Type: application/x-www-form-urlencoded"],
+        form,
+    )
+}
+
+#[test]
+fn an_endpoint_answers_as_configured_and_fails_on_schedule() {
+    let apps = lab("");
+    let host = start(&apps, 2);
+    let addr = host.addr;
+    let id = endpoint(addr, "name=flaky");
+    // Before any settings: 200 and the receipt.
+    let plain = request(addr, "POST", &format!("/webhooks/in/{id}"), &[], "x");
+    assert_eq!(plain.status, 200);
+    assert!(plain.body.contains("\"ok\":true"));
+
+    let saved = settings(
+        addr,
+        &id,
+        "status=202&headers=Content-Type%3A+text%2Fplain%0D%0AX-Lab%3A+yes&body=accepted&errorEvery=3&errorStatus=503&errorBody=try+later",
+    );
+    assert_eq!(saved.status, 303, "{saved:?}");
+    // The plain request was the first; the schedule starts again with the
+    // history, so clear it.
+    request(
+        addr,
+        "POST",
+        &format!("/webhooks/admin/e/{id}/clear"),
+        &[&bearer()],
+        "",
+    );
+    let mut statuses = Vec::new();
+    for n in 0..6 {
+        let answer = request(
+            addr,
+            "POST",
+            &format!("/webhooks/in/{id}"),
+            &[],
+            &format!("{n}"),
+        );
+        statuses.push(answer.status);
+        if answer.status == 202 {
+            assert_eq!(answer.body, "accepted");
+            assert_eq!(answer.header("x-lab"), Some("yes"));
+            assert_eq!(answer.header("content-type"), Some("text/plain"));
+        } else {
+            assert_eq!(answer.body, "try later");
+        }
+        assert!(answer.header("x-webhook-event").is_some());
+    }
+    assert_eq!(statuses, [202, 202, 503, 202, 202, 503]);
+    // The history says what each was answered.
+    let answered: Vec<u64> = history(addr, &id)["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["answered"].as_u64().unwrap())
+        .rev()
+        .collect();
+    assert_eq!(answered, [202, 202, 503, 202, 202, 503]);
+    assert_eq!(history(addr, &id)["reply"]["errorEvery"], 3);
+}
+
+#[test]
+fn the_error_schedule_counts_every_request_even_at_once() {
+    let apps = lab("");
+    let host = start(&apps, 4);
+    let addr = host.addr;
+    let id = endpoint(addr, "name=busy");
+    assert_eq!(
+        settings(addr, &id, "errorEvery=2&errorStatus=500").status,
+        303
+    );
+    let senders: Vec<_> = (0..20)
+        .map(|n| {
+            let id = id.clone();
+            std::thread::spawn(move || {
+                request(
+                    addr,
+                    "POST",
+                    &format!("/webhooks/in/{id}"),
+                    &[],
+                    &format!("{n}"),
+                )
+                .status
+            })
+        })
+        .collect();
+    let statuses: Vec<u16> = senders.into_iter().map(|s| s.join().unwrap()).collect();
+    // `kv.increment` is atomic: exactly every second request fails, however
+    // they interleave.
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 500).count(),
+        10,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 200).count(),
+        10,
+        "{statuses:?}"
+    );
+}
+
+#[test]
+fn a_delayed_endpoint_parks_while_other_apps_answer() {
+    let apps = lab("");
+    // One worker: if the wait held it, nothing else could run.
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let id = endpoint(addr, "name=slow");
+    assert_eq!(settings(addr, &id, "status=201&delayMs=3000").status, 303);
+    let sender = std::thread::spawn(move || {
+        request(
+            addr,
+            "POST",
+            &format!("/webhooks/in/{id}/late"),
+            &[],
+            "waiting",
+        )
+    });
+    wait_until("the delayed request to park", || {
+        count(&host, "webhooks", "parked") == 1
+    });
+    // Another app answers on the one worker while it waits ...
+    assert_eq!(get(addr, "/hello/?name=meanwhile").status, 200);
+    // ... and so does the lab itself: the request is already on its page.
+    let id = history_endpoint(addr);
+    let events = history(addr, &id)["events"].clone();
+    assert_eq!(events[0]["path"], "/late");
+    assert_eq!(count(&host, "webhooks", "parked"), 1);
+
+    let answer = sender.join().unwrap();
+    assert_eq!(answer.status, 201);
+    assert!(answer.body.contains("\"ok\":true"));
+    assert_eq!(count(&host, "webhooks", "parks"), 1);
+    assert_eq!(count(&host, "webhooks", "blocking_host_calls"), 0);
+}
+
+/// The one endpoint's id, from the endpoint list's JSON-free page.
+fn history_endpoint(addr: SocketAddr) -> String {
+    let page = request(addr, "GET", "/webhooks/admin", &[&bearer()], "");
+    let at = page.body.find("/webhooks/admin/e/").unwrap() + "/webhooks/admin/e/".len();
+    page.body[at..at + 16].to_string()
+}
+
+#[test]
+fn bad_settings_are_refused_and_good_ones_are_shown_escaped() {
+    let apps = lab("");
+    let host = start(&apps, 1);
+    let addr = host.addr;
+    let id = endpoint(addr, "name=x");
+    for (form, problem) in [
+        ("status=99", "status must be 100 to 599"),
+        ("delayMs=9000", "delay must be 0 to 8000"),
+        ("headers=not+a+header", "is not a `Name: value` header"),
+        ("headers=Bad+Name%3A+x", "is not a `Name: value` header"),
+        ("errorEvery=lots", "error every must be a whole number"),
+    ] {
+        let refused = settings(addr, &id, form);
+        assert_eq!(refused.status, 400, "{form}");
+        assert!(refused.body.contains(problem), "{form}: {}", refused.body);
+    }
+    assert_eq!(history(addr, &id)["reply"]["status"], 200);
+
+    let markup = "%3C%2Ftextarea%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    assert_eq!(
+        settings(addr, &id, &format!("body={markup}&errorBody={markup}")).status,
+        303
+    );
+    let page = request(
+        addr,
+        "GET",
+        &format!("/webhooks/admin/e/{id}"),
+        &[&bearer()],
+        "",
+    );
+    assert!(!page.body.contains("<script>alert(1)"));
+    assert!(page
+        .body
+        .contains("&lt;/textarea&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+    // What a sender gets is the body as configured, as text.
+    let answer = request(addr, "POST", &format!("/webhooks/in/{id}"), &[], "");
+    assert_eq!(answer.body, "</textarea><script>alert(1)</script>");
 }
 
 /// Standard base64, for a Basic login.
