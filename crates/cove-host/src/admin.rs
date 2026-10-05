@@ -14,7 +14,12 @@
 //! | `DELETE /apps/<app>` | stops routing to the app; what is in flight finishes |
 //! | `GET /apps` | the stats, as `GET /_host/stats` |
 //!
-//! Anything without the token is 401, and changes nothing.
+//! Anything without the token is 401, and changes nothing — except, under
+//! `--ops-listener admin`, a `GET` under `/_host/` ([`crate::ops`]): the
+//! operations views are read-only and served here without the token, so that
+//! a browser through an SSH tunnel can read them. Their `Host` has to be a
+//! loopback name (`localhost`, `127.0.0.1`, `[::1]`), so that a page on
+//! another site cannot reach them by rebinding its own name to 127.0.0.1.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -31,8 +36,8 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
 
 use crate::convert::Reply;
-use crate::ops;
-use crate::server::{json_reply, to_response, Front, UpdateError};
+use crate::ops::{self, OpsListener};
+use crate::server::{is_ops_path, json_reply, to_response, Front, UpdateError};
 
 /// Serves the admin listener until the runtime stops.
 pub(crate) async fn serve(front: Arc<Front>, listener: tokio::net::TcpListener) {
@@ -61,6 +66,24 @@ async fn handle(front: &Front, request: Request<Incoming>) -> Response<Full<Byte
 }
 
 async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
+    if front.options.ops_listener == OpsListener::Admin && is_ops_path(request.uri().path()) {
+        if request.method() != Method::GET && request.method() != Method::HEAD {
+            return Reply::text(405, "the operations views are read-only\n")
+                .with_header("allow", "GET, HEAD");
+        }
+        let host = request
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !is_loopback_host(host) {
+            return Reply::text(
+                403,
+                "cove-host admin: the operations views answer only a loopback `Host`\n",
+            );
+        }
+        return front.ops_reply(request.uri().path(), request.uri().query());
+    }
     let presented = request
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -119,6 +142,20 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
 
 fn front_ops(front: &Front) -> ops::OpsContext<'_> {
     front.ops_context()
+}
+
+/// Whether a `Host` header names this machine's loopback, with or without a
+/// port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    let name = name.to_ascii_lowercase();
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Compares two tokens in time that depends on their lengths only.
@@ -187,6 +224,29 @@ fn write_private(path: &Path, token: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_loopback_names_are_loopback() {
+        for host in [
+            "localhost",
+            "localhost:8791",
+            "127.0.0.1:8791",
+            "[::1]:8791",
+            "LOCALHOST",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "evil.example:8791",
+            "10.0.0.1",
+            "localhost.evil",
+            "127.evil.example",
+        ] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
 
     #[test]
     fn tokens_compare_whole() {

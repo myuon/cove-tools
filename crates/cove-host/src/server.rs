@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -47,7 +47,8 @@ use tokio::sync::{oneshot, Semaphore};
 use crate::apps::{load_all, load_as, App, AppState, Backend, Lineage, LoadOptions};
 use crate::convert::{AppRequest, Reply};
 use crate::hosts::HostModules;
-use crate::ops::{self, OpsContext};
+use crate::ops::{self, OpsContext, OpsListener};
+use crate::proxy::Forwarding;
 use crate::router::{PathPrefix, Router};
 use crate::sched::{Cancel, Engine, Flight, Installed, Start};
 use crate::stats::{Rejection, ServerCounters};
@@ -82,6 +83,11 @@ pub struct ServeOptions {
     /// The admin token. `None` reads `<data>/admin.token`, writing a fresh
     /// random one there first if there is none.
     pub admin_token: Option<String>,
+    /// Which listener serves `/_host/` (`--ops-listener`).
+    pub ops_listener: OpsListener,
+    /// What apps are told of the client's scheme and host
+    /// (`--public-origin`, `--trust-proxy`).
+    pub forwarding: Forwarding,
 }
 
 impl ServeOptions {
@@ -101,6 +107,8 @@ impl ServeOptions {
             data: Some(PathBuf::from("data")),
             admin: Some("127.0.0.1:8081".to_string()),
             admin_token: None,
+            ops_listener: OpsListener::Public,
+            forwarding: Forwarding::default(),
         }
     }
 }
@@ -118,6 +126,8 @@ pub(crate) struct Front {
     /// One update at a time, so that two cannot race for a version number.
     updating: tokio::sync::Mutex<()>,
     pub(crate) admin_token: String,
+    /// Set by [`Host::shutdown`]: new requests are answered 503.
+    draining: AtomicBool,
 }
 
 /// Why an update did not happen.
@@ -173,6 +183,11 @@ impl Host {
         options: ServeOptions,
         load: LoadOptions,
     ) -> Result<Host, String> {
+        if options.ops_listener == OpsListener::Admin && options.admin.is_none() {
+            return Err(
+                "--ops-listener admin needs the admin listener; drop --no-admin".to_string(),
+            );
+        }
         let listener = std::net::TcpListener::bind(&options.addr)
             .map_err(|e| format!("cannot listen on `{}`: {e}", options.addr))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -215,6 +230,7 @@ impl Host {
             load,
             updating: tokio::sync::Mutex::new(()),
             admin_token,
+            draining: AtomicBool::new(false),
         });
         let (listener, admin) = {
             let _entered = runtime.enter();
@@ -294,10 +310,22 @@ impl Host {
                 None => "no time slice".to_string(),
             },
         ));
+        let ops_at = match (options.ops_listener, self.admin_addr) {
+            (OpsListener::Admin, Some(admin)) => admin,
+            _ => self.addr,
+        };
         out.push_str(&format!(
-            "  stats: curl -s http://{}/_host/stats   ops page: http://{}/_host/ui\n",
-            self.addr, self.addr
+            "  stats: curl -s http://{ops_at}/_host/stats   ops page: http://{ops_at}/_host/ui{}\n",
+            match options.ops_listener {
+                OpsListener::Admin => "  (admin listener only)",
+                OpsListener::Public => "",
+            }
         ));
+        if let Some(origin) = &options.forwarding.public_origin {
+            out.push_str(&format!("  public origin: {origin}\n"));
+        } else if options.forwarding.trust_proxy {
+            out.push_str("  trusting X-Forwarded-Proto and X-Forwarded-Host\n");
+        }
         if let Some(admin) = self.admin_addr {
             out.push_str(&format!(
                 "  admin: http://{admin} (token in {}); update with `cove-host update <app>`\n",
@@ -311,10 +339,40 @@ impl Host {
         out
     }
 
-    /// Blocks until Ctrl-C.
-    pub fn wait_for_ctrl_c(&self) {
-        if let Some(runtime) = &self.runtime {
-            let _ = runtime.block_on(tokio::signal::ctrl_c());
+    /// Blocks until Ctrl-C (SIGINT) or, on Unix, SIGTERM — what
+    /// `systemctl stop` sends.
+    pub fn wait_for_signal(&self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut term) = signal(SignalKind::terminate()) {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                    return;
+                }
+            }
+            let _ = tokio::signal::ctrl_c().await;
+        });
+    }
+
+    /// Stops admitting requests — each new one is answered 503 with
+    /// `Connection: close` — and waits up to `grace` for those admitted to
+    /// be answered. Returns how many were still unanswered.
+    pub fn shutdown(&self, grace: Duration) -> usize {
+        self.front.draining.store(true, Ordering::SeqCst);
+        let until = Instant::now() + grace;
+        loop {
+            let left = self.front.engine.queue.admitted();
+            if left == 0 || Instant::now() >= until {
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -381,49 +439,22 @@ impl Front {
     }
 
     async fn reply(&self, request: Request<Incoming>) -> Reply {
-        let path = request.uri().path().to_string();
-        if path == "/_host/stats" {
-            return json_reply(&ops::stats(&self.ops()));
+        if self.draining.load(Ordering::Relaxed) {
+            return Reply::text(503, "cove-host is shutting down; try again shortly\n")
+                .with_header("retry-after", "1")
+                .with_header("connection", "close");
         }
-        if path == "/_host/ui" {
-            return Reply {
-                status: 200,
-                headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
-                body: ops::page(&self.ops()),
+        let path = request.uri().path().to_string();
+        if is_ops_path(&path) {
+            return match self.options.ops_listener {
+                OpsListener::Public => self.ops_reply(&path, request.uri().query()),
+                OpsListener::Admin => {
+                    Reply::text(404, format!("cove-host has nothing at `{path}`\n"))
+                }
             };
         }
         if path == "/" {
             return Reply::text(200, self.index());
-        }
-        if let Some(name) = path
-            .strip_prefix("/_host/apps/")
-            .filter(|n| !n.contains('/'))
-        {
-            return match self.engine.slot_named(name) {
-                Some(slot) => json_reply(&ops::app_detail(&self.ops(), &slot)),
-                None => Reply::text(404, format!("no app named `{name}`\n")),
-            };
-        }
-        if let Some(name) = path
-            .strip_prefix("/_host/apps/")
-            .and_then(|rest| rest.strip_suffix("/logs"))
-        {
-            let Some(app) = self.engine.slot_named(name) else {
-                return Reply::text(404, format!("no app named `{name}`\n"));
-            };
-            let lines = request
-                .uri()
-                .query()
-                .and_then(|query| {
-                    form_urlencoded::parse(query.as_bytes())
-                        .find(|(key, _)| key == "n")
-                        .and_then(|(_, n)| n.parse().ok())
-                })
-                .unwrap_or(200);
-            return Reply::text(200, app.logs.tail(lines));
-        }
-        if path == "/_host" || path.starts_with("/_host/") {
-            return Reply::text(404, format!("cove-host has nothing at `{path}`\n"));
         }
         let host = request
             .headers()
@@ -486,6 +517,8 @@ impl Front {
                 })
                 .or_insert(value);
         }
+        // How the client reached the host: see `crate::proxy`.
+        self.options.forwarding.apply(&mut headers);
         // Where the app is mounted, so that it can write links to itself: the
         // host's, whatever the client sent. (Behind a proxy that mounts the
         // host under a prefix of its own, prepend it there.)
@@ -571,11 +604,54 @@ impl Front {
         for app in self.engine.slots().iter().filter_map(|slot| slot.current()) {
             out.push_str(&format!("  /{}/  {}\n", app.name, app.describe()));
         }
-        out.push_str("\n  /_host/ui  the operations page\n");
-        out.push_str("  /_host/stats  per-app counters, queues and work, as JSON\n");
-        out.push_str("  /_host/apps/<app>  one app, its versions and recent errors, as JSON\n");
-        out.push_str("  /_host/apps/<app>/logs?n=200  an app's recent log lines\n");
+        if self.options.ops_listener == OpsListener::Public {
+            out.push_str("\n  /_host/ui  the operations page\n");
+            out.push_str("  /_host/stats  per-app counters, queues and work, as JSON\n");
+            out.push_str("  /_host/apps/<app>  one app, its versions and recent errors, as JSON\n");
+            out.push_str("  /_host/apps/<app>/logs?n=200  an app's recent log lines\n");
+        }
         out
+    }
+
+    /// Answers a `GET` under `/_host/` ([`crate::ops`]), on whichever
+    /// listener serves them.
+    pub(crate) fn ops_reply(&self, path: &str, query: Option<&str>) -> Reply {
+        if path == "/_host/stats" {
+            return json_reply(&ops::stats(&self.ops()));
+        }
+        if path == "/_host/ui" {
+            return Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+                body: ops::page(&self.ops()),
+            };
+        }
+        if let Some(name) = path
+            .strip_prefix("/_host/apps/")
+            .filter(|n| !n.contains('/'))
+        {
+            return match self.engine.slot_named(name) {
+                Some(slot) => json_reply(&ops::app_detail(&self.ops(), &slot)),
+                None => Reply::text(404, format!("no app named `{name}`\n")),
+            };
+        }
+        if let Some(name) = path
+            .strip_prefix("/_host/apps/")
+            .and_then(|rest| rest.strip_suffix("/logs"))
+        {
+            let Some(app) = self.engine.slot_named(name) else {
+                return Reply::text(404, format!("no app named `{name}`\n"));
+            };
+            let lines = query
+                .and_then(|query| {
+                    form_urlencoded::parse(query.as_bytes())
+                        .find(|(key, _)| key == "n")
+                        .and_then(|(_, n)| n.parse().ok())
+                })
+                .unwrap_or(200);
+            return Reply::text(200, app.logs.tail(lines));
+        }
+        Reply::text(404, format!("cove-host has nothing at `{path}`\n"))
     }
 
     pub(crate) fn ops_context(&self) -> OpsContext<'_> {
@@ -665,6 +741,11 @@ impl Front {
         eprintln!("cove-host: [{name}] removed (was {removed})");
         Some(removed)
     }
+}
+
+/// Whether `path` is one of the host's own, under `/_host`.
+pub(crate) fn is_ops_path(path: &str) -> bool {
+    path == "/_host" || path.starts_with("/_host/")
 }
 
 /// A JSON reply.

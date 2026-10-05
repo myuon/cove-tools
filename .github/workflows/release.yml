@@ -1,0 +1,83 @@
+name: Release
+
+# A tag `v<version>` (the workspace's version) builds cove-host for x86-64
+# Linux with the native tier, packages it with the apps and deploy/, and
+# publishes a GitHub Release. Run by hand with a tag to rebuild that tag's
+# assets (they are replaced).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build and publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    # Ubuntu 24.04, x86-64: the glibc (2.39) of the machine it is deployed
+    # to, and a host the native tier compiles for.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: the tag is the workspace's version
+        id: version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$TAG" = "v$version" ] || { echo "tag $TAG is not v$version (Cargo.toml)"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: |
+          export COVE_TOOLS_COMMIT="$(git rev-parse --short=12 HEAD)"
+          cargo build --release --locked -p cove-host --bin cove-host
+          strip target/release/cove-host
+          ./target/release/cove-host --version
+      - name: check and test the apps on the release binary
+        env:
+          WEBHOOKS_ADMIN_TOKEN: ci
+          LEDGER_TOKEN: ci
+        run: |
+          ./target/release/cove-host check --apps apps
+          ./target/release/cove-host test --apps apps
+      - name: package
+        id: package
+        run: |
+          tarball="$(deploy/package.sh "${{ steps.version.outputs.version }}" target/release/cove-host dist)"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          ls -l dist
+      - name: install and run as deployed
+        run: deploy/smoke.sh "${{ steps.package.outputs.tarball }}"
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cp deploy/install.sh dist/install.sh
+          {
+            echo "cove-host $VERSION for x86-64 Linux (glibc 2.39+, built on Ubuntu 24.04), native tier enabled, with the apps and deploy/."
+            echo
+            echo "    $(./target/release/cove-host --version)"
+            echo
+            echo "Install on the server, as the service's user:"
+            echo
+            echo "    curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh"
+            echo "    bash install.sh $TAG"
+            echo
+            echo "See the README's Deploying section and deploy/cloudflare.md."
+          } > "$RUNNER_TEMP/notes.md"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "cove-tools $TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
