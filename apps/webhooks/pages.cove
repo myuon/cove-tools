@@ -1,0 +1,176 @@
+use web
+use json
+use text
+
+// The admin pages. Every value that came from outside — an endpoint's name,
+// a request's path, query, headers and body — goes through `h` before it is
+// part of the page; the page's own markup is the only markup in it.
+
+/// `value`, escaped for HTML.
+fn h(value: String) -> String {
+  text.escapeHtml(value)
+}
+
+/// The response headers every admin page carries: no script but the page's
+/// own, no framing, no sniffing, no caching, no referrer.
+fn pageHeaders(contentType: String) -> Map<String, String> {
+  Map.of(
+    MapEntry(key: "content-type", value: contentType),
+    MapEntry(
+      key: "content-security-policy",
+      value: "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    ),
+    MapEntry(key: "x-content-type-options", value: "nosniff"),
+    MapEntry(key: "x-frame-options", value: "DENY"),
+    MapEntry(key: "referrer-policy", value: "no-referrer"),
+    MapEntry(key: "cache-control", value: "no-store"),
+  )
+}
+
+/// An HTML page.
+fn htmlResponse(status: Int, page: String) -> web.Response {
+  web.Response(status: status, headers: pageHeaders("text/html; charset=utf-8"), body: page)
+}
+
+/// A JSON document.
+fn jsonResponse(status: Int, body: String) -> web.Response {
+  web.Response(status: status, headers: pageHeaders("application/json"), body: "{body}\n")
+}
+
+/// Plain text, which a browser shows as text whatever it holds.
+fn textResponse(status: Int, body: String) -> web.Response {
+  web.Response(status: status, headers: pageHeaders("text/plain; charset=utf-8"), body: body)
+}
+
+/// A `303 See Other` to `location`.
+fn redirect(location: String) -> web.Response {
+  web.Response(
+    status: 303,
+    headers: Map.of(
+      MapEntry(key: "location", value: location),
+      MapEntry(key: "cache-control", value: "no-store"),
+    ),
+    body: "",
+  )
+}
+
+fn css() -> String {
+  "body\{font:14px/1.45 system-ui,sans-serif;margin:0;color:#1d1d1f;background:#fafafa\}header\{background:#24292f;padding:.6em 1.2em\}header a\{color:#fff;text-decoration:none;font-weight:600\}main\{padding:1em 1.2em;max-width:72em\}table\{border-collapse:collapse;margin:.4em 0 1.2em;background:#fff\}td,th\{border:1px solid #d0d7de;padding:.25em .6em;text-align:left;vertical-align:top\}th\{background:#f3f4f6\}code,pre\{font:12px/1.4 ui-monospace,monospace\}pre\{background:#fff;border:1px solid #d0d7de;padding:.6em;white-space:pre-wrap;word-break:break-all;max-height:40em;overflow:auto\}form.inline\{display:inline\}button\{font:inherit;padding:.2em .7em\}.muted\{color:#6e7781\}.danger\{color:#b42318\}input\{font:inherit\}"
+}
+
+/// The page around `content`.
+fn layout(base: String, title: String, content: String) -> String {
+  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · webhook lab</title><style>{css()}</style></head><body><header><a href=\"{h(base)}/admin\">webhook lab</a></header><main>{content}</main></body></html>"
+}
+
+/// A form that POSTs to `action` with one button.
+fn postButton(action: String, label: String, confirm: String) -> String {
+  let check = if confirm == "" { "" } else { " onclick=\"return confirm('{h(confirm)}')\"" }
+  "<form class=inline method=post action=\"{h(action)}\"><button{check}>{h(label)}</button></form>"
+}
+
+/// The list of endpoints, and the form that makes one.
+fn endpointsPage(base: String, origin: String, endpoints: Array<Endpoint>) -> String {
+  var rows = Vector.of()
+  for endpoint in endpoints {
+    let newest = listEvents(endpoint.id, "", 1)
+    let last = match newest.get(0) {
+      Some(event) => text.isoTime(event.received)
+      None => "–"
+    }
+    rows.push(
+      "<tr><td><a href=\"{h(base)}/admin/e/{h(endpoint.id)}\">{h(endpoint.name)}</a></td><td><code>{h(receiveUrl(origin, base, endpoint.id))}</code></td><td>{last}</td><td>{endpoint.retention}</td><td>{text.bytes(endpoint.maxBody)}</td><td>{if endpoint.mask { "yes" } else { "no" }}</td></tr>",
+    )
+  }
+  let table = if rows.length() == 0 {
+    "<p class=muted>No endpoints yet.</p>"
+  } else {
+    "<table><tr><th>name</th><th>receive URL</th><th>last request</th><th>keeps</th><th>body limit</th><th>masks secrets</th></tr>{"".join(rows.freeze())}</table>"
+  }
+  let form = "<h2>New endpoint</h2><form method=post action=\"{h(base)}/admin/endpoints\"><input type=hidden name=masking value=present><p><label>Name <input name=name required maxlength=100></label></p><p><label>Keep the last <input name=retention type=number value=100 min=1 max={maxRetention()}> requests</label></p><p><label>Store at most <input name=maxBody type=number value=65536 min=0 max={maxBodyLimit()}> bytes of a body</label></p><p><label><input type=checkbox name=mask checked> Mask secret headers (authorization, cookie, …) before storing</label></p><p><button>Create</button></p></form>"
+  layout(base, "endpoints", "<h1>Endpoints</h1>{table}{form}")
+}
+
+/// An endpoint, and a page of what it received.
+fn endpointPage(
+  base: String,
+  origin: String,
+  endpoint: Endpoint,
+  events: Array<Summary>,
+  pageSize: Int,
+) -> String {
+  let at = "{base}/admin/e/{endpoint.id}"
+  let url = receiveUrl(origin, base, endpoint.id)
+  var rows = Vector.of()
+  for event in events {
+    rows.push(
+      "<tr><td><a href=\"{h(at)}/events/{h(event.id)}\">{text.isoTime(event.received)}</a></td><td>{h(event.method)}</td><td><code>{h(event.path)}</code></td><td>{h(event.contentType)}</td><td>{text.bytes(event.bytes)}</td></tr>",
+    )
+  }
+  let table = if rows.length() == 0 {
+    "<p class=muted>Nothing received yet. Try <code>curl -d 'hello' {h(url)}</code></p>"
+  } else {
+    "<table><tr><th>received (UTC)</th><th>method</th><th>path</th><th>content type</th><th>size</th></tr>{"".join(rows.freeze())}</table>"
+  }
+  let older = match events.get(pageSize - 1) {
+    Some(last) => "<p><a href=\"{h(at)}?before={h(last.id)}\">older →</a></p>"
+    None => ""
+  }
+  let settings = "<p>Receive URL: <code id=url>{h(url)}</code> <button onclick=\"navigator.clipboard.writeText(document.getElementById('url').textContent)\">Copy</button></p><p class=muted>Keeps the last {endpoint.retention} requests · stores at most {text.bytes(endpoint.maxBody)} of a body · {if endpoint.mask { "masks secret headers" } else { "stores every header as sent" }} · created {text.isoTime(endpoint.created)}</p>"
+  let actions = "<p>{postButton("{at}/clear", "Delete history", "Delete every stored request of this endpoint?")} {postButton("{at}/delete", "Delete endpoint", "Delete this endpoint and its history?")} <a href=\"{h(at)}?format=json\">JSON</a></p>"
+  layout(base, endpoint.name, "<h1>{h(endpoint.name)}</h1>{settings}{actions}<h2>Requests</h2>{table}{older}")
+}
+
+/// A two-column table of `entries`, or a note that there are none.
+fn pairs(entries: Map<String, String>, none: String) -> String {
+  if entries.isEmpty() {
+    return "<p class=muted>{h(none)}</p>"
+  }
+  var rows = Vector.of()
+  for entry in entries {
+    rows.push("<tr><th>{h(entry.key)}</th><td><code>{h(entry.value)}</code></td></tr>")
+  }
+  "<table>{"".join(rows.freeze())}</table>"
+}
+
+/// One received request.
+fn eventPage(base: String, endpoint: Endpoint, event: Event) -> String {
+  let at = "{base}/admin/e/{endpoint.id}/events/{event.id}"
+  let size = if event.truncated {
+    "{text.bytes(event.bytes)}, <span class=danger>stored truncated to {text.bytes(event.body.byteLength())}</span>"
+  } else {
+    text.bytes(event.bytes)
+  }
+  let masked = if event.masked.length() == 0 {
+    ""
+  } else {
+    "<p class=muted>Masked before storing: {h(", ".join(event.masked))}</p>"
+  }
+  let summary = "<table><tr><th>received</th><td>{text.isoTime(event.received)}</td></tr><tr><th>method</th><td>{h(event.method)}</td></tr><tr><th>path</th><td><code>{h(event.path)}</code></td></tr><tr><th>body</th><td>{size}</td></tr></table>"
+  let formatted = match json.parse(event.body) {
+    Ok(value) => {
+      if event.body.trim() == "" {
+        ""
+      } else {
+        "<h3>As JSON</h3><pre>{h(json.renderPretty(value))}</pre>"
+      }
+    }
+    Err(_) => ""
+  }
+  let body = if event.body == "" {
+    "<p class=muted>No body.</p>"
+  } else {
+    "<p><button onclick=\"navigator.clipboard.writeText(document.getElementById('body').textContent)\">Copy body</button> <a href=\"{h(at)}?view=raw\">raw</a> · <a href=\"{h(at)}?view=json\">JSON</a></p><pre id=body>{h(event.body)}</pre>{formatted}"
+  }
+  let actions = "<p><a href=\"{h(base)}/admin/e/{h(endpoint.id)}\">← {h(endpoint.name)}</a> {postButton("{at}/delete", "Delete this request", "")}</p>"
+  layout(
+    base,
+    "{event.method} {event.path}",
+    "{actions}<h1>{h(event.method)} <code>{h(event.path)}</code></h1>{summary}<h2>Query</h2>{pairs(event.query, "No query.")}<h2>Headers</h2>{masked}{pairs(event.headers, "No headers.")}<h2>Body</h2>{body}",
+  )
+}
+
+/// An endpoint's receive URL, as a client outside reaches it.
+fn receiveUrl(origin: String, base: String, id: String) -> String {
+  "{origin}{base}/in/{id}"
+}

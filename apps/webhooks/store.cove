@@ -1,0 +1,377 @@
+use kv
+use random
+use json
+use json.Json
+use text
+
+// The lab's records in the app's key-value store, as JSON:
+//
+//   endpoint:<id>           an endpoint's settings
+//   index:<id>:<event>      one received request's summary, for listing
+//   event:<id>:<event>      the request in full
+//
+// An event id is the time it arrived in microseconds, zero-padded to sixteen
+// digits — `time.nowMicros()`, which the host makes strictly increasing, so
+// keys sort in arrival order even within one millisecond — and a random
+// suffix, so that an id cannot be guessed from the time alone. The summary is kept apart from the event so
+// that listing a page, and trimming to the retention count, never reads a
+// body.
+
+/// A receive URL and what it keeps.
+struct Endpoint {
+  id: String
+  name: String
+  created: Int
+  // Whether secret headers (`authorization`, `cookie`, ...) are masked
+  // before anything is stored.
+  mask: Bool
+  // The most of a body that is stored; the rest is dropped, and the event
+  // says so.
+  maxBody: Int
+  // How many events are kept; the oldest go first.
+  retention: Int
+}
+
+/// One received request, as stored.
+struct Event {
+  id: String
+  endpoint: String
+  received: Int
+  method: String
+  path: String
+  query: Map<String, String>
+  headers: Map<String, String>
+  body: String
+  // The body's size as it arrived, before any truncation.
+  bytes: Int
+  truncated: Bool
+  // The names of the headers whose values were masked.
+  masked: Array<String>
+}
+
+/// What a list of events shows of each.
+struct Summary {
+  id: String
+  received: Int
+  method: String
+  path: String
+  bytes: Int
+  contentType: String
+}
+
+/// The headers whose values are masked on an endpoint that masks.
+fn secretHeaders() -> Array<String> {
+  [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+    "x-access-token",
+  ]
+}
+
+/// The largest body an endpoint may store, and the most events it may keep.
+fn maxBodyLimit() -> Int {
+  1048576
+}
+
+fn maxRetention() -> Int {
+  1000
+}
+
+fn number(value: Int) -> Json {
+  Json.Number(value.toFloat())
+}
+
+fn endpointJson(endpoint: Endpoint) -> Json {
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "id", value: Json.Text(endpoint.id)),
+      MapEntry(key: "name", value: Json.Text(endpoint.name)),
+      MapEntry(key: "created", value: number(endpoint.created)),
+      MapEntry(key: "mask", value: Json.Bool(endpoint.mask)),
+      MapEntry(key: "maxBody", value: number(endpoint.maxBody)),
+      MapEntry(key: "retention", value: number(endpoint.retention)),
+    ),
+  )
+}
+
+fn endpointOf(value: Json) -> Endpoint {
+  Endpoint(
+    id: json.text(value, "id"),
+    name: json.text(value, "name"),
+    created: json.int(value, "created", 0),
+    mask: json.bool(value, "mask", true),
+    maxBody: json.int(value, "maxBody", 65536),
+    retention: json.int(value, "retention", 100),
+  )
+}
+
+/// An event as JSON: what is stored, and what the JSON view shows.
+fn eventJson(event: Event) -> Json {
+  var masked = Vector.of()
+  for name in event.masked {
+    masked.push(Json.Text(name))
+  }
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "id", value: Json.Text(event.id)),
+      MapEntry(key: "endpoint", value: Json.Text(event.endpoint)),
+      MapEntry(key: "received", value: number(event.received)),
+      MapEntry(key: "receivedAt", value: Json.Text(text.isoTime(event.received))),
+      MapEntry(key: "method", value: Json.Text(event.method)),
+      MapEntry(key: "path", value: Json.Text(event.path)),
+      MapEntry(key: "query", value: json.fromTextMap(event.query)),
+      MapEntry(key: "headers", value: json.fromTextMap(event.headers)),
+      MapEntry(key: "body", value: Json.Text(event.body)),
+      MapEntry(key: "bytes", value: number(event.bytes)),
+      MapEntry(key: "truncated", value: Json.Bool(event.truncated)),
+      MapEntry(key: "masked", value: Json.Items(masked.freeze())),
+    ),
+  )
+}
+
+fn eventOf(value: Json) -> Event {
+  var masked = Vector.of()
+  match json.field(value, "masked") {
+    Some(Json.Items(items)) => {
+      for item in items {
+        match item {
+          Json.Text(name) => masked.push(name)
+          _ => {}
+        }
+      }
+    }
+    _ => {}
+  }
+  Event(
+    id: json.text(value, "id"),
+    endpoint: json.text(value, "endpoint"),
+    received: json.int(value, "received", 0),
+    method: json.text(value, "method"),
+    path: json.text(value, "path"),
+    query: json.textMap(value, "query"),
+    headers: json.textMap(value, "headers"),
+    body: json.text(value, "body"),
+    bytes: json.int(value, "bytes", 0),
+    truncated: json.bool(value, "truncated", false),
+    masked: masked.freeze(),
+  )
+}
+
+fn summaryJson(event: Event) -> Json {
+  Json.Fields(
+    Map.of(
+      MapEntry(key: "id", value: Json.Text(event.id)),
+      MapEntry(key: "received", value: number(event.received)),
+      MapEntry(key: "method", value: Json.Text(event.method)),
+      MapEntry(key: "path", value: Json.Text(event.path)),
+      MapEntry(key: "bytes", value: number(event.bytes)),
+      MapEntry(
+        key: "contentType",
+        value: Json.Text(event.headers.get("content-type").unwrapOr("")),
+      ),
+    ),
+  )
+}
+
+fn summaryOf(value: Json) -> Summary {
+  Summary(
+    id: json.text(value, "id"),
+    received: json.int(value, "received", 0),
+    method: json.text(value, "method"),
+    path: json.text(value, "path"),
+    bytes: json.int(value, "bytes", 0),
+    contentType: json.text(value, "contentType"),
+  )
+}
+
+/// A new endpoint's id: sixteen random hex digits, which is also what makes
+/// its receive URL hard to guess.
+fn newEndpointId() -> String {
+  random.hex(8)
+}
+
+/// Stores `endpoint`, new or changed.
+fn saveEndpoint(endpoint: Endpoint) -> Result<Unit, Error> {
+  kv.put("endpoint:{endpoint.id}", json.render(endpointJson(endpoint)))
+}
+
+/// The endpoint `id`, if there is one.
+fn loadEndpoint(id: String) -> Option<Endpoint> {
+  match kv.get("endpoint:{id}") {
+    Some(stored) => match json.parse(stored) {
+      Ok(value) => Some(endpointOf(value))
+      Err(_) => None
+    }
+    None => None
+  }
+}
+
+/// Every endpoint, by id.
+fn listEndpoints() -> Array<Endpoint> {
+  var endpoints = Vector.of()
+  var after = ""
+  var more = true
+  while more {
+    let page = kv.list("endpoint:", after, 100)
+    for entry in page {
+      match json.parse(entry.value) {
+        Ok(value) => endpoints.push(endpointOf(value))
+        Err(_) => {}
+      }
+      after = entry.key
+    }
+    more = page.length() == 100
+  }
+  endpoints.freeze()
+}
+
+/// Deletes every event of endpoint `id`; how many there were.
+fn clearEvents(id: String) -> Int {
+  var deleted = 0
+  var more = true
+  while more {
+    let page = kv.list("index:{id}:", "", 100)
+    for entry in page {
+      let event = entry.key.slice("index:{id}:".length(), entry.key.length())
+      kv.delete(entry.key)
+      kv.delete("event:{id}:{event}")
+      deleted += 1
+    }
+    more = page.length() > 0
+  }
+  deleted
+}
+
+/// Deletes endpoint `id` and its events.
+fn deleteEndpoint(id: String) -> Int {
+  let deleted = clearEvents(id)
+  kv.delete("endpoint:{id}")
+  deleted
+}
+
+/// Deletes the event `event` of endpoint `id`; whether it was there.
+fn deleteEvent(id: String, event: String) -> Bool {
+  kv.delete("event:{id}:{event}")
+  kv.delete("index:{id}:{event}")
+}
+
+/// Keeps the newest `retention` events of endpoint `id` and deletes the
+/// rest; how many it deleted.
+fn trim(id: String, retention: Int) -> Int {
+  let prefix = "index:{id}:"
+  let newest = kv.listDesc(prefix, "", retention)
+  if newest.length() < retention {
+    return 0
+  }
+  // Everything older than the oldest kept goes.
+  let oldestKept = newest.get(retention - 1)
+  var deleted = 0
+  match oldestKept {
+    Some(kept) => {
+      var more = true
+      while more {
+        let older = kv.listDesc(prefix, kept.key, 100)
+        for entry in older {
+          let event = entry.key.slice(prefix.length(), entry.key.length())
+          kv.delete(entry.key)
+          kv.delete("event:{id}:{event}")
+          deleted += 1
+        }
+        more = older.length() > 0
+      }
+    }
+    None => {}
+  }
+  deleted
+}
+
+/// The headers to store: the host's own `x-forwarded-prefix` dropped, and
+/// on an endpoint that masks, each secret header's value replaced by its
+/// length. Answers the headers and the names masked.
+fn storedHeaders(headers: Map<String, String>, mask: Bool) -> Stored {
+  var kept: Map<String, String> = Map.of()
+  var masked = Vector.of()
+  for entry in headers {
+    if entry.key != "x-forwarded-prefix" {
+      if mask && secretHeaders().contains(entry.key) {
+        kept = kept.inserted(entry.key, "[masked: {entry.value.length()} characters]")
+        masked.push(entry.key)
+      } else {
+        kept = kept.inserted(entry.key, entry.value)
+      }
+    }
+  }
+  Stored(headers: kept, masked: masked.freeze())
+}
+
+/// Headers as they are stored, and which were masked.
+struct Stored {
+  headers: Map<String, String>
+  masked: Array<String>
+}
+
+/// Builds the event for a request that reached endpoint `endpoint` at
+/// `micros` (`time.nowMicros()`, which never repeats), with `path` below
+/// the endpoint's receive URL.
+fn eventFor(
+  endpoint: Endpoint,
+  micros: Int,
+  method: String,
+  path: String,
+  query: Map<String, String>,
+  headers: Map<String, String>,
+  body: String,
+) -> Event {
+  let kept = storedHeaders(headers, endpoint.mask)
+  let stored = text.truncateBytes(body, endpoint.maxBody)
+  Event(
+    id: "{text.padded(micros, 16)}-{random.hex(4)}",
+    endpoint: endpoint.id,
+    received: micros / 1000,
+    method: method,
+    path: path,
+    query: query,
+    headers: kept.headers,
+    body: stored,
+    bytes: body.byteLength(),
+    truncated: stored.byteLength() < body.byteLength(),
+    masked: kept.masked,
+  )
+}
+
+/// Stores `event` and trims its endpoint to `retention` events.
+fn storeEvent(event: Event, retention: Int) -> Result<Unit, Error> {
+  kv.put("event:{event.endpoint}:{event.id}", json.render(eventJson(event)))?
+  kv.put("index:{event.endpoint}:{event.id}", json.render(summaryJson(event)))?
+  trim(event.endpoint, retention)
+  Ok(())
+}
+
+/// The event `event` of endpoint `id`, if it is still kept.
+fn loadEvent(id: String, event: String) -> Option<Event> {
+  match kv.get("event:{id}:{event}") {
+    Some(stored) => match json.parse(stored) {
+      Ok(value) => Some(eventOf(value))
+      Err(_) => None
+    }
+    None => None
+  }
+}
+
+/// A page of endpoint `id`'s events, newest first: at most `limit`, older
+/// than the event `before` (`""` for the newest).
+fn listEvents(id: String, before: String, limit: Int) -> Array<Summary> {
+  let from = if before == "" { "" } else { "index:{id}:{before}" }
+  var events = Vector.of()
+  for entry in kv.listDesc("index:{id}:", from, limit) {
+    match json.parse(entry.value) {
+      Ok(value) => events.push(summaryOf(value))
+      Err(_) => {}
+    }
+  }
+  events.freeze()
+}
