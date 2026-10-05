@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # x86-64 Linux, so the native tier is built and exercised.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      # Everything under `--profile checked` (release with debug assertions
+      # and overflow checks): the tests run Cove programs, which unoptimised
+      # is several times slower, and one profile means one build.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --profile checked -- -D warnings
+      - name: test
+        run: cargo test --workspace --profile checked
+      - name: test on the encoded VM
+        run: cargo test --profile checked --test host
+        env:
+          COVE_HOST_TEST_BACKEND: vm
+      - name: check and test the sample apps
+        run: |
+          ./target/checked/cove-host check --apps apps
+          ./target/checked/cove-host test --apps apps
