@@ -1,0 +1,28 @@
+use web
+
+fn upTo(n: String) -> web.Response {
+  handle(
+    web.Request(
+      method: "GET",
+      path: "/",
+      query: Map.of(MapEntry(key: "n", value: n)),
+      headers: Map.of(),
+      body: "",
+    ),
+  )
+}
+
+/// The counts are the known values of the prime-counting function.
+test fn countsThePrimesUpToN() -> Result<Unit, Error> {
+  assertEqual(upTo("2").body, "1 primes up to 2, the largest 2\n")?
+  assertEqual(upTo("100").body, "25 primes up to 100, the largest 97\n")?
+  assertEqual(upTo("10000").body, "1229 primes up to 10000, the largest 9973\n")?
+  Ok(())
+}
+
+test fn aSizeOutOfRangeIsRefused() -> Result<Unit, Error> {
+  assertEqual(upTo("lots").status, 400)?
+  assertEqual(upTo("1").status, 400)?
+  assertEqual(upTo("200001").status, 400)?
+  Ok(())
+}

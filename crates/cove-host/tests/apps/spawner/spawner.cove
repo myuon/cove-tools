@@ -1,0 +1,10 @@
+use web
+
+/// Doubles a number on a task of its own.
+export async fn handle(request: web.Request) -> web.Response {
+  scope tasks {
+    let doubled = tasks.spawn { 21 * 2 }
+    let answer = doubled.await()
+    web.Response(status: 200, headers: Map.of(), body: "{answer}\n")
+  }
+}

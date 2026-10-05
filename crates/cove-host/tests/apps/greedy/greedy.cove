@@ -1,0 +1,8 @@
+use web
+use log
+
+/// Logs every request, which needs `log`, which `app.toml` does not grant.
+export fn handle(request: web.Request) -> web.Response {
+  log.info("{request.method} {request.path}")
+  web.Response(status: 200, headers: Map.of(), body: "logged\n")
+}

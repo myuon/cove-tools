@@ -1,0 +1,25 @@
+use web
+
+/// A `GET` of `path` with the query `pairs` and no body.
+fn get(path: String, pairs: Map<String, String>) -> web.Request {
+  web.Request(method: "GET", path: path, query: pairs, headers: Map.of(), body: "")
+}
+
+test fn greetsWhoeverTheQueryNames() -> Result<Unit, Error> {
+  let answer = handle(get("/", Map.of(MapEntry(key: "name", value: "Cove"))))
+  assertEqual(answer.status, 200)?
+  assertEqual(answer.body, "Hello, Cove! (GET /)\n")?
+  Ok(())
+}
+
+test fn greetsTheWorldWhenNobodyIsNamed() -> Result<Unit, Error> {
+  let answer = handle(get("/about", Map.of()))
+  assertEqual(answer.body, "Hello, world! (GET /about)\n")?
+  Ok(())
+}
+
+test fn answersABodyOfTheSizeAsked() -> Result<Unit, Error> {
+  let answer = handle(get("/big", Map.of(MapEntry(key: "bytes", value: "5"))))
+  assertEqual(answer.body, "xxxxx")?
+  Ok(())
+}
