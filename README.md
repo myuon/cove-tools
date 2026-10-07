@@ -586,6 +586,51 @@ every call to it at the boundary:
 - hosts match by name as written; what a name resolves to is the system
   resolver's, so this is no defence against DNS rebinding.
 
+**An API key the app never sees.** An app cannot read a secret (`auth.check`
+only compares against one), so a key for an authenticated API is given to the
+host instead, which adds it as a header when the request is sent:
+
+```toml
+[secrets]
+openai = { env = "OPENAI_API_KEY" }
+gemini = { env = "GEMINI_API_KEY" }
+
+[fetch]
+allow = ["https://api.openai.com", "https://generativelanguage.googleapis.com"]
+
+[fetch.headers."https://api.openai.com"]
+authorization = { secret = "openai", prefix = "Bearer " }
+
+[fetch.headers."https://generativelanguage.googleapis.com"]
+x-goog-api-key = { secret = "gemini" }
+```
+
+- Each `[fetch.headers."<origin>"]` key is a header name; its value names a
+  `[secrets]` entry, with an optional literal `prefix` sent before it
+  (empty by default).
+- The app is refused at load, saying why and never quoting the value, if
+  the origin is not a bare origin (`scheme://host[:port]`: no path, no
+  `:*`), is not an entry of `[fetch] allow` (compared as parsed, so
+  `https://api.openai.com` and `https://api.openai.com:443` are the same), if
+  the secret is not in `[secrets]`, the header name is not one, or the prefix
+  and secret cannot be a header value.
+- The header is added to a request whose URL has **exactly that origin** —
+  scheme, host and effective port — and to no other. It is added after the
+  app's headers and **replaces** an app-supplied header of the same name
+  (names compare case-insensitively).
+- The value never reaches the app: not in a `fetch.Response`, an `Err`, a
+  log line, the stats or the admin app's view of the app. Redirects are not
+  followed, so a redirect cannot carry it to another origin.
+- The admin app's allowlist changes cannot point it at a new origin: the
+  origin is checked against `[fetch] allow` as `app.toml` writes it, and only
+  `app.toml` can bind a header. Removing the origin from the allowlist at run
+  time leaves the app loaded, and requests there are refused like any other
+  off the list.
+
+What the host does not do is defend the value against the app's own code:
+apps share one process (see [Security](#security)). This keeps the key out of
+the app's hands as a string, in its logs and in its answers.
+
 A fetch parks the run. It is a future on the I/O runtime (reqwest over
 hyper) raced against the run's deadline and against the client going away;
 whichever ends first drops the future, which closes the outbound
@@ -628,10 +673,16 @@ timeout = "10s"                 # one fetch, connect to last byte
 max_request_bytes = 1048576
 max_response_bytes = 4194304
 
+# A `[secrets]` value the host sends as a header to one origin of `allow`;
+# see `fetch` above. The prefix is optional.
+# [fetch.headers."https://api.openai.com"]
+# authorization = { secret = "openai", prefix = "Bearer " }
+
 [route]                         # see "Routing by hostname"
 hosts = []                      # e.g. ["admin.example"]: reached by these only
 
-[secrets]                       # what `auth.check` compares against; one of:
+[secrets]                       # what `auth.check` compares against, or
+                                # `[fetch.headers]` sends; one of:
 admin = { env = "APP_ADMIN_TOKEN" }   # an environment variable of the host
 # admin = { file = "admin.secret" }   # a file, relative to the app's directory
 # admin = { value = "..." }           # literal, for tests
@@ -952,6 +1003,10 @@ so, and what it asserts is counted.
 - `fetch` reaches an allowed local upstream with GET and with POST carrying
   a header and a body, exactly as the upstream records them; a target off
   the allowlist is refused with the upstream seeing no connection at all;
+- a `[fetch.headers]` secret reaches its origin, with its prefix, replacing
+  the app's header of the same name; another allowed origin gets the app's
+  header and not the secret; and the value is in none of the app's answers,
+  a failed fetch's `Err`, its logs, its admin view or the stats;
 - a fetch is abandoned — the upstream sees its connection closed — at the
   run's deadline, and when the client goes away;
 - a client going away cancels a spinning run that is running or yielded, one

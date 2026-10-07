@@ -22,6 +22,21 @@
 //! send the request somewhere else. Hosts are matched by name as written;
 //! what that name resolves to is the resolver's (no DNS-rebinding defence).
 //!
+//! # Secret headers
+//!
+//! `[fetch.headers."<origin>"]` binds a header to a `[secrets]` entry, with
+//! an optional literal prefix (`authorization = { secret = "openai", prefix
+//! = "Bearer " }`). The origin must be an entry of `[fetch] allow` as
+//! `app.toml` writes it, or the app is refused at load. The header is added
+//! here, after the app's own headers, to a request whose URL has exactly
+//! that origin — scheme, host and effective port — and replaces an
+//! app-supplied header of the same name. The app never holds the value: it
+//! is not in a `fetch.Response`, an `Err`, a log line or the host's stats.
+//! Since redirects are not followed, it cannot be carried to another origin
+//! by one; and an admin override of the allowlist cannot give it a new
+//! origin — taking the origin off the list refuses requests there, as for
+//! any origin off the list.
+//!
 //! # Waiting
 //!
 //! A fetch answers **pending**: the run parks, and the request runs on the
@@ -175,6 +190,13 @@ impl FetchHost {
                 }
             ));
         }
+        // The request URL's exact origin: scheme, host and effective port.
+        let injected: Vec<_> = self
+            .policy
+            .headers
+            .iter()
+            .filter(|injected| injected.applies_to(scheme, host, port))
+            .collect();
         if body.len() > self.policy.max_request_bytes {
             return Err(format!(
                 "a request body of {} bytes is above app `{}`'s fetch max_request_bytes of {}",
@@ -207,7 +229,16 @@ impl FetchHost {
                 request = request.header(name, value);
             }
         }
-        request.build().map_err(|e| e.to_string())
+        let mut request = request.build().map_err(|e| e.to_string())?;
+        // `[fetch.headers]`: added last, so a header of the same name the app
+        // supplied is replaced, not sent beside it. Nothing the app is
+        // answered with is built from these values.
+        for injected in injected {
+            request
+                .headers_mut()
+                .insert(injected.name.clone(), injected.value.clone());
+        }
+        Ok(request)
     }
 
     /// The fetch itself: runs on the I/O runtime.

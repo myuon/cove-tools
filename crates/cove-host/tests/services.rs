@@ -126,6 +126,8 @@ struct Upstream {
     /// Connections the other side closed while this one held its answer.
     abandoned: Arc<AtomicU64>,
     seen: Arc<Mutex<Vec<String>>>,
+    /// Each request's head, request line and headers, as it arrived.
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Upstream {
@@ -137,23 +139,26 @@ impl Upstream {
             requests: Arc::default(),
             abandoned: Arc::default(),
             seen: Arc::default(),
+            heads: Arc::default(),
         };
-        let (connections, requests, abandoned, seen) = (
+        let (connections, requests, abandoned, seen, heads) = (
             Arc::clone(&upstream.connections),
             Arc::clone(&upstream.requests),
             Arc::clone(&upstream.abandoned),
             Arc::clone(&upstream.seen),
+            Arc::clone(&upstream.heads),
         );
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 connections.fetch_add(1, Ordering::SeqCst);
-                let (requests, abandoned, seen) = (
+                let (requests, abandoned, seen, heads) = (
                     Arc::clone(&requests),
                     Arc::clone(&abandoned),
                     Arc::clone(&seen),
+                    Arc::clone(&heads),
                 );
-                thread::spawn(move || serve(stream, mode, &requests, &abandoned, &seen));
+                thread::spawn(move || serve(stream, mode, &requests, &abandoned, &seen, &heads));
             }
         });
         upstream
@@ -170,6 +175,7 @@ fn serve(
     requests: &AtomicU64,
     abandoned: &AtomicU64,
     seen: &Mutex<Vec<String>>,
+    heads: &Mutex<Vec<String>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut head = String::new();
@@ -199,6 +205,7 @@ fn serve(
         .find_map(|line| line.strip_prefix("x-test: "))
         .unwrap_or("-")
         .to_string();
+    heads.lock().unwrap().push(head.clone());
     seen.lock()
         .unwrap()
         .push(format!("{method} x-test={x_test} body={body}"));
@@ -293,6 +300,92 @@ fn a_target_off_the_allowlist_is_refused_without_a_connection() {
     assert_eq!(count(&host, "proxy", "fetch.refused"), 2);
     // Refused at once: the run never parked.
     assert_eq!(count(&host, "proxy", "parks"), 0);
+}
+
+/// The value of `name` in a request head, if it was sent.
+fn header_in<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+#[test]
+fn a_secret_header_reaches_its_origin_only_and_never_the_app() {
+    const KEY: &str = "sk-cove-host-test-0123456789";
+    let keyed = Upstream::start(Mode::Echo);
+    let other = Upstream::start(Mode::Echo);
+    // An origin with the header that nothing listens on: the fetch fails.
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let origin = |addr: SocketAddr| format!("http://127.0.0.1:{}", addr.port());
+    let config = format!(
+        "grant = [\"fetch\", \"log\"]\n\
+         [secrets]\nopenai = {{ value = \"{KEY}\" }}\n\
+         [fetch]\nallow = [\"{}\", \"{}\", \"{}\"]\n\
+         [fetch.headers.\"{}\"]\n\
+         authorization = {{ secret = \"openai\", prefix = \"Bearer \" }}\n\
+         x-goog-api-key = {{ secret = \"openai\" }}\n\
+         [fetch.headers.\"{}\"]\nx-goog-api-key = {{ secret = \"openai\" }}\n",
+        origin(keyed.addr),
+        origin(other.addr),
+        origin(closed),
+        origin(keyed.addr),
+        origin(closed),
+    );
+    let apps = apps(&[sample_with("proxy", &config)]);
+    let host = start(&apps, 1);
+    // The proxy forwards the client's `x-*` headers: the app supplies an
+    // `x-goog-api-key` of its own.
+    let through = |target: String| {
+        send_raw(
+            host.addr,
+            format!(
+                "GET /proxy/?url={target}/v1 HTTP/1.1\r\nHost: localhost\r\n\
+                 Connection: close\r\nx-goog-api-key: from-the-app\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+    };
+    let mut answered = Vec::new();
+
+    let keyed_answer = through(origin(keyed.addr));
+    assert_eq!(keyed_answer.status, 200, "{keyed_answer:?}");
+    let head = keyed.heads.lock().unwrap()[0].clone();
+    assert_eq!(
+        header_in(&head, "authorization"),
+        Some(format!("Bearer {KEY}").as_str()),
+        "{head}"
+    );
+    // Replaced, not sent beside the app's.
+    assert_eq!(header_in(&head, "x-goog-api-key"), Some(KEY), "{head}");
+    assert!(!head.contains("from-the-app"), "{head}");
+    answered.push(format!("{keyed_answer:?}"));
+
+    // Another allowed origin gets the app's header and none of the secret.
+    let other_answer = through(origin(other.addr));
+    assert_eq!(other_answer.status, 200, "{other_answer:?}");
+    let head = other.heads.lock().unwrap()[0].clone();
+    assert_eq!(header_in(&head, "authorization"), None, "{head}");
+    assert_eq!(header_in(&head, "x-goog-api-key"), Some("from-the-app"));
+    assert!(!head.contains(KEY), "{head}");
+    answered.push(format!("{other_answer:?}"));
+
+    // A fetch that fails with the header set: the `Err` does not carry it.
+    let failed = through(origin(closed));
+    assert_eq!(failed.status, 502, "{failed:?}");
+    assert!(failed.body.contains("could not connect"), "{}", failed.body);
+    answered.push(format!("{failed:?}"));
+
+    // Nothing the app was answered, logged or counted holds the value.
+    answered.push(get(host.addr, "/_host/apps/proxy/logs?n=50").body);
+    answered.push(get(host.addr, "/_host/apps/proxy").body);
+    answered.push(host.stats().to_string());
+    for text in &answered {
+        assert!(!text.contains(KEY), "{text}");
+    }
 }
 
 #[test]
