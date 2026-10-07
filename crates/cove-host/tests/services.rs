@@ -115,6 +115,8 @@ enum Mode {
     /// Reads the request and never answers; notes when the connection is
     /// closed on it.
     Hang,
+    /// Echo's answer, gzipped, with `content-encoding: gzip`.
+    Gzip,
 }
 
 /// A local HTTP server the tests fetch from, recording what reached it.
@@ -221,6 +223,20 @@ fn serve(
                 answer.len()
             );
         }
+        Mode::Gzip => {
+            let answer = format!("{method} x-test={x_test} body={body}");
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(answer.as_bytes()).unwrap();
+            let answer = encoder.finish().unwrap();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/x-echo\r\ncontent-encoding: gzip\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n",
+                answer.len()
+            );
+            let _ = stream.write_all(&answer);
+        }
         Mode::Hang => {
             // Nothing is ever sent; a read answers 0 once the fetch's
             // connection is closed.
@@ -269,6 +285,24 @@ fn fetch_reaches_an_allowed_upstream_with_get_and_post() {
     );
     assert_eq!(count(&host, "proxy", "parks"), 2);
     assert_eq!(count(&host, "proxy", "fetch.calls"), 2);
+}
+
+#[test]
+fn a_gzipped_answer_reaches_the_app_decoded() {
+    let upstream = Upstream::start(Mode::Gzip);
+    let config = proxy_config(&format!("http://127.0.0.1:{}", upstream.addr.port()), "");
+    let apps = apps(&[sample_with("proxy", &config)]);
+    let host = start(&apps, 1);
+    let target = format!("http://127.0.0.1:{}/x", upstream.addr.port());
+    let got = get(host.addr, &format!("/proxy/?url={target}"));
+    assert_eq!(got.status, 200, "{got:?}");
+    assert_eq!(got.body, "GET x-test=- body=");
+    let head = upstream.heads.lock().unwrap()[0].clone();
+    assert_eq!(
+        header_in(&head, "accept-encoding"),
+        Some("gzip, deflate, br"),
+        "{head}"
+    );
 }
 
 #[test]
