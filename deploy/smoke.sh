@@ -150,6 +150,20 @@ esac
 "$root/current/cove-host" rollback hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token" > /dev/null \
   || fail "cove-host rollback failed"
 [ "$(status http://127.0.0.1:8790/hello/)" = 200 ] || fail "hello is not served after the rollback"
+# A secret set on the running host: kept in the data directory, mode 0600,
+# listed by name and never by value, and deleted.
+admin_flags=(--admin 127.0.0.1:8791 --token-file "$root/data/admin.token")
+printf 'smoke-secret-value\n' | "$root/current/cove-host" secret set smoke "${admin_flags[@]}" > /dev/null \
+  || fail "cove-host secret set failed"
+[ "$(stat -c %a "$root/data/_host/secrets")" = 600 ] || fail "the secret store is not mode 0600"
+listed="$("$root/current/cove-host" secret list "${admin_flags[@]}")" || fail "cove-host secret list failed"
+case "$listed" in
+  *smoke-secret-value*) fail "cove-host secret list printed a value" ;;
+  *'"name": "smoke"'*) ;;
+  *) fail "cove-host secret list does not list the secret: $listed" ;;
+esac
+"$root/current/cove-host" secret delete smoke "${admin_flags[@]}" > /dev/null \
+  || fail "cove-host secret delete failed"
 stop_host
 
 # 2. Access off (no team): the apps' tokens are the way in, as before.

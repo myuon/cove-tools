@@ -11,6 +11,16 @@
 //! assertion — with the app's grant (not the test's derived one), the app's
 //! limits, and the host's modules answered through their blocking path, since
 //! a test runs to its end on one thread.
+//!
+//! **Secrets.** Neither runs with a host, so a `{ store = "…" }` secret is
+//! looked up in the store of the data directory `--data` names
+//! (`<data>/_host/secrets`, read only), and without `--data` there is no
+//! store. `check` refuses an app whose secret cannot be resolved, as `serve`
+//! would. `test` does not: a secret only gates `auth.check` and a
+//! `[fetch.headers]` header, which a test has no business reaching for real,
+//! so a secret it cannot resolve — store, environment or file — is given a
+//! placeholder value (`cove-host-test-placeholder-<name>`, see
+//! [`crate::config::placeholder`]) and the run says which, on stderr.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +31,9 @@ use cove_sema::resolve::DeclaredTest;
 use cove_sema::HostSchemas;
 
 use crate::apps::{self, App, AppState, Compiled};
+use crate::config::SecretSource;
 use crate::hosts::HostModules;
+use crate::secrets::SecretStore;
 
 /// What a command printed, and whether it succeeded.
 #[derive(Debug, Default)]
@@ -38,12 +50,32 @@ pub struct Report {
 /// what its entry requires, what `app.toml` grants, and whether the host
 /// would load it. Fails if any app would be refused.
 pub fn check(root: &Path, only: &[String], modules: &HostModules) -> Result<Report, String> {
+    check_with(root, only, modules, None)
+}
+
+/// The secret store of the data directory `data`, if one is named.
+fn store_of(data: Option<&Path>) -> Result<Option<Arc<SecretStore>>, String> {
+    data.map(|data| SecretStore::open_data(data).map(Arc::new))
+        .transpose()
+}
+
+/// [`check`], with `store` secrets looked up in `data`'s store.
+pub fn check_with(
+    root: &Path,
+    only: &[String],
+    modules: &HostModules,
+    data: Option<&Path>,
+) -> Result<Report, String> {
+    let source = SecretSource {
+        store: store_of(data)?,
+        placeholders: false,
+    };
     let mut report = Report::default();
     let mut refused = 0;
     let mut warnings = 0;
     let dirs = apps::app_dirs(root, only)?;
     for (name, dir) in &dirs {
-        let (mut app, config) = apps::describe(name, dir);
+        let (mut app, config) = apps::describe(name, dir, &source);
         if config.is_some() {
             app.state = match apps::compile(dir, name, modules) {
                 Ok(compiled) => {
@@ -127,6 +159,21 @@ pub fn test(
     filter: Option<&str>,
     modules: &HostModules,
 ) -> Result<Report, String> {
+    test_with(root, only, filter, modules, None)
+}
+
+/// [`test()`], with `store` secrets looked up in `data`'s store first.
+pub fn test_with(
+    root: &Path,
+    only: &[String],
+    filter: Option<&str>,
+    modules: &HostModules,
+    data: Option<&Path>,
+) -> Result<Report, String> {
+    let source = SecretSource {
+        store: store_of(data)?,
+        placeholders: true,
+    };
     let mut report = Report::default();
     let (mut ran, mut failed, mut uncompiled) = (0, 0, 0);
     // What `fetch` waits on: the tests answer every host call blocking, and
@@ -137,7 +184,21 @@ pub fn test(
         .build()
         .map_err(|e| format!("cannot start the I/O runtime: {e}"))?;
     for (name, dir) in apps::app_dirs(root, only)? {
-        let (app, config) = apps::describe(&name, &dir);
+        let (app, config) = apps::describe(&name, &dir, &source);
+        if let Some(config) = &config {
+            if !config.placeholders.is_empty() {
+                report.err.push_str(&format!(
+                    "note: `{name}` runs its tests with a placeholder for secret(s) {}: not set \
+                     here (see `cove-host test --help`)\n",
+                    config
+                        .placeholders
+                        .iter()
+                        .map(|secret| format!("`{secret}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
         if config.is_none() {
             uncompiled += 1;
             if let AppState::Refused(why) = &app.state {

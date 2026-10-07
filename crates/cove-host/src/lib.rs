@@ -39,6 +39,7 @@ pub mod overrides;
 pub mod proxy;
 pub mod router;
 pub mod sched;
+pub mod secrets;
 pub mod server;
 pub mod stats;
 pub mod sys;

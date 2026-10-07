@@ -22,9 +22,9 @@
 #      secret, any other `KEY=value` as written there — and changes nothing
 #      else in it;
 #   4. checks every app installed in <root>/apps with the release's binary,
-#      against that env — with the bundled apps named by
-#      --with-bundled-apps in place of their installed versions — and stops,
-#      switching nothing, if any would be refused;
+#      against that env and the secret store in <root>/data — with the
+#      bundled apps named by --with-bundled-apps in place of their installed
+#      versions — and stops, switching nothing, if any would be refused;
 #   5. deploys the bundled apps --with-bundled-apps names, from the release,
 #      with `cove-host deploy --into <root>/apps` (each checked again; the
 #      version it replaces is kept in <root>/apps/.previous/<app>); none by
@@ -167,12 +167,12 @@ for app in $BUNDLED; do
   [ -f "$release/apps/$app/app.toml" ] || die "the release has no app \`$app\`"
   cp -R "$release/apps/$app" "$check/$app"
 done
-with_env "$release/cove-host" check --apps "$check" \
-  || die "an app does not check against this release and $ROOT/env (see above; a new secret?); nothing switched"
+with_env "$release/cove-host" check --apps "$check" --data "$ROOT/data" \
+  || die "an app does not check against this release, $ROOT/env and the secret store (see above; a new secret?); nothing switched"
 
 # 5. The bundled apps asked for, deployed as any app is.
 for app in $BUNDLED; do
-  with_env "$release/cove-host" deploy "$release/apps/$app" --name "$app" --into "$ROOT/apps" >/dev/null \
+  with_env "$release/cove-host" deploy "$release/apps/$app" --name "$app" --into "$ROOT/apps" --data "$ROOT/data" >/dev/null \
     || die "deploying the bundled app \`$app\` failed (see above); nothing switched"
 done
 

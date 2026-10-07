@@ -422,18 +422,20 @@ impl Places {
 /// `cove-host deploy --into <apps>`: stages `files` as the app `name`,
 /// checks it as `cove-host check` does (with this process's env), and only
 /// if it passes switches it in, keeping the version it replaces. What the
-/// check printed is the report; a refusal changes no file.
+/// check printed is the report; a refusal changes no file. `store` secrets
+/// are looked up in `data`'s secret store, as `cove-host check --data` does.
 pub fn deploy_into(
     apps: &Path,
     name: &str,
     files: &AppFiles,
     modules: &crate::hosts::HostModules,
+    data: Option<&Path>,
 ) -> Result<crate::toolchain::Report, String> {
     crate::apps::valid_name(name)?;
     let places = Places::new(apps, name);
-    let checked = places
-        .stage(files)
-        .and_then(|()| crate::toolchain::check(&apps.join(STAGING), &[name.to_string()], modules));
+    let checked = places.stage(files).and_then(|()| {
+        crate::toolchain::check_with(&apps.join(STAGING), &[name.to_string()], modules, data)
+    });
     let mut report = match checked {
         Ok(report) => report,
         Err(why) => {
