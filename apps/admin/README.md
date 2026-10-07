@@ -23,6 +23,12 @@ in the main README, [Administering apps at run time](../../README.md#administeri
 | `POST /apps/<app>/configure` | the grant (`cap.<name>` checkboxes), the allowlist (`allow`, one per line) and every limit (`fuel`, `maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) |
 | `POST /apps/<app>/reset` | drops the changes made here, back to `app.toml` |
 | `GET /history` | every change, made here or by `cove-host` on the machine, refused ones included |
+| `GET /secrets` | the host's secret store: each secret stored or used by an app — set or unset, when it was set, which apps use it — **never a value** |
+| `POST /secrets/set` | `name` and `value` (a password field, never filled back in): stores it and reloads the apps that use it; the page says what each reload came to |
+| `POST /secrets/delete` | `name`, `confirm` (a required checkbox: there is no script for a dialog), and `force` for a secret an app uses, which leaves those apps refused |
+
+The secret store and what a change to it does are in the main README,
+[Secrets set at run time](../../README.md#secrets-set-at-run-time).
 
 A change that went through redirects back to the app's page (`?done=`); one
 that did not answers 422 with the reasons — the form's own (a field that is

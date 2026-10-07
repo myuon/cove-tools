@@ -237,6 +237,23 @@ ran 5 test(s), 5 passed
 Both take app names to narrow them (`cove-host check hello`), and `test`
 takes `--filter`.
 
+**Secrets.** Neither runs with a host, so a secret taken from the host's
+store (`{ store = "…" }`, [Secrets set at run time](#secrets-set-at-run-time))
+is looked up in the store of the data directory `--data` names
+(`<data>/_host/secrets`, read only); without `--data` there is no store.
+`check` refuses an app whose secret cannot be resolved, as `serve` would.
+`test` does not: a secret only gates `auth.check` and a `[fetch.headers]`
+header, which a test should not reach for real, so a secret it cannot
+resolve — store, environment variable or file — is given the value
+`cove-host-test-placeholder-<name>`, and the run says which on stderr:
+
+```console
+$ ./target/checked/cove-host test --apps crates/cove-host/tests/apps keyed
+note: `keyed` runs its tests with a placeholder for secret(s) `key`: not set here (see `cove-host test --help`)
+ok    keyed      keyed.aWrongTokenIsNotTheSecret
+ran 1 test(s), 1 passed
+```
+
 ## Updating an app
 
 ```console
@@ -307,7 +324,9 @@ nothing. The endpoints are `POST /apps/<app>/update`,
 `POST /apps/<app>/deploy` and `/rollback` (see [Deploying an
 app](#deploying-an-app)), `DELETE /apps/<app>`,
 `POST /apps/<app>/enable`, `/disable` and `/reset` (see [Administering apps
-at run time](#administering-apps-at-run-time)), `GET /apps` (the stats) and
+at run time](#administering-apps-at-run-time)), `GET /secrets`,
+`PUT /secrets/<name>` and `DELETE /secrets/<name>` (see [Secrets set at run
+time](#secrets-set-at-run-time)), `GET /apps` (the stats) and
 `GET /changes?n=50` (the change history). There is no file watcher: an update is an
 explicit act, which is what makes a refused one a report rather than a
 silent non-event.
@@ -362,10 +381,12 @@ exit 1
   changes to its grant, and the hostnames other apps claim — exactly as an
   update loads it. **If it does not load, nothing changes**: no file is
   written, the current version keeps serving, and the diagnostics are
-  printed (exit 1). An app that needs a secret the host's env does not have
-  is refused here, saying which; add it to `~/cove-tools/env` and restart
-  the service first. A `[secrets]` value `{ file = ... }` is not sent: keep
-  secrets in the env.
+  printed (exit 1). An app that needs a secret the host does not have is
+  refused here, saying which: set it first — in the admin app's Secrets
+  page or with `cove-host secret set` for a `{ store = ... }` secret
+  ([Secrets set at run time](#secrets-set-at-run-time)), or in
+  `~/cove-tools/env` and a restart for an `{ env = ... }` one. A `[secrets]`
+  value `{ file = ... }` is not sent: keep secrets in the store or the env.
 - **If it loads**, it is written to `<apps>/.deploy/<app>`, the current
   `<apps>/<app>` is moved to `<apps>/.previous/<app>` (replacing the one kept
   there), the new copy is renamed into place, and the host updates to it:
@@ -395,9 +416,10 @@ files are hidden and skipped) and needs `--name`. With a tunnel
 works from the laptop too.
 
 `cove-host deploy <dir> --into <apps>` does the same with no running host,
-checking as `cove-host check` does with the current environment; the host
-loads it at its next start. `deploy/install.sh` installs the bundled apps
-this way.
+checking as `cove-host check` does with the current environment (and, with
+`--data <data>`, that data directory's secret store); the host loads it at
+its next start. `deploy/install.sh` installs the bundled apps this way, and
+checks every installed app with `--data` before it switches.
 
 ## Administering apps at run time
 
@@ -423,8 +445,11 @@ refuses a package module that shadows a host module):
 | `host.setEnabled(app, enabled, who)` | `Result<String, Error>` |
 | `host.configure(app, settings, who)` | `Result<String, Error>`: `settings` is `host.Settings { grant, fetchAllow, limits }`, the whole of what they are to be |
 | `host.reset(app, who)` | `Result<String, Error>`: back to `app.toml` |
+| `host.secrets()` | `Array<host.Secret>`: every secret stored or used — `name`, `set`, `updatedMs` (0 when unset), `apps` that use it — never a value |
+| `host.setSecret(name, value, who)` | `Result<String, Error>`: stores it and reloads the apps that use it; the message is what each reload came to |
+| `host.deleteSecret(name, force, who)` | `Result<String, Error>`: refused while an app uses it unless `force` |
 
-The three that change something park the run while the host works (an app
+The five that change something park the run while the host works (an app
 is reloaded on a blocking thread, as an update is), so they hold no worker.
 
 **A change is a re-check, not a revocation.** Cove decides capabilities
@@ -478,6 +503,77 @@ touches:
 - `<data>/_host/changes.jsonl`: the history — who (what the admin app says
   of its user, or `admin listener`), when, which app, what was asked and
   what came of it, refused attempts included — one JSON line each, appended.
+- `<data>/_host/secrets`: the secret store, below.
+
+### Secrets set at run time
+
+An API key used to mean ssh, an edit of `~/cove-tools/env` and a restart.
+A secret can instead live in the host's **secret store** and be set,
+replaced and deleted on the running host — from the admin app's Secrets
+page, the admin listener, or `cove-host secret`. An `app.toml` takes a
+secret from it with `store`, beside `env`, `file` and `value`:
+
+```toml
+[secrets]
+gemini = { store = "gemini" }
+
+[fetch]
+allow = ["https://generativelanguage.googleapis.com"]
+
+[fetch.headers."https://generativelanguage.googleapis.com"]
+x-goog-api-key = { secret = "gemini" }
+```
+
+- **Where it is kept**: `<data>/_host/secrets`, one JSON file (`{ "secrets":
+  { "<name>": { "value", "updated_ms" } } }`), mode 0600, written whole
+  through a temporary file that is synced and renamed (and the directory
+  synced), so a crash leaves the old file or the new one. The data directory
+  is the one thing the service may write besides the apps
+  (`ReadWritePaths`), and no release or deploy touches it. A file that does
+  not read stops the host from starting, saying so without quoting it.
+- **A secret that is not set refuses the app** that takes it, at load, with
+  the usual diagnostic naming it — `secret `gemini`: the host's secret
+  store has no `gemini` (set it on the admin app's Secrets page, or with
+  `cove-host secret set gemini`)` — which is the reason the admin app shows
+  for the app, and the Secrets page lists the name as unset and used by it.
+  A name is a letter or digit, then letters, digits, `_`, `-` or `.`, at
+  most 64; a value is not empty and at most 16 KiB.
+- **Setting or replacing one reloads every app that uses it** — those
+  routed to whose `app.toml` names it in a `store` — through the same
+  versioned update as `cove-host update`: requests in flight finish on the
+  old value, the new version has the new one. The answer says what each
+  reload came to. **The value is stored first and kept whatever the reloads
+  do**: an app that does not load (its code broken on disk, say) keeps
+  serving what it served, and picks the value up at its next load.
+- **Deleting one an app uses is refused** (409) unless forced; forced, the
+  apps that use it are reloaded without it and are refused (503), so the
+  value is no longer used anywhere.
+- **Write-only.** No endpoint, page or command returns a value: the listings
+  are names, whether each is set, when, and which apps use it. Nothing
+  logs one, and the stats, the diagnostics and the change history (which
+  records who, the secret's name and the action — app `–`) do not hold
+  one. The admin app handles the value once, in the request that sets it,
+  in a password field that is never filled back in.
+
+| through | list | set or replace | delete |
+| --- | --- | --- | --- |
+| the admin app (`/secrets`) | the table | the row's password field, or *Set a secret* | the row's *Delete*, with *confirm* ticked (and *force* for one in use) |
+| the admin listener | `GET /secrets` | `PUT /secrets/<name>`, the value as the body | `DELETE /secrets/<name>[?force=1]` |
+| `cove-host secret` | `list` | `set <name>`, the value on stdin | `delete <name> [--force]` |
+
+The admin app's forms are POSTs under its usual protections: an identity
+(`auth.identity`: Cloudflare Access, or its token where Access is off), and
+a POST from another site refused (`Sec-Fetch-Site`, `Origin`). There is no
+script on its pages, so the confirmation is a required checkbox, checked
+again by the app. `cove-host secret` takes `deploy`'s `--admin` and
+`--token-file`; `set` reads one line without echo from a terminal, or all of
+stdin otherwise, dropping one trailing newline:
+
+```console
+$ ssh whisky '~/cove-tools/current/cove-host secret list --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+$ ssh -t whisky '~/cove-tools/current/cove-host secret set gemini --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+value for secret `gemini` (not echoed):
+```
 
 ### Routing by hostname
 
@@ -788,6 +884,7 @@ hosts = []                      # e.g. ["admin.example"]: reached by these only
 [secrets]                       # what `auth.check` compares against, or
                                 # `[fetch.headers]` sends; one of:
 admin = { env = "APP_ADMIN_TOKEN" }   # an environment variable of the host
+# admin = { store = "admin" }         # the host's secret store, set at run time
 # admin = { file = "admin.secret" }   # a file, relative to the app's directory
 # admin = { value = "..." }           # literal, for tests
 
@@ -799,8 +896,9 @@ token = "admin"                 # a `[secrets]` name: the token way in
 fallback = "none"               # or "token": the token as well with Access on
 ```
 
-A secret that cannot be resolved (the variable unset, the file missing)
-refuses the app, saying which; its value is never printed. An `[access]`
+A secret that cannot be resolved (the variable unset, the file missing, the
+store without it) refuses the app, saying which; its value is never printed.
+`store` is for secrets only: an `[access]` setting cannot come from it. An `[access]`
 value is a setting, not a secret: an unset (or empty) `team` or `aud` turns
 Access off for the app, which the host logs when it loads it.
 
@@ -1081,7 +1179,7 @@ $ cargo t     # = cargo test --workspace --profile checked
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
 integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and
-`updates.rs`, `admin.rs`, `access.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
+`updates.rs`, `admin.rs`, `access.rs`, `secrets.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
 so, and what it asserts is counted.
@@ -1146,6 +1244,21 @@ so, and what it asserts is counted.
   changes survive a restart and a release that replaces `apps/`; the history
   records who, when and what; an app with a hostname is reached by it alone,
   as that hostname's origin, and a hostname reaches one app;
+- the secret store (`secrets.rs`, and `secrets.rs`'s and `config.rs`'s unit
+  tests): the file survives reopening, is mode 0600, leaves no temporary
+  file, and a write that fails leaves the old file and value; names and
+  values are held to their rules and a broken file is refused, none of it
+  quoting a value; an app whose stored secret is missing is refused naming
+  it; setting it reloads the app, and `auth.check` and a `[fetch.headers]`
+  header sent to a test upstream use the new value, replacing it the old
+  value no longer works, and a restart finds it; a reload that fails keeps
+  the value stored and the serving version; deleting a secret an app uses is
+  409 unless forced, and forced refuses the app; the admin app sets,
+  replaces and deletes from its page (a cross-site POST refused, a delete
+  needing *confirm*, and *force* when used); `cove-host secret set|list|delete`;
+  `check --data` and `test` without the secret (on a placeholder, said); and
+  the value is in none of the listener's answers, the admin pages, the stats,
+  the operations views, the logs, the change history or `overrides.json`;
 - the operations page escapes markup an app logs, and shows errors and KV
   usage against the quota; an app's log reaches `<data>/<app>/log.txt`;
 - Cloudflare Access (`access.rs`, against a JWKS the test serves with RSA

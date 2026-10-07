@@ -43,10 +43,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use cove_runtime::Limits;
 use serde::{Deserialize, Serialize};
+
+use crate::secrets::SecretStore;
 
 /// The capability of the `admin` host module: listing the apps and changing
 /// their configuration.
@@ -133,6 +136,39 @@ pub struct SecretFile {
     pub file: Option<String>,
     /// The value itself, for tests and demos; prefer `env` or `file`.
     pub value: Option<String>,
+    /// A name in the host's secret store ([`crate::secrets`]), set by the
+    /// admin at run time. Secrets only: an `[access]` setting cannot come
+    /// from the store.
+    pub store: Option<String>,
+}
+
+/// Where `{ store = "…" }` secrets are looked up, and what a secret that
+/// cannot be resolved becomes.
+#[derive(Clone, Debug, Default)]
+pub struct SecretSource {
+    /// The host's store; without one, a `store` secret is unset.
+    pub store: Option<Arc<SecretStore>>,
+    /// `cove-host test`: a secret that cannot be resolved — its variable
+    /// unset, its file missing, its store entry not set — is given
+    /// [`placeholder`] as its value instead of refusing the app, and
+    /// [`AppConfig::placeholders`] names it. Off everywhere a request is
+    /// served.
+    pub placeholders: bool,
+}
+
+impl SecretSource {
+    /// Looking `store` secrets up in `store`.
+    pub fn store(store: Arc<SecretStore>) -> SecretSource {
+        SecretSource {
+            store: Some(store),
+            placeholders: false,
+        }
+    }
+}
+
+/// The value `cove-host test` gives a secret it cannot resolve.
+pub fn placeholder(name: &str) -> String {
+    format!("cove-host-test-placeholder-{name}")
 }
 
 /// An app's secrets, by name, resolved. `Debug` prints the names only.
@@ -145,40 +181,65 @@ impl std::fmt::Debug for Secrets {
     }
 }
 
-/// Resolves every secret, or says which could not be.
+/// Resolves every secret, or says which could not be; with
+/// [`SecretSource::placeholders`], also the names given a placeholder.
 fn resolve_secrets(
     entries: BTreeMap<String, SecretFile>,
     dir: Option<&Path>,
-) -> Result<Secrets, String> {
+    source: &SecretSource,
+) -> Result<(Secrets, Vec<String>), String> {
     let mut secrets = BTreeMap::new();
+    let mut placeholders = Vec::new();
     for (name, entry) in entries {
-        let value = match (entry.env, entry.file, entry.value) {
-            (Some(var), None, None) => std::env::var(&var).map_err(|_| {
+        let resolved = match (entry.env, entry.file, entry.value, entry.store) {
+            (Some(var), None, None, None) => std::env::var(&var).map_err(|_| {
                 format!("secret `{name}`: the environment variable `{var}` is not set")
-            })?,
-            (None, Some(file), None) => {
+            }),
+            (None, Some(file), None, None) => {
                 let path = match dir {
                     Some(dir) if !Path::new(&file).is_absolute() => dir.join(&file),
                     _ => std::path::PathBuf::from(&file),
                 };
                 std::fs::read_to_string(&path)
-                    .map_err(|e| format!("secret `{name}`: cannot read `{}`: {e}", path.display()))?
-                    .trim_end()
-                    .to_string()
+                    .map(|text| text.trim_end().to_string())
+                    .map_err(|e| format!("secret `{name}`: cannot read `{}`: {e}", path.display()))
             }
-            (None, None, Some(value)) => value,
+            (None, None, Some(value), None) => Ok(value),
+            (None, None, None, Some(stored)) => {
+                crate::secrets::valid_name(&stored)
+                    .map_err(|why| format!("secret `{name}`: `store`: {why}"))?;
+                match &source.store {
+                    Some(store) => store.get(&stored).ok_or_else(|| {
+                        format!(
+                            "secret `{name}`: the host's secret store has no `{stored}` (set it \
+                             on the admin app's Secrets page, or with `cove-host secret set \
+                             {stored}`)"
+                        )
+                    }),
+                    None => Err(format!(
+                        "secret `{name}`: `{{ store = \"{stored}\" }}` needs the host's secret \
+                         store, and there is none here (pass `--data`)"
+                    )),
+                }
+            }
             _ => {
                 return Err(format!(
-                    "secret `{name}` must have exactly one of `env`, `file` or `value`"
+                    "secret `{name}` must have exactly one of `env`, `file`, `value` or `store`"
                 ))
             }
         };
-        if value.is_empty() {
-            return Err(format!("secret `{name}` is empty"));
-        }
+        let value = match resolved {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) if !source.placeholders => return Err(format!("secret `{name}` is empty")),
+            Err(why) if !source.placeholders => return Err(why),
+            _ => {
+                placeholders.push(name.clone());
+                placeholder(&name)
+            }
+        };
         secrets.insert(name, value);
     }
-    Ok(Secrets(secrets))
+    Ok((Secrets(secrets), placeholders))
 }
 
 /// A non-secret setting from the same three places as a secret: `None` when
@@ -191,6 +252,11 @@ fn resolve_setting(
     let Some(entry) = entry else {
         return Ok(None);
     };
+    if entry.store.is_some() {
+        return Err(format!(
+            "`{key}` is a setting, not a secret: it cannot come from the secret store"
+        ));
+    }
     let value = match (entry.env, entry.file, entry.value) {
         (Some(var), None, None) => std::env::var(&var).unwrap_or_default(),
         (None, Some(file), None) => {
@@ -767,6 +833,9 @@ pub struct AppConfig {
     pub kv: KvLimits,
     pub fetch: FetchPolicy,
     pub secrets: Secrets,
+    /// The secrets given a placeholder value because they could not be
+    /// resolved ([`SecretSource::placeholders`]; `cove-host test` only).
+    pub placeholders: Vec<String>,
     /// `[route] hosts`, lower-cased.
     pub hosts: Vec<String>,
     /// `[fetch] allow` as written, after any override: the entries the
@@ -778,19 +847,21 @@ pub struct AppConfig {
 
 /// Reads `dir/app.toml` for the app `name`.
 pub fn read_app(dir: &Path, name: &str) -> Result<AppConfig, String> {
-    read_app_with(dir, name, None)
+    read_app_with(dir, name, None, &SecretSource::default())
 }
 
-/// [`read_app`], with `over` applied to the file before it is validated.
+/// [`read_app`], with `over` applied to the file before it is validated and
+/// `store` secrets looked up in `source`.
 pub fn read_app_with(
     dir: &Path,
     name: &str,
     over: Option<&AppOverride>,
+    source: &SecretSource,
 ) -> Result<AppConfig, String> {
     let path = dir.join("app.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
-    parse_app_with(&text, name, Some(dir), over).map_err(|e| match over {
+    parse_app_with(&text, name, Some(dir), over, source).map_err(|e| match over {
         Some(over) if over.changes_config() => {
             format!("`{}` with the admin's changes: {e}", path.display())
         }
@@ -805,16 +876,17 @@ pub fn parse_app(text: &str, name: &str) -> Result<AppConfig, String> {
 
 /// [`parse_app`], with `file` secrets read relative to `dir`.
 pub fn parse_app_in(text: &str, name: &str, dir: Option<&Path>) -> Result<AppConfig, String> {
-    parse_app_with(text, name, dir, None)
+    parse_app_with(text, name, dir, None, &SecretSource::default())
 }
 
 /// [`parse_app_in`], with `over` applied to the file before anything is
-/// validated.
+/// validated, and `store` secrets looked up in `source`.
 pub fn parse_app_with(
     text: &str,
     name: &str,
     dir: Option<&Path>,
     over: Option<&AppOverride>,
+    source: &SecretSource,
 ) -> Result<AppConfig, String> {
     let file: AppFile = toml::from_str(text).map_err(|e| e.message().to_string())?;
     // `[fetch.headers]` is held to the allowlist as the file writes it, not
@@ -915,7 +987,7 @@ pub fn parse_app_with(
         max_keys: file.kv.max_keys.unwrap_or(kv_defaults.max_keys),
         max_bytes: file.kv.max_bytes.unwrap_or(kv_defaults.max_bytes),
     };
-    let secrets = resolve_secrets(file.secrets, dir)?;
+    let (secrets, placeholders) = resolve_secrets(file.secrets, dir, source)?;
     let fetch_defaults = FetchPolicy::default();
     let fetch = FetchPolicy {
         allow: file
@@ -946,10 +1018,27 @@ pub fn parse_app_with(
         kv,
         fetch,
         secrets,
+        placeholders,
         hosts,
         file_allow: file.fetch.allow,
         access,
     })
+}
+
+/// The store names `dir/app.toml`'s `[secrets]` take a value from: whether
+/// setting or deleting a stored secret concerns the app. Empty for a file
+/// that does not read — an app refused for that is not using the store.
+pub fn store_references(dir: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(dir.join("app.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<AppFile>(&text).ok())
+        .map(|file| {
+            file.secrets
+                .into_values()
+                .filter_map(|entry| entry.store)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `"300ms"` or `"5s"`.
@@ -1046,6 +1135,66 @@ mod tests {
         );
         assert!(missing.unwrap_err().contains("is not set"));
         assert!(parse_app("[secrets]\nd = { value = \"v\", env = \"E\" }\n", "x").is_err());
+    }
+
+    #[test]
+    fn a_store_secret_comes_from_the_store_or_refuses_the_app_by_name() {
+        let toml = "[secrets]\ngemini = { store = \"gemini-key\" }\n";
+        // No store at all, and a store without it: refused, naming both.
+        let error = parse_app(toml, "x").unwrap_err();
+        assert!(
+            error.contains("secret `gemini`") && error.contains("`--data`"),
+            "{error}"
+        );
+        let store = Arc::new(SecretStore::in_memory());
+        let source = SecretSource::store(Arc::clone(&store));
+        let error = parse_app_with(toml, "x", None, None, &source).unwrap_err();
+        assert!(error.contains("has no `gemini-key`"), "{error}");
+        store.set("gemini-key", "sk-from-the-store").unwrap();
+        let config = parse_app_with(toml, "x", None, None, &source).unwrap();
+        assert_eq!(config.secrets.0["gemini"], "sk-from-the-store");
+        assert!(config.placeholders.is_empty());
+        // One source only, a name the store could hold, and secrets only.
+        assert!(parse_app("[secrets]\ng = { store = \"a\", env = \"E\" }\n", "x").is_err());
+        assert!(parse_app("[secrets]\ng = { store = \"a b\" }\n", "x")
+            .unwrap_err()
+            .contains("not a secret name"));
+        assert!(parse_app("[access]\nteam = { store = \"t\" }\n", "x")
+            .unwrap_err()
+            .contains("cannot come from the secret store"));
+        // What `store_references` reads.
+        let dir = std::env::temp_dir().join(format!("cove-host-store-refs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("app.toml"),
+            format!("{toml}other = {{ env = \"E\" }}\nthird = {{ store = \"b\" }}\n"),
+        )
+        .unwrap();
+        let names: Vec<String> = store_references(&dir).into_iter().collect();
+        assert_eq!(names, ["b", "gemini-key"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn placeholders_stand_in_for_what_cannot_be_resolved() {
+        let source = SecretSource {
+            store: None,
+            placeholders: true,
+        };
+        let config = parse_app_with(
+            "[secrets]\na = { store = \"x\" }\nb = { env = \"COVE_HOST_NOT_SET_ANYWHERE\" }\n\
+             c = { value = \"kept\" }\n",
+            "x",
+            None,
+            None,
+            &source,
+        )
+        .unwrap();
+        assert_eq!(config.placeholders, ["a", "b"]);
+        assert_eq!(config.secrets.0["a"], placeholder("a"));
+        assert_eq!(config.secrets.0["c"], "kept");
+        // A malformed entry is still refused.
+        assert!(parse_app_with("[secrets]\na = {}\n", "x", None, None, &source).is_err());
     }
 
     const OPENAI: &str = "[secrets]\nopenai = { value = \"sk-not-a-real-key\" }\n\
@@ -1154,7 +1303,8 @@ mod tests {
             fetch_allow_add: vec!["https://api.example.com".to_string()],
             ..AppOverride::none()
         };
-        let config = parse_app_with(&text, "x", None, Some(&removed)).unwrap();
+        let config =
+            parse_app_with(&text, "x", None, Some(&removed), &SecretSource::default()).unwrap();
         assert!(!config.fetch.admits("https", "api.openai.com", 443));
         assert!(config.fetch.admits("https", "api.example.com", 443));
         assert!(config.fetch.headers.iter().all(|header| !header.applies_to(
@@ -1175,6 +1325,7 @@ mod tests {
             "x",
             None,
             Some(&added),
+            &SecretSource::default(),
         )
         .unwrap_err();
         assert!(
@@ -1226,6 +1377,7 @@ mod tests {
             "notes",
             None,
             Some(&over),
+            &SecretSource::default(),
         )
         .unwrap();
         let granted: Vec<&str> = later.granted.iter().map(String::as_str).collect();

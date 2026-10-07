@@ -12,6 +12,7 @@
 //! | --- | --- |
 //! | `<data>/_host/overrides.json` | per app, an [`AppOverride`]: `enabled`, capabilities added and removed, allowlist entries added and removed, limits set — each relative to `app.toml` |
 //! | `<data>/_host/changes.jsonl` | the change history: one JSON object per line, `unix_ms`, `who`, `app`, `action`, `detail`, `outcome`; appended, never rewritten |
+//! | `<data>/_host/secrets` | the secret store ([`crate::secrets`]), mode 0600 |
 //!
 //! `_host` cannot be an app's directory (an app's name starts with a
 //! letter). An override is applied every time the app is loaded — at start,
@@ -33,6 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppOverride;
+use crate::secrets::SecretStore;
 use crate::server::Front;
 
 /// How many changes are kept in memory for the admin app's history page.
@@ -44,6 +46,8 @@ const HISTORY_IN_MEMORY: usize = 1000;
 pub struct Control {
     pub overrides: Overrides,
     pub history: History,
+    /// The secrets the admin sets ([`crate::secrets`]): `<data>/_host/secrets`.
+    pub secrets: Arc<SecretStore>,
     front: OnceLock<Weak<Front>>,
 }
 
@@ -57,6 +61,7 @@ impl Control {
         Ok(Control {
             overrides: Overrides::open(dir.as_deref())?,
             history: History::open(dir.as_deref())?,
+            secrets: Arc::new(SecretStore::open(dir.as_deref())?),
             front: OnceLock::new(),
         })
     }
@@ -167,8 +172,10 @@ pub struct Change {
     /// email, when it has one), or `admin listener` for `cove-host
     /// update`/`remove`/`enable`/`disable`/`reset`.
     pub who: String,
+    /// The app; empty for a change to the secret store.
     pub app: String,
-    /// `enable`, `disable`, `configure`, `reset`, `update`, `remove`.
+    /// `enable`, `disable`, `configure`, `reset`, `update`, `remove`,
+    /// `deploy`, `rollback`, `secret set`, `secret delete`.
     pub action: String,
     /// What was asked for.
     pub detail: String,

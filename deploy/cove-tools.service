@@ -24,6 +24,8 @@ User=ioijoi
 Group=ioijoi
 WorkingDirectory=/home/ioijoi/cove-tools
 # The apps' secrets: WEBHOOKS_ADMIN_TOKEN, LEDGER_TOKEN (deploy/env.example).
+# Secrets set at run time (the admin app's Secrets page, `cove-host secret`)
+# are in data/_host/secrets instead, which ReadWritePaths below lets it write.
 EnvironmentFile=/home/ioijoi/cove-tools/env
 # Two workers and two I/O threads on a shared four-core N100; at most this
 # many connections and admitted requests (one more is answered 503).

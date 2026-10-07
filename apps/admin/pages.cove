@@ -54,7 +54,7 @@ fn css() -> String {
 
 /// The page around `content`.
 fn layout(base: String, title: String, content: String) -> String {
-  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · cove-tools admin</title><style>{css()}</style></head><body><header><a class=home href=\"{h(base)}/\">cove-tools admin</a><a href=\"{h(base)}/\">apps</a><a href=\"{h(base)}/history\">history</a></header><main>{content}</main></body></html>"
+  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · cove-tools admin</title><style>{css()}</style></head><body><header><a class=home href=\"{h(base)}/\">cove-tools admin</a><a href=\"{h(base)}/\">apps</a><a href=\"{h(base)}/secrets\">secrets</a><a href=\"{h(base)}/history\">history</a></header><main>{content}</main></body></html>"
 }
 
 fn badge(state: String) -> String {
@@ -276,12 +276,54 @@ fn refusedNotice(action: String, message: String) -> String {
   "<div class=problem><b>Refused: nothing was changed.</b> The host said, of <code>{h(action)}</code>:<pre>{h(message)}</pre></div>"
 }
 
+/// The app a change was about: a link, or a dash for a change to the host
+/// itself (a secret).
+fn historyApp(base: String, app: String) -> String {
+  if app == "" {
+    return "<span class=muted>–</span>"
+  }
+  "<a href=\"{h(base)}/apps/{h(app)}\">{h(app)}</a>"
+}
+
+fn doneNotice(message: String) -> String {
+  "<div class=notice>{h(message)}</div>"
+}
+
+/// The secret store: every secret stored or used, and the forms that set,
+/// replace and delete them. A value is never part of the page: the store
+/// gives none, and the inputs are password fields that start empty.
+/// `notice` is said above everything; `name` fills the set form's name.
+fn secretsPage(base: String, secrets: Array<host.Secret>, notice: String, name: String) -> String {
+  var rows = Vector.of()
+  for secret in secrets {
+    let state = if secret.set { "<span class=\"state serving\">set</span>" } else { "<span class=\"state refused\">unset</span>" }
+    let updated = if secret.set { text.isoTime(secret.updatedMs) } else { "<span class=muted>–</span>" }
+    var users = Vector.of()
+    for app in secret.apps {
+      users.push("<a href=\"{h(base)}/apps/{h(app)}\"><code>{h(app)}</code></a>")
+    }
+    let used = if users.length() == 0 { "<span class=muted>none</span>" } else { " ".join(users.freeze()) }
+    let replace = "<form method=post action=\"{h(base)}/secrets/set\"><input type=hidden name=name value=\"{h(secret.name)}\"><input type=password name=value autocomplete=new-password required placeholder=\"new value\"> <button>{if secret.set { "Replace" } else { "Set" }}</button></form>"
+    let force = if secret.apps.length() > 0 { " <label><input type=checkbox name=force> even though apps use it (they are refused)</label>" } else { "" }
+    let delete = if secret.set { "<form method=post action=\"{h(base)}/secrets/delete\"><input type=hidden name=name value=\"{h(secret.name)}\"><label><input type=checkbox name=confirm required> confirm</label>{force} <button>Delete</button></form>" } else { "" }
+    rows.push("<tr><td><code>{h(secret.name)}</code></td><td>{state}</td><td>{updated}</td><td>{used}</td><td>{replace}</td><td>{delete}</td></tr>")
+  }
+  let table = if rows.length() == 0 {
+    "<p class=muted>No secret is stored or used.</p>"
+  } else {
+    "<table><tr><th>name</th><th>state</th><th>set at (UTC)</th><th>used by</th><th>set or replace</th><th>delete</th></tr>{"".join(rows.freeze())}</table>"
+  }
+  let add = "<h2>Set a secret</h2><form method=post action=\"{h(base)}/secrets/set\"><table><tr><th><label for=secret-name>name</label></th><td><input id=secret-name name=name value=\"{h(name)}\" required pattern=\"[A-Za-z0-9][A-Za-z0-9_.\\-]*\" maxlength=64></td></tr><tr><th><label for=secret-value>value</label></th><td><input id=secret-value type=password name=value autocomplete=new-password required></td></tr></table><p><button>Set</button> <span class=muted>Stored by the host (<code>&lt;data&gt;/_host/secrets</code>, mode 0600); the apps that use it are reloaded with it.</span></p></form>"
+  let about = "<p class=muted>An app takes a stored secret with <code>[secrets] key = \{ store = \"name\" \}</code> in its app.toml, for <code>auth.check</code> or a <code>[fetch.headers]</code> header. A value is write-only: no page, log or history shows it.</p>"
+  layout(base, "secrets", "<h1>Secrets</h1>{notice}{table}{add}{about}")
+}
+
 /// The change history.
 fn historyPage(base: String, changes: Array<host.Change>) -> String {
   var rows = Vector.of()
   for change in changes {
     rows.push(
-      "<tr><td>{text.isoTime(change.atMs)}</td><td>{h(change.who)}</td><td><a href=\"{h(base)}/apps/{h(change.app)}\">{h(change.app)}</a></td><td><code>{h(change.action)}</code></td><td>{h(change.detail)}</td><td>{h(change.outcome)}</td></tr>",
+      "<tr><td>{text.isoTime(change.atMs)}</td><td>{h(change.who)}</td><td>{historyApp(base, change.app)}</td><td><code>{h(change.action)}</code></td><td>{h(change.detail)}</td><td>{h(change.outcome)}</td></tr>",
     )
   }
   let table = if rows.length() == 0 {

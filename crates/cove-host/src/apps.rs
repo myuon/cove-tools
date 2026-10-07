@@ -25,7 +25,8 @@ use cove_sema::resolve::{FnEntry, Program};
 use cove_sema::{Compiler, HostSchemas};
 
 use crate::config::{
-    read_app_with, AppConfig, AppLimits, AppOverride, FetchPolicy, KvLimits, Secrets, ADMIN_APP,
+    read_app_with, AppConfig, AppLimits, AppOverride, FetchPolicy, KvLimits, SecretSource, Secrets,
+    ADMIN_APP,
 };
 use crate::hosts::{AppContext, HostModules};
 use crate::logs::LogRing;
@@ -71,6 +72,17 @@ pub struct LoadOptions {
     pub io: tokio::runtime::Handle,
     /// What the admin app's `host` module acts on; given to that app only.
     pub control: Option<Arc<Control>>,
+}
+
+impl LoadOptions {
+    /// Where an app's `{ store = "…" }` secrets come from: the host's store,
+    /// when there is a host.
+    pub fn secret_source(&self) -> SecretSource {
+        match &self.control {
+            Some(control) => SecretSource::store(Arc::clone(&control.secrets)),
+            None => SecretSource::default(),
+        }
+    }
 }
 
 /// One app, ready or refused.
@@ -284,9 +296,10 @@ pub fn load_all(root: &Path, options: &LoadOptions) -> Result<Vec<App>, String> 
 }
 
 /// An app as its directory and config describe it, before anything is
-/// compiled; refused if the config does not read.
-pub fn describe(name: &str, dir: &Path) -> (App, Option<AppConfig>) {
-    describe_as(name, dir, Lineage::first(), None)
+/// compiled; refused if the config does not read. `store` secrets are
+/// looked up in `source`.
+pub fn describe(name: &str, dir: &Path, source: &SecretSource) -> (App, Option<AppConfig>) {
+    describe_as(name, dir, Lineage::first(), None, source)
 }
 
 /// What a version of an app inherits from the versions before it: its
@@ -316,6 +329,7 @@ pub fn describe_as(
     dir: &Path,
     lineage: Lineage,
     over: Option<&AppOverride>,
+    source: &SecretSource,
 ) -> (App, Option<AppConfig>) {
     let mut app = App {
         name: name.to_string(),
@@ -342,7 +356,7 @@ pub fn describe_as(
         app.state = AppState::Refused(why);
         return (app, None);
     }
-    match read_app_with(dir, name, over) {
+    match read_app_with(dir, name, over, source) {
         Ok(config) => {
             app.hosts = config.hosts.clone();
             app.fetch_allow = config.file_allow.clone();
@@ -443,7 +457,7 @@ pub fn load_with(
     lineage: Lineage,
     over: Option<&AppOverride>,
 ) -> App {
-    let (mut app, config) = describe_as(name, dir, lineage, over);
+    let (mut app, config) = describe_as(name, dir, lineage, over, &options.secret_source());
     if let Some(data) = &options.data {
         if valid_name(name).is_ok() {
             app.logs.attach(data.join(name).join("log.txt"));

@@ -33,6 +33,16 @@
 //! answered 503 (`app … is disabled by the administrator`, counted as
 //! `rejected.disabled`); those already admitted finish. Enabling routes to it
 //! again, with its data as it was.
+//!
+//! **Secrets** ([`crate::secrets`]) are changed here too. Setting one
+//! writes the store first and then reloads every app whose `app.toml` takes
+//! a secret from it (`{ store = "<name>" }`), as an update would: an app
+//! that loads is routed to with the new value and requests in flight finish
+//! on the old; one that does not keeps serving what it served, and the
+//! answer says so — the value stays stored either way. Deleting one that an
+//! app uses is refused unless forced; forced, the apps are reloaded without
+//! it and installed refused, so the value is no longer used anywhere. The
+//! history records the secret's name and the action, never the value.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
@@ -40,8 +50,10 @@ use std::sync::Arc;
 
 use serde_json::Value as Json;
 
-use crate::apps::{load_with, AppState, Lineage};
-use crate::config::{read_app_with, AppOverride, LimitsFile, ADMIN_APP, ADMIN_CAPABILITY};
+use crate::apps::{load_as, load_with, AppState, Lineage};
+use crate::config::{
+    read_app_with, store_references, AppOverride, LimitsFile, ADMIN_APP, ADMIN_CAPABILITY,
+};
 use crate::server::Front;
 
 /// Who the change history says made a change through the admin listener.
@@ -76,14 +88,49 @@ pub enum ChangeError {
     NotFound(String),
     /// The change was refused; the configuration is as it was.
     Refused(String),
+    /// A secret an app uses, not deleted without `force`.
+    InUse(String),
 }
 
 impl std::fmt::Display for ChangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChangeError::NotFound(why) | ChangeError::Refused(why) => f.write_str(why),
+            ChangeError::NotFound(why) | ChangeError::Refused(why) | ChangeError::InUse(why) => {
+                f.write_str(why)
+            }
         }
     }
+}
+
+/// One secret as the admin sees it — never its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretInfo {
+    pub name: String,
+    /// Whether the store has it.
+    pub set: bool,
+    /// When it was last set, if it is.
+    pub updated_ms: Option<u64>,
+    /// The apps whose `app.toml` takes a secret from it.
+    pub apps: Vec<String>,
+}
+
+/// What came of reloading one app after a secret changed.
+#[derive(Clone, Debug)]
+pub struct Reloaded {
+    pub app: String,
+    /// Whether it serves the new version.
+    pub ok: bool,
+    /// `serving v3-…`, `refused, still serving v2-…: why`, or `now
+    /// refused: why`.
+    pub outcome: String,
+}
+
+/// What a secret change did.
+#[derive(Clone, Debug)]
+pub struct SecretChange {
+    pub secret: String,
+    pub message: String,
+    pub reloaded: Vec<Reloaded>,
 }
 
 /// What an app's configuration is to become: the grant, the allowlist, and
@@ -363,7 +410,8 @@ impl Front {
         let dir = self.options.apps.join(name);
         // The app as its `app.toml` alone says: what the change is relative
         // to.
-        let file = read_app_with(&dir, name, None).map_err(|why| {
+        let source = self.load.secret_source();
+        let file = read_app_with(&dir, name, None, &source).map_err(|why| {
             ChangeError::Refused(format!(
                 "its app.toml does not read, so nothing is changed: {why}"
             ))
@@ -407,7 +455,7 @@ impl Front {
             },
         };
         // The config's own rules first: they need no compiling.
-        read_app_with(&dir, name, Some(&next)).map_err(ChangeError::Refused)?;
+        read_app_with(&dir, name, Some(&next), &source).map_err(ChangeError::Refused)?;
 
         let lineage = Lineage {
             counters: Arc::clone(&slot.counters),
@@ -474,6 +522,257 @@ impl Front {
                 why.lines().next().unwrap_or_default()
             ),
         })
+    }
+}
+
+impl Front {
+    /// Every secret the store has or an app takes from it, by name.
+    pub(crate) fn secret_infos(&self) -> Vec<SecretInfo> {
+        let mut infos: std::collections::BTreeMap<String, SecretInfo> = self
+            .control
+            .secrets
+            .list()
+            .into_iter()
+            .map(|stored| {
+                (
+                    stored.name.clone(),
+                    SecretInfo {
+                        name: stored.name,
+                        set: true,
+                        updated_ms: Some(stored.updated_ms),
+                        apps: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        for (app, names) in self.store_users() {
+            for name in names {
+                infos
+                    .entry(name.clone())
+                    .or_insert_with(|| SecretInfo {
+                        name,
+                        set: false,
+                        updated_ms: None,
+                        apps: Vec::new(),
+                    })
+                    .apps
+                    .push(app.clone());
+            }
+        }
+        infos.into_values().collect()
+    }
+
+    /// Every app routed to (serving, disabled or refused), with the store
+    /// names its `app.toml` takes secrets from.
+    fn store_users(&self) -> Vec<(String, BTreeSet<String>)> {
+        self.engine
+            .slots()
+            .iter()
+            .filter_map(|slot| {
+                let app = slot.current()?;
+                let names = store_references(&app.dir);
+                (!names.is_empty()).then(|| (slot.name.clone(), names))
+            })
+            .collect()
+    }
+
+    /// The apps that take a secret from the store's `name`.
+    fn users_of(&self, name: &str) -> Vec<String> {
+        self.store_users()
+            .into_iter()
+            .filter(|(_, names)| names.contains(name))
+            .map(|(app, _)| app)
+            .collect()
+    }
+
+    /// Sets the stored secret `name` to `value`, then reloads every app that
+    /// uses it. The value is kept whatever the reloads do.
+    pub(crate) async fn set_secret(
+        &self,
+        name: &str,
+        value: &str,
+        via: &Via,
+    ) -> Result<SecretChange, ChangeError> {
+        let _one_at_a_time = self.updating.lock().await;
+        let replaced = self.control.secrets.contains(name);
+        let result = match self.control.secrets.set(name, value) {
+            Ok(()) => {
+                let verb = if replaced { "replaced" } else { "set" };
+                Ok(self
+                    .reload_users(name, &format!("secret `{name}` {verb}"), false, via)
+                    .await)
+            }
+            Err(why) => Err(ChangeError::Refused(why)),
+        };
+        self.record_secret(name, "secret set", via, &result);
+        result
+    }
+
+    /// Deletes the stored secret `name`. Refused while an app uses it unless
+    /// `force`; forced, those apps are reloaded without it, and installed
+    /// refused.
+    pub(crate) async fn delete_secret(
+        &self,
+        name: &str,
+        force: bool,
+        via: &Via,
+    ) -> Result<SecretChange, ChangeError> {
+        let _one_at_a_time = self.updating.lock().await;
+        let result = async {
+            if !self.control.secrets.contains(name) {
+                return Err(ChangeError::NotFound(format!("no secret `{name}` is set")));
+            }
+            let users = self.users_of(name);
+            if !users.is_empty() && !force {
+                return Err(ChangeError::InUse(format!(
+                    "secret `{name}` is used by {}: deleted, they would be refused at their \
+                     next load. Delete it with force to do that now",
+                    users.join(", ")
+                )));
+            }
+            self.control
+                .secrets
+                .delete(name)
+                .map_err(ChangeError::Refused)?;
+            Ok(self
+                .reload_users(name, &format!("secret `{name}` deleted"), true, via)
+                .await)
+        }
+        .await;
+        self.record_secret(name, "secret delete", via, &result);
+        result
+    }
+
+    /// Reloads every app that uses the stored secret `name`, saying `why`
+    /// in its log. `install_refused`: an app that no longer loads is
+    /// installed refused (a forced delete), rather than left serving what it
+    /// served (a set).
+    async fn reload_users(
+        &self,
+        name: &str,
+        why: &str,
+        install_refused: bool,
+        via: &Via,
+    ) -> SecretChange {
+        let mut reloaded = Vec::new();
+        for app in self.users_of(name) {
+            reloaded.push(
+                self.reload_for_secret(&app, why, install_refused, via)
+                    .await,
+            );
+        }
+        let message = if reloaded.is_empty() {
+            format!("{why}; no app uses it")
+        } else {
+            format!(
+                "{why}; {}",
+                reloaded
+                    .iter()
+                    .map(|r| format!("`{}` {}", r.app, r.outcome))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        SecretChange {
+            secret: name.to_string(),
+            message,
+            reloaded,
+        }
+    }
+
+    async fn reload_for_secret(
+        &self,
+        name: &str,
+        why: &str,
+        install_refused: bool,
+        via: &Via,
+    ) -> Reloaded {
+        let reloaded = |ok: bool, outcome: String| Reloaded {
+            app: name.to_string(),
+            ok,
+            outcome,
+        };
+        let Some(slot) = self.engine.slot_named(name) else {
+            return reloaded(false, "is not routed to".to_string());
+        };
+        let current = slot.current().map(|app| app.version.clone());
+        let lineage = Lineage {
+            counters: Arc::clone(&slot.counters),
+            logs: Arc::clone(&slot.logs),
+            number: slot.next_version(),
+        };
+        let dir = self.options.apps.join(name);
+        let load = self.load.clone();
+        let owned = name.to_string();
+        let loaded =
+            tokio::task::spawn_blocking(move || load_as(&owned, &dir, &load, lineage)).await;
+        let mut app = match loaded {
+            Ok(app) => app,
+            Err(e) => return reloaded(false, format!("did not reload: {e}")),
+        };
+        self.refuse_taken_hostnames(&mut app);
+        let refused = match &app.state {
+            AppState::Ready(_) => None,
+            AppState::Refused(why) => Some(why.lines().next().unwrap_or_default().to_string()),
+        };
+        let counters = Arc::clone(&app.counters);
+        let logs = Arc::clone(&app.logs);
+        let (ok, line, outcome) = match refused {
+            None => {
+                let installed = self.engine.install(app);
+                counters.updates.fetch_add(1, Ordering::Relaxed);
+                (
+                    true,
+                    format!(
+                        "reloaded, {why} ({}): {} -> {}",
+                        via.who(),
+                        installed.previous.as_deref().unwrap_or("nothing"),
+                        installed.version
+                    ),
+                    format!("serving {}", installed.version),
+                )
+            }
+            Some(reason) if install_refused => {
+                self.engine.install(app);
+                counters.updates.fetch_add(1, Ordering::Relaxed);
+                (
+                    false,
+                    format!("reloaded, {why} ({}), and now refused: {reason}", via.who()),
+                    format!("now refused: {reason}"),
+                )
+            }
+            Some(reason) => {
+                counters.updates_refused.fetch_add(1, Ordering::Relaxed);
+                let still = current.as_deref().unwrap_or("nothing");
+                (
+                    false,
+                    format!(
+                        "reload after {why} ({}) refused, still serving {still}: {reason}",
+                        via.who()
+                    ),
+                    format!("refused, still serving {still}: {reason}"),
+                )
+            }
+        };
+        logs.push("host", &line);
+        eprintln!("cove-host: [{name}] {line}");
+        reloaded(ok, outcome)
+    }
+
+    fn record_secret(
+        &self,
+        name: &str,
+        action: &str,
+        via: &Via,
+        result: &Result<SecretChange, ChangeError>,
+    ) {
+        let outcome = match result {
+            Ok(change) => format!("applied: {}", change.message),
+            Err(error) => format!("refused: {error}"),
+        };
+        self.control
+            .history
+            .record(&via.who(), "", action, &format!("`{name}`"), &outcome);
     }
 }
 

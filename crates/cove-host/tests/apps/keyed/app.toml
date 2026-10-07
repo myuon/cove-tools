@@ -1,0 +1,8 @@
+# The app the secret-store tests set, replace and delete a secret under
+# (issue #32): `key` comes from the host's store. The tests write their own
+# app.toml, with a `[fetch]` allowlist and a `[fetch.headers]` entry for
+# their upstream; this one is what `cove-host check` and `test` see.
+grant = ["auth", "fetch"]
+
+[secrets]
+key = { store = "keyed-key" }

@@ -1,6 +1,6 @@
 //! `cove-host`: serve, check and test the Cove apps in a directory.
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -106,6 +106,11 @@ enum Command {
         /// start (or `cove-host update`). What `deploy/install.sh` uses.
         #[arg(long, value_name = "APPS")]
         into: Option<PathBuf>,
+        /// With `--into`: the host's data directory, whose secret store
+        /// (`<data>/_host/secrets`) `{ store = "…" }` secrets are checked
+        /// against.
+        #[arg(long, requires = "into")]
+        data: Option<PathBuf>,
         #[command(flatten)]
         admin: AdminArgs,
     },
@@ -147,18 +152,67 @@ enum Command {
     Check {
         #[arg(long, default_value = "apps")]
         apps: PathBuf,
+        /// The host's data directory: `{ store = "…" }` secrets are looked
+        /// up in its secret store (`<data>/_host/secrets`). Without it there
+        /// is no store, and an app that takes a secret from it is refused.
+        #[arg(long)]
+        data: Option<PathBuf>,
         /// Only these apps.
         names: Vec<String>,
     },
     /// Run apps' `test fn`s with the host's modules, grants and limits.
+    ///
+    /// A secret that cannot be resolved here — its environment variable
+    /// unset, its file missing, its store entry not set — does not stop the
+    /// tests: it is given the value `cove-host-test-placeholder-<name>`, and
+    /// the run says which secrets were. A secret only gates `auth.check` and
+    /// a `[fetch.headers]` header, which a test should not reach for real.
     Test {
         #[arg(long, default_value = "apps")]
         apps: PathBuf,
+        /// The host's data directory, whose secret store is tried first for
+        /// `{ store = "…" }` secrets.
+        #[arg(long)]
+        data: Option<PathBuf>,
         /// Only tests whose qualified name contains this.
         #[arg(long)]
         filter: Option<String>,
         /// Only these apps.
         names: Vec<String>,
+    },
+    /// The running host's secret store (`<data>/_host/secrets`), which
+    /// `app.toml` reads with `[secrets] x = { store = "<name>" }`. Write-only:
+    /// nothing prints a value.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Set or replace a secret, reading its value from stdin (not echoed on
+    /// a terminal; one trailing newline is dropped), and reload the apps that
+    /// use it.
+    Set {
+        name: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Every secret stored or used: name, set or not, when it was set, and
+    /// the apps that use it.
+    List {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Delete a secret. Refused while an app uses it, unless `--force`,
+    /// which reloads those apps without it (they are then refused).
+    Delete {
+        name: String,
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        admin: AdminArgs,
     },
 }
 
@@ -183,7 +237,7 @@ fn admin_with(
     args: &AdminArgs,
     method: reqwest::Method,
     path: &str,
-    body: Option<Vec<u8>>,
+    body: Option<(&str, Vec<u8>)>,
 ) -> ExitCode {
     let token = match std::fs::read_to_string(&args.token_file) {
         Ok(token) => token.trim().to_string(),
@@ -211,10 +265,8 @@ fn admin_with(
             .request(method, &url)
             .bearer_auth(token)
             .timeout(Duration::from_secs(600));
-        if let Some(body) = body {
-            request = request
-                .header("content-type", "application/x-tar")
-                .body(body);
+        if let Some((content_type, body)) = body {
+            request = request.header("content-type", content_type).body(body);
         }
         let response = request.send().await?;
         let status = response.status();
@@ -299,8 +351,9 @@ fn main() -> ExitCode {
             source,
             name,
             into,
+            data,
             admin: args,
-        } => deploy_command(&source, name, into.as_deref(), &args),
+        } => deploy_command(&source, name, into.as_deref(), data.as_deref(), &args),
         Command::Rollback { app, admin: args } => admin(
             &args,
             reqwest::Method::POST,
@@ -320,20 +373,101 @@ fn main() -> ExitCode {
         Command::Reset { app, admin: args } => {
             admin(&args, reqwest::Method::POST, &format!("/apps/{app}/reset"))
         }
-        Command::Check { apps, names } => {
-            finish(toolchain::check(&apps, &names, &HostModules::standard()))
-        }
+        Command::Check { apps, data, names } => finish(toolchain::check_with(
+            &apps,
+            &names,
+            &HostModules::standard(),
+            data.as_deref(),
+        )),
         Command::Test {
             apps,
+            data,
             filter,
             names,
-        } => finish(toolchain::test(
+        } => finish(toolchain::test_with(
             &apps,
             &names,
             filter.as_deref(),
             &HostModules::standard(),
+            data.as_deref(),
         )),
+        Command::Secret { command } => secret_command(command),
     }
+}
+
+/// `cove-host secret set|list|delete`, through the admin listener.
+fn secret_command(command: SecretCommand) -> ExitCode {
+    match command {
+        SecretCommand::List { admin: args } => admin(&args, reqwest::Method::GET, "/secrets"),
+        SecretCommand::Delete {
+            name,
+            force,
+            admin: args,
+        } => admin(
+            &args,
+            reqwest::Method::DELETE,
+            &format!("/secrets/{name}{}", if force { "?force=1" } else { "" }),
+        ),
+        SecretCommand::Set { name, admin: args } => {
+            if let Err(why) = cove_host::secrets::valid_name(&name) {
+                eprintln!("cove-host: {why}");
+                return ExitCode::FAILURE;
+            }
+            let value = match read_secret_value(&name) {
+                Ok(value) => value,
+                Err(why) => {
+                    eprintln!("cove-host: {why}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            admin_with(
+                &args,
+                reqwest::Method::PUT,
+                &format!("/secrets/{name}"),
+                Some(("application/octet-stream", value.into_bytes())),
+            )
+        }
+    }
+}
+
+/// A secret's value from stdin: on a terminal, one line typed without
+/// echo; otherwise everything, with one trailing newline dropped.
+fn read_secret_value(name: &str) -> Result<String, String> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    let mut value = String::new();
+    if stdin.is_terminal() {
+        eprint!("value for secret `{name}` (not echoed): ");
+        let echo_off = set_echo(false);
+        let read = stdin.lock().read_line(&mut value);
+        if echo_off {
+            set_echo(true);
+        }
+        eprintln!();
+        read.map_err(|e| format!("cannot read the value: {e}"))?;
+    } else {
+        stdin
+            .lock()
+            .take(cove_host::secrets::MAX_VALUE_BYTES as u64 + 2)
+            .read_to_string(&mut value)
+            .map_err(|e| format!("cannot read the value from stdin: {e}"))?;
+    }
+    if let Some(rest) = value.strip_suffix('\n') {
+        value = rest.strip_suffix('\r').unwrap_or(rest).to_string();
+    }
+    if value.is_empty() {
+        return Err(format!("no value for secret `{name}` on stdin"));
+    }
+    Ok(value)
+}
+
+/// Turns the terminal's echo on or off with `stty`; whether it did.
+fn set_echo(on: bool) -> bool {
+    std::process::Command::new("stty")
+        .arg(if on { "echo" } else { "-echo" })
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn finish(report: Result<toolchain::Report, String>) -> ExitCode {
@@ -360,6 +494,7 @@ fn deploy_command(
     source: &Path,
     name: Option<String>,
     into: Option<&Path>,
+    data: Option<&Path>,
     args: &AdminArgs,
 ) -> ExitCode {
     let limits = deploy::Limits::standard();
@@ -422,6 +557,7 @@ fn deploy_command(
             &name,
             &files,
             &HostModules::standard(),
+            data,
         ));
     }
     let archive = match deploy::pack(&files) {
@@ -435,6 +571,6 @@ fn deploy_command(
         args,
         reqwest::Method::POST,
         &format!("/apps/{name}/deploy"),
-        Some(archive),
+        Some(("application/x-tar", archive)),
     )
 }

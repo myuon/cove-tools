@@ -18,6 +18,9 @@
 //! | `POST /apps/<app>/reset` | drops the admin app's changes to the app's configuration and reloads it from `app.toml` |
 //! | `GET /apps` | the stats, as `GET /_host/stats` |
 //! | `GET /changes?n=50` | the change history, newest first, as JSON |
+//! | `GET /secrets` | the secret store ([`crate::secrets`]), as JSON: each secret stored or used — `name`, `set`, `updated_ms`, `apps` (those that use it) — **never a value** |
+//! | `PUT /secrets/<name>` | body: the value. Stores it (mode 0600, atomically), then reloads every app that uses it. 200 with each app's reload; 422 for a name or value refused |
+//! | `DELETE /secrets/<name>` | removes it. 409 while an app uses it, unless `?force=1`, which reloads those apps without it (they are refused); 404 if it is not set |
 //!
 //! These are the emergency exits when the admin app is broken or locked
 //! out: they do not go through it, and they may do what it may not —
@@ -46,7 +49,7 @@ use serde_json::json;
 
 use crate::convert::Reply;
 use crate::deploy::{self, Limits};
-use crate::manage::{ChangeError, Via};
+use crate::manage::{ChangeError, SecretChange, Via};
 use crate::ops::{self, OpsListener};
 use crate::sched::Installed;
 use crate::server::{is_ops_path, json_reply, to_response, Front, UpdateError};
@@ -122,7 +125,16 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
         Ok(message) => Reply::text(200, format!("{message}\n")),
         Err(ChangeError::NotFound(why)) => Reply::text(404, format!("{why}\n")),
         Err(ChangeError::Refused(why)) => Reply::text(422, format!("{why}\n")),
+        Err(ChangeError::InUse(why)) => Reply::text(409, format!("{why}\n")),
     };
+    let secret = path
+        .strip_prefix("/secrets/")
+        .unwrap_or_default()
+        .to_string();
+    let force = request.uri().query().is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .any(|(k, v)| k == "force" && (v == "1" || v == "true" || v == "yes"))
+    });
     match (method, path.as_str()) {
         (Method::GET, "/apps") => json_reply(&ops::stats(&front_ops(front))),
         (Method::GET, "/changes") => {
@@ -172,6 +184,40 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
                 Err(why) => Reply::text(400, format!("deploy of `{name}` refused: {why}\n")),
             }
         }
+        (Method::GET, "/secrets") => json_reply(&json!(front
+            .secret_infos()
+            .into_iter()
+            .map(|info| json!({
+                "name": info.name,
+                "set": info.set,
+                "updated_ms": info.updated_ms,
+                "apps": info.apps,
+            }))
+            .collect::<Vec<_>>())),
+        (Method::PUT, _) if !secret.is_empty() => {
+            let body = match Limited::new(request.into_body(), crate::secrets::MAX_VALUE_BYTES + 1)
+                .collect()
+                .await
+            {
+                Ok(body) => body.to_bytes(),
+                Err(_) => {
+                    return Reply::text(
+                        422,
+                        format!(
+                            "secret `{secret}`: the value is over the store's {} bytes\n",
+                            crate::secrets::MAX_VALUE_BYTES
+                        ),
+                    )
+                }
+            };
+            let Ok(value) = String::from_utf8(body.to_vec()) else {
+                return Reply::text(422, format!("secret `{secret}`: the value is not UTF-8\n"));
+            };
+            secret_changed(front.set_secret(&secret, &value, &Via::Listener).await)
+        }
+        (Method::DELETE, _) if !secret.is_empty() => {
+            secret_changed(front.delete_secret(&secret, force, &Via::Listener).await)
+        }
         (Method::DELETE, _) if !name.is_empty() && verb.is_empty() => match front.remove(&name) {
             Some(version) => Reply::text(200, format!("removed `{name}` (was {version})\n")),
             None => Reply::text(404, format!("no app named `{name}` is routed to\n")),
@@ -180,8 +226,27 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
             404,
             "cove-host admin: POST /apps/<app>/update, DELETE /apps/<app>, \
              POST /apps/<app>/deploy|rollback|enable|disable|reset, GET /apps, \
-             GET /changes\n",
+             GET /changes, GET /secrets, PUT|DELETE /secrets/<name>\n",
         ),
+    }
+}
+
+/// The answer to a secret's change: what each app's reload came to. Never
+/// the value.
+fn secret_changed(result: Result<SecretChange, ChangeError>) -> Reply {
+    match result {
+        Ok(change) => json_reply(&json!({
+            "secret": change.secret,
+            "message": change.message,
+            "reloaded": change
+                .reloaded
+                .iter()
+                .map(|r| json!({ "app": r.app, "ok": r.ok, "outcome": r.outcome }))
+                .collect::<Vec<_>>(),
+        })),
+        Err(ChangeError::NotFound(why)) => Reply::text(404, format!("{why}\n")),
+        Err(ChangeError::Refused(why)) => Reply::text(422, format!("{why}\n")),
+        Err(ChangeError::InUse(why)) => Reply::text(409, format!("{why}\n")),
     }
 }
 

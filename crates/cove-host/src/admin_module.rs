@@ -15,8 +15,11 @@
 //! | `host.setEnabled(app, enabled, who)` | `Result<String, Error>`: routes to the app again, or stops; nothing is reloaded |
 //! | `host.configure(app, settings, who)` | `Result<String, Error>`: the app's grant, allowlist and limits become `settings`, if the app loads with them |
 //! | `host.reset(app, who)` | `Result<String, Error>`: drops the admin's changes, back to `app.toml` |
+//! | `host.secrets()` | `Array<host.Secret>`: every secret stored or used — `name`, `set`, `updatedMs` (0 when unset), `apps` that use it — never a value |
+//! | `host.setSecret(name, value, who)` | `Result<String, Error>`: stores the value ([`crate::secrets`]) and reloads the apps that use it; the message says what each reload came to |
+//! | `host.deleteSecret(name, force, who)` | `Result<String, Error>`: refused while an app uses it, unless `force` |
 //!
-//! The three that change something are answered **pending**: the run parks
+//! The five that change something are answered **pending**: the run parks
 //! while the app is reloaded on a blocking thread — parsed, checked,
 //! admitted, lowered, prepared and compiled, as an update is — and holds no
 //! worker. What they may do, and the persistence, are
@@ -38,7 +41,7 @@ use cove_runtime::{
 
 use crate::config::{LimitsFile, ADMIN_CAPABILITY};
 use crate::hosts::{AppContext, HostModule, PendingWork};
-use crate::manage::{AppInfo, Settings, Via};
+use crate::manage::{AppInfo, SecretInfo, Settings, Via};
 use crate::overrides::{Change, Control};
 
 const STR: HostType = HostType::String;
@@ -111,6 +114,24 @@ pub const ADMIN: ModuleSchema = ModuleSchema {
             Effect::IrreversibleWrite,
         ),
         op("reset", &[STR, STR], CHANGED, Effect::IrreversibleWrite),
+        op(
+            "secrets",
+            &[],
+            HostType::Array(&HostType::Named("host.Secret")),
+            Effect::Read,
+        ),
+        op(
+            "setSecret",
+            &[STR, STR, STR],
+            CHANGED,
+            Effect::IrreversibleWrite,
+        ),
+        op(
+            "deleteSecret",
+            &[STR, HostType::Bool, STR],
+            CHANGED,
+            Effect::IrreversibleWrite,
+        ),
     ],
     types: &[
         // `maxHeapWords` 0 is "no limit but the runtime's"; every other
@@ -180,6 +201,19 @@ pub const ADMIN: ModuleSchema = ModuleSchema {
                 field("grant", STRINGS),
                 field("fetchAllow", STRINGS),
                 field("limits", HostType::Named("host.Limits")),
+            ],
+        },
+        TypeSchema {
+            name: "Secret",
+            cases: &[],
+            fields: &[
+                field("name", STR),
+                // Whether the store has it.
+                field("set", HostType::Bool),
+                // When it was last set; 0 when it is not.
+                field("updatedMs", INT),
+                // The apps whose app.toml takes a secret from it.
+                field("apps", STRINGS),
             ],
         },
         TypeSchema {
@@ -308,6 +342,18 @@ fn app_value(info: AppInfo) -> Value {
     )
 }
 
+fn secret_value(info: SecretInfo) -> Value {
+    Value::structure(
+        "host.Secret",
+        vec![
+            ("name", Value::string(info.name)),
+            ("set", Value::bool(info.set)),
+            ("updatedMs", int(info.updated_ms.unwrap_or(0))),
+            ("apps", strings(info.apps)),
+        ],
+    )
+}
+
 fn change_value(change: Change) -> Value {
     Value::structure(
         "host.Change",
@@ -417,6 +463,8 @@ impl AdminHost {
             Enable(bool),
             Configure(Result<Settings, String>),
             Reset,
+            SetSecret(String),
+            DeleteSecret(bool),
         }
         let (asked, who) = match op {
             "setEnabled" => (
@@ -428,6 +476,13 @@ impl AdminHost {
                 text(2),
             ),
             "reset" => (Asked::Reset, text(1)),
+            // The first argument is the secret's name; the value goes to the
+            // store and nowhere else.
+            "setSecret" => (Asked::SetSecret(text(1)), text(2)),
+            "deleteSecret" => (
+                Asked::DeleteSecret(args.get(1).and_then(Value::as_bool).unwrap_or(false)),
+                text(2),
+            ),
             other => {
                 return Err(RuntimeError::new(format!(
                     "`host` declares no operation `{other}`"
@@ -447,6 +502,14 @@ impl AdminHost {
                     Err(crate::manage::ChangeError::Refused(why))
                 }
                 Asked::Reset => front.reset(&app, &via).await,
+                Asked::SetSecret(value) => front
+                    .set_secret(&app, &value, &via)
+                    .await
+                    .map(|change| change.message),
+                Asked::DeleteSecret(force) => front
+                    .delete_secret(&app, force, &via)
+                    .await
+                    .map(|change| change.message),
             };
             Ok(match outcome {
                 Ok(message) => Transfer::ok(Transfer::string(message)),
@@ -478,6 +541,14 @@ impl HostApi for AdminHost {
                     .ok_or_else(|| RuntimeError::new("admin: the host is shutting down"))?;
                 Ok(strings(front.capabilities()))
             }
+            "secrets" => {
+                let front = control
+                    .front()
+                    .ok_or_else(|| RuntimeError::new("admin: the host is shutting down"))?;
+                Ok(Value::array(
+                    front.secret_infos().into_iter().map(secret_value),
+                ))
+            }
             "history" => {
                 let limit = args.first().and_then(Value::as_int).unwrap_or(50);
                 let limit = limit.clamp(0, 1000) as usize;
@@ -494,10 +565,12 @@ impl HostApi for AdminHost {
 
     fn call_parkable(&self, op: &str, args: Vec<Value>, _back: &mut dyn Reentry) -> HostAnswer {
         match op {
-            "setEnabled" | "configure" | "reset" => match self.change(op, &args) {
-                Ok(change) => PendingWork::new("host.change", change).answer(),
-                Err(error) => HostAnswer::Ready(Err(error)),
-            },
+            "setEnabled" | "configure" | "reset" | "setSecret" | "deleteSecret" => {
+                match self.change(op, &args) {
+                    Ok(change) => PendingWork::new("host.change", change).answer(),
+                    Err(error) => HostAnswer::Ready(Err(error)),
+                }
+            }
             _ => HostAnswer::Ready(self.call(op, args)),
         }
     }

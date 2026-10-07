@@ -12,6 +12,9 @@ use text
 ///   grant, the allowlist and the limits, reset to `app.toml`.
 /// - `GET /history` is the change history.
 /// - `POST /apps/<app>/enable|disable|configure|reset` make the changes.
+/// - `GET /secrets` lists the host's secret store — names, whether each is
+///   set, when, and which apps use it; never a value — and
+///   `POST /secrets/set` and `POST /secrets/delete` change it.
 ///
 /// Every page needs an identity (`auth.identity`): deployed, the user
 /// Cloudflare Access let in, verified by the host; run locally without
@@ -42,6 +45,15 @@ export fn handle(request: web.Request) -> web.Response {
   }
   if section == "history" && name == "" && get {
     return htmlResponse(200, historyPage(at, host.history(200)))
+  }
+  if section == "secrets" {
+    if name == "" && get {
+      return htmlResponse(200, secretsPage(at, host.secrets(), "", ""))
+    }
+    if get || parts.length() > 3 {
+      return textResponse(404, "no such page\n")
+    }
+    return changeSecret(at, name, text.parseForm(request.body), user(identity))
   }
   if section != "apps" || name == "" {
     return textResponse(404, "no such page\n")
@@ -97,6 +109,36 @@ fn finish(
         appPage(at, now, host.capabilities(), refusedNotice(action, error.message), Some(form)),
       )
     }
+  }
+}
+
+/// `POST /secrets/set` (`name`, `value`) or `/secrets/delete` (`name`,
+/// `confirm`, and `force` for one an app uses). The value goes to the host
+/// and is never part of a page: a refused set shows the form again with the
+/// name and an empty value. The answer is the Secrets page with what each
+/// app's reload came to.
+fn changeSecret(at: String, action: String, form: Map<String, String>, who: String) -> web.Response {
+  let secret = form.get("name").unwrapOr("").trim()
+  if action == "set" {
+    let value = form.get("value").unwrapOr("")
+    if secret == "" || value == "" {
+      return htmlResponse(422, secretsPage(at, host.secrets(), problemsNotice(Vector.of("a secret needs a name and a value").freeze()), secret))
+    }
+    return secretAnswer(at, action, host.setSecret(secret, value, who), secret)
+  }
+  if action == "delete" {
+    if !form.contains("confirm") {
+      return htmlResponse(422, secretsPage(at, host.secrets(), problemsNotice(Vector.of("tick “confirm” to delete `{secret}`").freeze()), ""))
+    }
+    return secretAnswer(at, action, host.deleteSecret(secret, form.contains("force"), who), "")
+  }
+  textResponse(404, "no such page\n")
+}
+
+fn secretAnswer(at: String, action: String, result: Result<String, Error>, name: String) -> web.Response {
+  match result {
+    Ok(message) => htmlResponse(200, secretsPage(at, host.secrets(), doneNotice(message), ""))
+    Err(error) => htmlResponse(422, secretsPage(at, host.secrets(), refusedNotice(action, error.message), name))
   }
 }
 
