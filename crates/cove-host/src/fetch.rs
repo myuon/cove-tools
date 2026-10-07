@@ -9,7 +9,20 @@
 //! String }`; header names are lowercased and a repeated header's values
 //! joined with `, `; a body that is not UTF-8 is decoded lossily. Any
 //! response is `Ok`, whatever its status: an `Err` is a fetch that did not
-//! get one — refused, unreachable, too slow, too large.
+//! get one — refused, unreachable, too slow, too large, undecodable.
+//!
+//! # Content encoding
+//!
+//! A request is sent with `accept-encoding: gzip, deflate, br` unless the app
+//! set its own `accept-encoding`. A response whose `content-encoding` is
+//! `gzip`, `deflate` or `br` is decoded — whatever the request asked for,
+//! since some servers compress regardless — and the app sees the decoded
+//! body, with `content-encoding` and `content-length` (which describe the
+//! encoded one) taken out of its headers. Decoding streams, and
+//! `max_response_bytes` bounds the *decoded* body: a fetch stops as soon as
+//! it is passed, so a compression bomb is refused without being inflated. A
+//! body that does not decode is an `Err`, not text. Any other encoding is
+//! handed over as it came, header and all.
 //!
 //! # Where it may go
 //!
@@ -69,6 +82,9 @@ use crate::hosts::{AppContext, HostModule, PendingWork};
 use crate::stats::AppCounters;
 
 const STRING_MAP: HostType = HostType::Map(&HostType::String, &HostType::String);
+/// The `accept-encoding` sent when the app sets none: what the client
+/// decodes (reqwest's `gzip`, `deflate` and `brotli` features).
+const ACCEPT_ENCODING: &str = "gzip, deflate, br";
 const ANSWER: HostType = HostType::Result(&HostType::Named("fetch.Response"), &HostType::Error);
 
 const fn op(name: &'static str, params: &'static [HostType], effect: Effect) -> OperationSchema {
@@ -131,12 +147,7 @@ impl HostModule for FetchModule {
     }
 
     fn instantiate(&self, app: &AppContext) -> Result<Box<dyn HostApi>, String> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .use_rustls_tls()
-            .connect_timeout(app.fetch.timeout.min(Duration::from_secs(10)))
-            .build()
-            .map_err(|e| format!("cannot build its fetch client: {e}"))?;
+        let client = client(&app.fetch)?;
         Ok(Box::new(FetchHost {
             app: app.app.clone(),
             client,
@@ -145,6 +156,17 @@ impl HostModule for FetchModule {
             io: app.io.clone(),
         }))
     }
+}
+
+/// An app's client: no redirects, rustls, and `gzip`, `deflate` and `br`
+/// decoded (reqwest's defaults once those features are on).
+fn client(policy: &FetchPolicy) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .use_rustls_tls()
+        .connect_timeout(policy.timeout.min(Duration::from_secs(10)))
+        .build()
+        .map_err(|e| format!("cannot build its fetch client: {e}"))
 }
 
 struct FetchHost {
@@ -230,6 +252,14 @@ impl FetchHost {
             }
         }
         let mut request = request.build().map_err(|e| e.to_string())?;
+        // What the client decodes. reqwest would add its own spelling of it;
+        // the app's own `accept-encoding` is sent as written.
+        if let reqwest::header::Entry::Vacant(entry) = request
+            .headers_mut()
+            .entry(reqwest::header::ACCEPT_ENCODING)
+        {
+            entry.insert(reqwest::header::HeaderValue::from_static(ACCEPT_ENCODING));
+        }
         // `[fetch.headers]`: added last, so a header of the same name the app
         // supplied is replaced, not sent beside it. Nothing the app is
         // answered with is built from these values.
@@ -265,6 +295,9 @@ async fn fetch(
     request: reqwest::Request,
     policy: &FetchPolicy,
 ) -> Result<Fetched, String> {
+    // The client decodes `content-encoding` as the body streams, and takes
+    // that header and `content-length` out of the response: the chunks below
+    // are the decoded body, so the limit holds on what the app would get.
     let mut response = client.execute(request).await.map_err(describe)?;
     let status = response.status().as_u16();
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -301,6 +334,8 @@ fn describe(error: reqwest::Error) -> String {
         "timed out"
     } else if error.is_connect() {
         "could not connect"
+    } else if error.is_decode() {
+        "could not decode the response"
     } else {
         "failed"
     };
@@ -373,6 +408,263 @@ impl HostApi for FetchHost {
                 self.counters.fetch_refused.fetch_add(1, Ordering::Relaxed);
                 HostAnswer::Ready(Ok(Value::err(Value::error(why))))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::config::AllowRule;
+
+    const TEXT: &str = "The decoded body: ünïcödé, and long enough to compress. \
+                        The decoded body: ünïcödé, and long enough to compress.";
+
+    /// A one-shot upstream on 127.0.0.1: reads one request, sends its head
+    /// (request line and headers) back on the channel, and answers with
+    /// `headers` (each `name: value\r\n`), a `content-length` and `body`.
+    fn upstream(headers: &str, body: Vec<u8>) -> (u16, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let headers = headers.to_string();
+        let (heads, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let _ = heads.send(head);
+            let mut stream = stream;
+            // A client that stopped reading closes the connection: a failed
+            // write is that, not a test failure.
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(&body);
+        });
+        (port, received)
+    }
+
+    /// A host for an app allowed to reach any port on 127.0.0.1.
+    fn host(io: &tokio::runtime::Runtime, max_response_bytes: usize) -> FetchHost {
+        let policy = FetchPolicy {
+            allow: vec![AllowRule::parse("http://127.0.0.1:*").unwrap()],
+            max_response_bytes,
+            ..FetchPolicy::default()
+        };
+        FetchHost {
+            app: "test".to_string(),
+            client: client(&policy).unwrap(),
+            policy: Arc::new(policy),
+            counters: Arc::default(),
+            io: io.handle().clone(),
+        }
+    }
+
+    /// `fetch.request("GET", url, headers, "")`, as far as the response the
+    /// host holds, and the request head the upstream received.
+    fn get(
+        port: u16,
+        received: &mpsc::Receiver<String>,
+        headers: &[(&str, &str)],
+        max_response_bytes: usize,
+    ) -> (Result<Fetched, String>, String) {
+        let io = tokio::runtime::Runtime::new().unwrap();
+        let host = host(&io, max_response_bytes);
+        let headers = Value::map(
+            headers
+                .iter()
+                .map(|(name, value)| (MapKey::Str(name.to_string()), Value::string(*value))),
+        );
+        let args = [
+            Value::string("GET"),
+            Value::string(format!("http://127.0.0.1:{port}/")),
+            headers,
+            Value::string(""),
+        ];
+        let request = host.admit("request", &args).unwrap();
+        let fetched = io.block_on(fetch(&host.client, request, &host.policy));
+        let head = received.recv().unwrap_or_default();
+        (fetched, head)
+    }
+
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn deflate(bytes: &[u8]) -> Vec<u8> {
+        // HTTP's `deflate` is the zlib format (RFC 9110 8.4.1.2).
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn brotli(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+            encoder.write_all(bytes).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn an_encoded_body_is_decoded_and_its_headers_dropped() {
+        for (encoding, body) in [
+            ("gzip", gzip(TEXT.as_bytes())),
+            ("deflate", deflate(TEXT.as_bytes())),
+            ("br", brotli(TEXT.as_bytes())),
+        ] {
+            let (port, received) = upstream(
+                &format!("content-type: text/plain\r\ncontent-encoding: {encoding}\r\n"),
+                body,
+            );
+            let (fetched, head) = get(port, &received, &[], 1 << 20);
+            let fetched = fetched.unwrap_or_else(|e| panic!("{encoding}: {e}"));
+            assert_eq!(fetched.body, TEXT, "{encoding}");
+            let names: Vec<&str> = fetched.headers.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(
+                !names.contains(&"content-encoding"),
+                "{encoding}: {names:?}"
+            );
+            assert!(!names.contains(&"content-length"), "{encoding}: {names:?}");
+            assert!(names.contains(&"content-type"), "{encoding}: {names:?}");
+            assert_eq!(
+                header(&head, "accept-encoding"),
+                Some(ACCEPT_ENCODING),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identity_body_is_handed_over_as_it_came() {
+        let (port, received) = upstream("content-type: text/plain\r\n", TEXT.as_bytes().to_vec());
+        let (fetched, head) = get(port, &received, &[], 1 << 20);
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.body, TEXT);
+        let length = TEXT.len().to_string();
+        assert!(
+            fetched
+                .headers
+                .iter()
+                .any(|(n, v)| n == "content-length" && *v == length),
+            "{:?}",
+            fetched.headers
+        );
+        assert_eq!(
+            header(&head, "accept-encoding"),
+            Some(ACCEPT_ENCODING),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn the_apps_own_accept_encoding_is_sent_as_written() {
+        let (port, received) = upstream("", TEXT.as_bytes().to_vec());
+        let (fetched, head) = get(port, &received, &[("accept-encoding", "identity")], 1 << 20);
+        assert_eq!(fetched.unwrap().body, TEXT);
+        assert_eq!(header(&head, "accept-encoding"), Some("identity"), "{head}");
+
+        // A server that compresses anyway is still decoded.
+        let (port, received) = upstream("content-encoding: gzip\r\n", gzip(TEXT.as_bytes()));
+        let (fetched, head) = get(port, &received, &[("accept-encoding", "identity")], 1 << 20);
+        assert_eq!(fetched.unwrap().body, TEXT);
+        assert_eq!(header(&head, "accept-encoding"), Some("identity"), "{head}");
+    }
+
+    #[test]
+    fn a_body_that_does_not_decode_is_an_error() {
+        for encoding in ["gzip", "deflate", "br"] {
+            let (port, received) = upstream(
+                &format!("content-encoding: {encoding}\r\n"),
+                b"this is not compressed at all, whatever the header says".to_vec(),
+            );
+            let (fetched, _) = get(port, &received, &[], 1 << 20);
+            let error = match fetched {
+                Ok(fetched) => panic!("{encoding}: answered {:?}", fetched.body),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("could not decode the response"),
+                "{encoding}: {error}"
+            );
+        }
+    }
+
+    /// The process's peak resident set, in bytes.
+    #[cfg(unix)]
+    fn peak_rss() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `getrusage` fills the struct it is given.
+        let usage = unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+            usage.assume_init()
+        };
+        let peak = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+        // Bytes on macOS, KiB elsewhere.
+        if cfg!(target_os = "macos") {
+            peak
+        } else {
+            peak * 1024
+        }
+    }
+
+    #[test]
+    fn a_compression_bomb_is_refused_without_being_inflated() {
+        // 1 GiB of zeros in about 1 MiB of gzip, one member (the decoder
+        // refuses bytes after the first).
+        let zeros = vec![0; 1 << 20];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        for _ in 0..1024 {
+            encoder.write_all(&zeros).unwrap();
+        }
+        let bomb = encoder.finish().unwrap();
+        assert!(bomb.len() < 8 << 20, "{}", bomb.len());
+        let (port, received) = upstream("content-encoding: gzip\r\n", bomb);
+
+        #[cfg(unix)]
+        let before = peak_rss();
+        let started = Instant::now();
+        let (fetched, _) = get(port, &received, &[], 1 << 20);
+        let took = started.elapsed();
+        let error = match fetched {
+            Ok(fetched) => panic!("answered {} bytes", fetched.body.len()),
+            Err(error) => error,
+        };
+        assert!(error.contains("max_response_bytes of 1048576"), "{error}");
+        // Inflating it would hold 1 GiB and take seconds; stopping at the
+        // limit holds about 1 MiB and takes milliseconds.
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        #[cfg(unix)]
+        {
+            let grew = peak_rss().saturating_sub(before);
+            assert!(grew < 128 << 20, "peak resident set grew {grew} bytes");
         }
     }
 }

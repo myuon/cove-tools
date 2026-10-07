@@ -725,7 +725,7 @@ do, and an app may use only what `app.toml` grants:
 | `log` | `log` | `info`, `warn`, `error` (`String`): a line on stdout, `[app] level: line` |
 | `timer` | `timer` | `sleep(millis: Int)`: parks the run for that long (at most 60 s; `0` parks and comes straight back) |
 | `kv` | `kv` | `get(key) -> Option<String>`, `put(key, value) -> Result<Unit, Error>`, `delete(key) -> Bool`, `increment(key, by) -> Result<Int, Error>` (atomic), `list(prefix, after, limit) -> Array<kv.Entry>`, `listDesc(prefix, before, limit) -> Array<kv.Entry>` |
-| `fetch` | `fetch` | `get(url)` and `request(method, url, headers: Map<String, String>, body)`, each `-> Result<fetch.Response, Error>` |
+| `fetch` | `fetch` | `get(url)` and `request(method, url, headers: Map<String, String>, body)`, each `-> Result<fetch.Response, Error>`; the body is decoded from `gzip`, `deflate` or `br` |
 | `time` | `time` | `nowMillis() -> Int`: the wall clock, milliseconds since the Unix epoch; `nowMicros() -> Int`: microseconds, strictly increasing across the process |
 | `random` | `random` | `hex(bytes: Int) -> String`: 1–64 random bytes from the operating system, as hex |
 | `auth` | `auth` | `check(secret: String, authorization: String) -> Bool`: whether an `Authorization` header (`Bearer <s>`, or `Basic` with `<s>` as the password) presents the app's secret `secret`. Constant-time; the secret itself never reaches the app. `identity(headers: Map<String, String>) -> Result<auth.Identity, Error>`: who is asking — `{ email, via }`, a Cloudflare Access user the host verified (`via` `"access"`) or the `[access] token` secret (`via` `"token"`, `email` empty); see [Cloudflare Access](#cloudflare-access-who-is-asking). `usesAccess() -> Bool`: whether Access is on for the app, so whether a refusal should prompt for a token |
@@ -838,6 +838,23 @@ connection, so the upstream sees the request abandoned. Each fetch is also
 bounded by `[fetch] timeout` (default 10 s), `max_request_bytes` (its body,
 default 1 MiB) and `max_response_bytes` (default 4 MiB). Any response is
 `Ok`, whatever its status; an `Err` is a fetch that got none.
+
+**Compressed responses are decoded.** A request goes out with
+`accept-encoding: gzip, deflate, br` unless the app set its own
+`accept-encoding`, which is sent as written. A response with
+`content-encoding: gzip`, `deflate` or `br` is decoded whatever the request
+asked for — some servers compress regardless — and the app sees the decoded
+body, without the `content-encoding` and `content-length` headers, which
+describe the encoded one. Any other encoding is handed over as it came,
+header included.
+
+- `max_response_bytes` bounds the **decoded** body. Decoding streams and
+  stops as soon as the limit is passed, so a compression bomb (a megabyte
+  that inflates to a gigabyte) is the usual too-large `Err`, refused without
+  being inflated.
+- A body that does not decode — corrupt, truncated, or not in the encoding
+  its header names — is an `Err` (`fetch could not decode the response: …`),
+  never garbage text.
 
 **https** is supported, with rustls and the Mozilla root set
 (`webpki-roots`), so there is no dependency on the system's OpenSSL. Inbound
