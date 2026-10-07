@@ -571,8 +571,8 @@ impl LimitsFile {
 }
 
 /// What the admin app changed of an app's `app.toml`, kept in the data
-/// directory rather than in the file: a release replaces `apps/` wholesale,
-/// and the change has to outlive it.
+/// directory rather than in the file: a deploy replaces the app's directory
+/// with what was sent, and the change has to outlive it.
 ///
 /// Sets are kept as what was added and removed relative to the file, not as
 /// the whole set, so that a release whose `app.toml` grants something new

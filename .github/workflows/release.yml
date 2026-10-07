@@ -75,6 +75,9 @@ jobs:
             echo "    curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh"
             echo "    bash install.sh $TAG"
             echo
+            echo "A first install wants the bundled apps: bash install.sh --with-bundled-apps \"webhooks ledger algo admin\" $TAG."
+            echo "An install never removes or replaces an app it was not asked to; deploy others with cove-host deploy."
+            echo
             echo "See the README's Deploying section and deploy/cloudflare.md."
           } > "$RUNNER_TEMP/notes.md"
           if gh release view "$TAG" > /dev/null 2>&1; then

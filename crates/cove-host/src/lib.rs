@@ -14,8 +14,10 @@
 //! An app is updated in place ([`admin`], [`server::Host::update`]): the
 //! next version is loaded off the request path and routed to only if it
 //! loads; requests admitted to the old version finish on it, and it is
-//! dropped with its last one ([`sched::Slot`]). [`ops`] is what the host
-//! shows of all this.
+//! dropped with its last one ([`sched::Slot`]). An app from anywhere else
+//! is deployed onto the host the same way, its files sent to the admin
+//! listener and written into the apps directory only if they load
+//! ([`deploy`]). [`ops`] is what the host shows of all this.
 //!
 //! The README is the walkthrough; this crate's tests start the host
 //! in-process on a free port.
@@ -26,6 +28,7 @@ pub mod admin_module;
 pub mod apps;
 pub mod config;
 pub mod convert;
+pub mod deploy;
 pub mod fetch;
 pub mod hosts;
 pub mod kv;

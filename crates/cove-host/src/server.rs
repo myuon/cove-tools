@@ -716,8 +716,43 @@ impl Front {
     /// app. Requests already admitted — queued, running, yielded or parked —
     /// finish on the version they were admitted to.
     pub(crate) async fn update(&self, name: &str) -> Result<Installed, UpdateError> {
-        let result = self.update_unrecorded(name).await;
-        let outcome = match &result {
+        let result = {
+            let _one_at_a_time = self.updating.lock().await;
+            self.update_locked(name).await
+        };
+        self.record_update(name, "update", &result);
+        result
+    }
+
+    /// Writes `files` as the app `name`'s next version and updates to it, if
+    /// it loads with this host's config; keeps the version it replaces for
+    /// [`Front::rollback`]. A refused deploy changes no file ([`crate::deploy`]).
+    pub(crate) async fn deploy(
+        &self,
+        name: &str,
+        files: crate::deploy::AppFiles,
+    ) -> Result<Installed, UpdateError> {
+        let result = {
+            let _one_at_a_time = self.updating.lock().await;
+            self.deploy_locked(name, files).await
+        };
+        self.record_update(name, "deploy", &result);
+        result
+    }
+
+    /// Swaps the app `name` with the version its last deploy replaced, and
+    /// updates to it if it loads ([`crate::deploy`]).
+    pub(crate) async fn rollback(&self, name: &str) -> Result<Installed, UpdateError> {
+        let result = {
+            let _one_at_a_time = self.updating.lock().await;
+            self.rollback_locked(name).await
+        };
+        self.record_update(name, "rollback", &result);
+        result
+    }
+
+    fn record_update(&self, name: &str, action: &str, result: &Result<Installed, UpdateError>) {
+        let outcome = match result {
             Ok(installed) => format!(
                 "applied: {} -> {}",
                 installed.previous.as_deref().unwrap_or("nothing"),
@@ -730,12 +765,18 @@ impl Front {
         };
         self.control
             .history
-            .record(crate::manage::LISTENER, name, "update", "", &outcome);
-        result
+            .record(crate::manage::LISTENER, name, action, "", &outcome);
     }
 
-    async fn update_unrecorded(&self, name: &str) -> Result<Installed, UpdateError> {
-        let _one_at_a_time = self.updating.lock().await;
+    /// The version `name` routes to now, if any.
+    fn current_version(&self, name: &str) -> Option<String> {
+        self.engine
+            .slot_named(name)
+            .and_then(|slot| slot.current())
+            .map(|app| app.version.clone())
+    }
+
+    async fn update_locked(&self, name: &str) -> Result<Installed, UpdateError> {
         let dir = self.options.apps.join(name);
         if !dir.join("app.toml").is_file() {
             return Err(UpdateError::NotFound(format!(
@@ -743,11 +784,63 @@ impl Front {
                 self.options.apps.display()
             )));
         }
+        let app = self.load_next(name, &dir).await?;
+        Ok(self.install_loaded(name, app))
+    }
+
+    async fn deploy_locked(
+        &self,
+        name: &str,
+        files: crate::deploy::AppFiles,
+    ) -> Result<Installed, UpdateError> {
+        let refused = |why: String| UpdateError::Refused {
+            current: self.current_version(name),
+            why,
+        };
+        crate::apps::valid_name(name).map_err(refused)?;
+        let places = crate::deploy::Places::new(&self.options.apps, name);
+        if let Err(why) = places.stage(&files) {
+            places.unstage();
+            return Err(refused(why));
+        }
+        let mut app = match self.load_next(name, &places.staged).await {
+            Ok(app) => app,
+            Err(error) => {
+                places.unstage();
+                return Err(error);
+            }
+        };
+        if let Err(why) = places.switch_in() {
+            places.unstage();
+            return Err(refused(why));
+        }
+        // Loaded from the staged copy, which is now the app's directory.
+        app.dir = places.current.clone();
+        Ok(self.install_loaded(name, app))
+    }
+
+    async fn rollback_locked(&self, name: &str) -> Result<Installed, UpdateError> {
+        crate::apps::valid_name(name).map_err(UpdateError::NotFound)?;
+        let places = crate::deploy::Places::new(&self.options.apps, name);
+        if !places.has_previous() {
+            return Err(UpdateError::NotFound(format!(
+                "no previous version of `{name}` is kept (a deploy keeps the one it replaces)"
+            )));
+        }
+        let mut app = self.load_next(name, &places.previous).await?;
+        places.swap().map_err(|why| UpdateError::Refused {
+            current: self.current_version(name),
+            why,
+        })?;
+        app.dir = places.current.clone();
+        Ok(self.install_loaded(name, app))
+    }
+
+    /// Loads `dir` as the app `name`'s next version; a refusal is counted and
+    /// logged, and is the error. Called with the update lock held.
+    async fn load_next(&self, name: &str, dir: &std::path::Path) -> Result<App, UpdateError> {
         let slot = self.engine.slot_named(name);
-        let current = slot
-            .as_ref()
-            .and_then(|slot| slot.current())
-            .map(|app| app.version.clone());
+        let current = self.current_version(name);
         let lineage = match &slot {
             Some(slot) => Lineage {
                 counters: Arc::clone(&slot.counters),
@@ -758,6 +851,7 @@ impl Front {
         };
         let load = self.load.clone();
         let owned = name.to_string();
+        let dir = dir.to_path_buf();
         let mut app = tokio::task::spawn_blocking(move || load_as(&owned, &dir, &load, lineage))
             .await
             .map_err(|e| UpdateError::Refused {
@@ -780,6 +874,11 @@ impl Front {
                 why: why.clone(),
             });
         }
+        Ok(app)
+    }
+
+    /// Routes to `app`, a version [`Front::load_next`] loaded.
+    fn install_loaded(&self, name: &str, app: App) -> Installed {
         let counters = Arc::clone(&app.counters);
         let logs = Arc::clone(&app.logs);
         let installed = self.engine.install(app);
@@ -791,7 +890,7 @@ impl Front {
         );
         logs.push("host", &line);
         eprintln!("cove-host: [{name}] {line}");
-        Ok(installed)
+        installed
     }
 
     /// Stops routing to `name`; what is in flight finishes.

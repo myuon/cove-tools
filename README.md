@@ -303,12 +303,101 @@ localhost whatever the public one is. Every admin request needs
 `<data>/admin.token` (mode 0600) the first time it starts without one, and
 `cove-host update` / `remove` read it from there (`--token-file`, `--admin`
 to point them elsewhere). Anything without the token is 401 and changes
-nothing. The endpoints are `POST /apps/<app>/update`, `DELETE /apps/<app>`,
+nothing. The endpoints are `POST /apps/<app>/update`,
+`POST /apps/<app>/deploy` and `/rollback` (see [Deploying an
+app](#deploying-an-app)), `DELETE /apps/<app>`,
 `POST /apps/<app>/enable`, `/disable` and `/reset` (see [Administering apps
 at run time](#administering-apps-at-run-time)), `GET /apps` (the stats) and
 `GET /changes?n=50` (the change history). There is no file watcher: an update is an
 explicit act, which is what makes a refused one a report rather than a
 silent non-event.
+
+## Deploying an app
+
+`update` reloads a directory that is already in the host's apps directory.
+An app that lives somewhere else — its own repository, like
+[myuon/ai-daily](https://github.com/myuon/ai-daily)'s `apps/aidaily` — is
+**deployed**: `cove-host deploy` packs it and sends it to the admin listener,
+which checks it and only then writes it into the apps directory and updates
+to it.
+
+```console
+$ ./target/checked/cove-host deploy ../elsewhere/hello     # with a README.md beside it
+cove-host: not part of the app, left out: README.md
+cove-host: deploying `hello`: 3 file(s), 2430 bytes
+{
+  "app": "hello",
+  "previous": null,
+  "version": "v1-05b655c0"
+}
+$ sed -i 's/Hello,/Hi,/' ../elsewhere/hello/hello.cove
+$ ./target/checked/cove-host deploy ../elsewhere/hello 2>/dev/null | grep version
+  "version": "v2-11744df1"
+$ ./target/checked/cove-host rollback hello | grep version
+  "version": "v3-05b655c0"
+$ echo 'fn broken( {' >> ../elsewhere/hello/hello.cove
+$ ./target/checked/cove-host deploy ../elsewhere/hello; echo "exit $?"
+cove-host: not part of the app, left out: README.md
+cove-host: deploying `hello`: 3 file(s), 2440 bytes
+cove-host: 422 Unprocessable Entity
+deploy of `hello` refused; still serving v3-05b655c0:
+does not parse:
+error[cove::parse::unexpected_token]: expected identifier, found `{`
+  --> hello/hello.cove:51:12
+   |
+51 | fn broken( {
+   |            ^
+
+exit 1
+```
+
+- **What is sent** is the app's `app.toml` and its `.cove` files, at any
+  depth — nothing else (a README, samples, a `.git`; anything hidden is
+  skipped). A symbolic link, a path outside the directory, and more than
+  16 MiB or 4096 files are refused before anything is sent, and again by
+  the host. The name is the directory's (`--name` to choose another); it is
+  the app's route and its main module's name, so `aidaily/aidaily.cove`.
+- **The check is the running host's**: the app is loaded as its next
+  version with the host's env (its `[secrets]`, `[access]`), the admin's
+  changes to its grant, and the hostnames other apps claim — exactly as an
+  update loads it. **If it does not load, nothing changes**: no file is
+  written, the current version keeps serving, and the diagnostics are
+  printed (exit 1). An app that needs a secret the host's env does not have
+  is refused here, saying which; add it to `~/cove-tools/env` and restart
+  the service first. A `[secrets]` value `{ file = ... }` is not sent: keep
+  secrets in the env.
+- **If it loads**, it is written to `<apps>/.deploy/<app>`, the current
+  `<apps>/<app>` is moved to `<apps>/.previous/<app>` (replacing the one kept
+  there), the new copy is renamed into place, and the host updates to it:
+  requests in flight finish on the old version, as with `update`.
+- `cove-host rollback <app>` swaps `<apps>/<app>` with the kept copy — after
+  loading it, so a kept version that no longer checks is refused and nothing
+  moves — and updates to it. A second rollback undoes the first.
+- Both are admin requests (`POST /apps/<app>/deploy` with the archive as the
+  body, `POST /apps/<app>/rollback`), behind the same token as `update`, and
+  both go in the change history.
+
+**To whisky, over ssh.** The admin listener stays on the server's
+localhost; the archive goes over ssh's stdin to the `cove-host` installed
+there, which sends it to the listener with the token it can read. No tunnel,
+no token on the laptop:
+
+```console
+$ tar -C apps/aidaily -c . | ssh whisky \
+    '~/cove-tools/current/cove-host deploy - --name aidaily --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+$ ssh whisky '~/cove-tools/current/cove-host rollback aidaily --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+```
+
+`deploy -` reads a tar archive (any `tar`'s, macOS's included: its `._`
+files are hidden and skipped) and needs `--name`. With a tunnel
+(`ssh -L 8791:127.0.0.1:8791 whisky`) and a copy of the token,
+`cove-host deploy apps/aidaily --admin 127.0.0.1:8791 --token-file <copy>`
+works from the laptop too.
+
+`cove-host deploy <dir> --into <apps>` does the same with no running host,
+checking as `cove-host check` does with the current environment; the host
+loads it at its next start. `deploy/install.sh` installs the bundled apps
+this way.
 
 ## Administering apps at run time
 
@@ -372,9 +461,10 @@ $ ./target/checked/cove-host disable notes    # or enable, reset
 $ ./target/checked/cove-host reset admin      # drop the admin's changes to the admin app
 ```
 
-**Where the changes are kept.** Not in `app.toml`: a release's `install.sh`
-replaces `apps/` wholesale, and the deployed unit mounts it read-only. They
-are kept in the data directory, which no release touches:
+**Where the changes are kept.** Not in `app.toml`: a deploy replaces an
+app's directory with what was sent (`install.sh --with-bundled-apps` too).
+They are kept in the data directory, which no release and no deploy
+touches:
 
 - `<data>/_host/overrides.json`: per app, `enabled`, the capabilities and
   allowlist entries added and removed, and the limits set — each relative to
@@ -422,9 +512,9 @@ Access in front:
 
 | file | what |
 | --- | --- |
-| [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code) |
+| [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code; writable: `data/`, and `apps/` for `cove-host deploy`) |
 | [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`, `ADMIN_UI_TOKEN`) and the Cloudflare Access settings (`ACCESS_TEAM_DOMAIN`, `COVTOOLS_ACCESS_AUD`, `COVTOOLS_ADMIN_ACCESS_AUD`, `ACCESS_ALLOWED_EMAILS`), as `~/cove-tools/env`; `install.sh` appends a key a release adds — a secret fresh, a setting as written there — and leaves the others |
-| [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks its apps, replaces `~/cove-tools/apps`, points `~/cove-tools/current` at it, and prints the one `sudo` command |
+| [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks every app installed in `~/cove-tools/apps` with the new binary (and refuses to switch if one would be refused), deploys the bundled apps it is asked for (`--with-bundled-apps`), points `~/cove-tools/current` at it, and prints the one `sudo` command. It never removes or replaces an app it was not asked to |
 | [`deploy/backup.sh`](deploy/backup.sh) | SQLite online backups of every app's `kv.sqlite3`, kept 14 days; a user crontab line is in the file |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | the tunnel's public hostname and the Access applications, with the paths left open to outside callers |
 
@@ -440,19 +530,33 @@ On the server, as the service's user:
 
 ```console
 $ curl -fsSLO https://github.com/myuon/cove-tools/releases/download/v0.2.2/install.sh
-$ bash install.sh v0.2.2
+$ bash install.sh --with-bundled-apps "webhooks ledger algo admin" v0.2.2
 ...
 first time: install the unit and start the service (needs sudo, once):
 
   sudo install -m644 /home/ioijoi/cove-tools/current/deploy/cove-tools.service /etc/systemd/system/cove-tools.service && sudo systemctl daemon-reload && sudo systemctl enable --now cove-tools
 ```
 
-An upgrade is the same two lines with the new tag, then
-`sudo systemctl restart cove-tools` (the script says which). The service
-stops on SIGTERM by answering new requests 503 and waiting up to
-`--shutdown-grace` for those in flight. By default the webhook lab, the ledger,
-the algorithm playground and the admin UI are installed (`--apps "..."` to
-choose); the sample apps are not.
+**The platform and the apps are installed separately.** A release is the
+platform — the binary, the unit, `deploy/` — and installing one never
+removes or replaces an app: the apps are whatever was deployed into
+`~/cove-tools/apps`, from this repository or another ([Deploying an
+app](#deploying-an-app)). An upgrade is `bash install.sh v<new>`, then
+`sudo systemctl restart cove-tools` (the script says which, and when the
+unit changed). Before it switches, it checks every installed app with the
+new binary against `~/cove-tools/env`, and if one would be refused it stops
+and switches nothing. This repository's apps — the webhook lab, the ledger,
+the algorithm playground and the admin UI — are deployed only when asked:
+`--with-bundled-apps "webhooks ledger algo admin"` deploys those of the
+release, each checked and its previous version kept, exactly as `cove-host
+deploy` would; a first install wants it, and an upgrade that should also
+update them passes it again. The sample apps are never installed. The
+service stops on SIGTERM by answering new requests 503 and waiting up to
+`--shutdown-grace` for those in flight.
+
+Upgrading from a release before this split: its unit made `apps/`
+read-only to the service, so install the new unit when the script says it
+changed, or `cove-host deploy` is refused with a permission error.
 
 What the deployment relies on from the host:
 
@@ -1021,6 +1125,17 @@ so, and what it asserts is counted.
 - the admin listener answers 401 without the token (missing, wrong, empty)
   and changes nothing, and the public listener has no update route;
 - an update adds an app, `remove` removes one, and an update brings it back;
+- deploying (`deploying.rs`, and `deploy.rs`'s unit tests): an archive is
+  refused for a symbolic link, a path that leaves the directory (`..`, an
+  absolute path), a hard link, a pipe, a duplicate or its size, and packs
+  `app.toml` and `.cove` files only; a deploy adds an app, and replaces one
+  while a request parked on the old version finishes on it; a deploy that
+  does not parse, that needs an ungranted capability or that needs a secret
+  the env lacks is refused with its reason and changes no file; rollback
+  restores the kept version and a second undoes it; both need the token;
+  `cove-host deploy` from a directory and from stdin, and `--into`;
+  `deploy/smoke.sh` (CI, Linux) checks `install.sh` leaves an app that is
+  not the release's alone and refuses to switch while one does not check;
 - through the `host` module: the list shows every app's state, grant and
   limits; a disabled app answers 503 while one of its requests in flight
   finishes, and enabled again has its store; taking a needed capability
