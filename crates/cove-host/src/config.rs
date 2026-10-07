@@ -81,7 +81,8 @@ pub struct AppFile {
     #[serde(default)]
     pub fetch: FetchFile,
     /// Named secrets the app may check a presented credential against
-    /// (`auth.check`), never read.
+    /// (`auth.check`), or the host sends as a header (`[fetch.headers]`);
+    /// never read.
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretFile>,
     #[serde(default)]
@@ -288,6 +289,119 @@ pub struct FetchFile {
     pub timeout: Option<String>,
     pub max_request_bytes: Option<usize>,
     pub max_response_bytes: Option<usize>,
+    /// `[fetch.headers."<origin>"]`: per origin, headers whose value is a
+    /// secret, added by the host when a request to that origin is sent.
+    #[serde(default)]
+    pub headers: BTreeMap<String, BTreeMap<String, HeaderFile>>,
+}
+
+/// One `[fetch.headers."<origin>"]` entry: `name = { secret = "…" }`, with
+/// an optional literal `prefix` (`"Bearer "`) put before the secret.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderFile {
+    /// A `[secrets]` name.
+    pub secret: String,
+    /// Sent before the secret, as written; empty by default.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+/// A header the host adds to every request sent to one origin, its value
+/// built from a secret. The app never sees the value: `Debug` prints the
+/// origin, the header's name and the secret's name only.
+#[derive(Clone)]
+pub struct InjectedHeader {
+    /// The origin, as `[fetch] allow` parses it; its port is never `*`.
+    pub origin: AllowRule,
+    /// Lowercase.
+    pub name: reqwest::header::HeaderName,
+    /// The `[secrets]` name the value comes from.
+    pub secret: String,
+    /// The prefix and the secret, marked sensitive.
+    pub value: reqwest::header::HeaderValue,
+}
+
+impl std::fmt::Debug for InjectedHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: <secret `{}`>",
+            self.origin, self.name, self.secret
+        )
+    }
+}
+
+impl InjectedHeader {
+    /// Whether a request to `scheme://host:port` gets this header: the
+    /// origin exactly — scheme, host and effective port.
+    pub fn applies_to(&self, scheme: &str, host: &str, port: u16) -> bool {
+        self.origin.admits(scheme, host, port)
+    }
+}
+
+/// Resolves `[fetch.headers]` against the allowlist as `app.toml` writes it
+/// and against the app's secrets. Nothing said here quotes a secret's value.
+fn resolve_injected_headers(
+    headers: BTreeMap<String, BTreeMap<String, HeaderFile>>,
+    written_allow: &[String],
+    secrets: &Secrets,
+) -> Result<Vec<InjectedHeader>, String> {
+    let allowed: Vec<AllowRule> = written_allow
+        .iter()
+        .filter_map(|entry| AllowRule::parse(entry).ok())
+        .collect();
+    let mut injected = Vec::new();
+    for (origin_text, entries) in headers {
+        let at = format!("`fetch.headers.\"{origin_text}\"`");
+        let origin = AllowRule::parse(&origin_text)
+            .ok()
+            .filter(|rule| rule.port.is_some())
+            .ok_or_else(|| {
+                format!(
+                    "{at}: `{origin_text}` is not an origin like \"https://api.openai.com\" \
+                     (a scheme, a host and an optional port; no path, no `:*`)"
+                )
+            })?;
+        if !allowed.contains(&origin) {
+            return Err(format!(
+                "{at}: `{origin_text}` is not an entry of `[fetch] allow`; a secret header goes \
+                 only to an origin the allowlist names exactly"
+            ));
+        }
+        for (name, entry) in entries {
+            let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| format!("{at}: `{name}` is not a header name"))?;
+            let Some(secret) = secrets.0.get(&entry.secret) else {
+                return Err(format!(
+                    "{at}: `{name} = {{ secret = \"{}\" }}` names no `[secrets]` entry",
+                    entry.secret
+                ));
+            };
+            if reqwest::header::HeaderValue::from_str(&entry.prefix).is_err() {
+                return Err(format!(
+                    "{at}: the `prefix` of `{name}` cannot be sent in a header value"
+                ));
+            }
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&format!("{}{secret}", entry.prefix))
+                    .map_err(|_| {
+                        format!(
+                            "{at}: secret `{}` cannot be sent as the value of `{name}` \
+                             (a control character or a line break?)",
+                            entry.secret
+                        )
+                    })?;
+            value.set_sensitive(true);
+            injected.push(InjectedHeader {
+                origin: origin.clone(),
+                name: header,
+                secret: entry.secret,
+                value,
+            });
+        }
+    }
+    Ok(injected)
 }
 
 /// An app's key-value quotas.
@@ -384,6 +498,9 @@ pub struct FetchPolicy {
     pub timeout: Duration,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
+    /// `[fetch.headers]`, resolved: what the host adds to a request to each
+    /// origin. Not an override's to change.
+    pub headers: Vec<InjectedHeader>,
 }
 
 impl Default for FetchPolicy {
@@ -393,6 +510,7 @@ impl Default for FetchPolicy {
             timeout: Duration::from_secs(10),
             max_request_bytes: 1 << 20,
             max_response_bytes: 4 << 20,
+            headers: Vec::new(),
         }
     }
 }
@@ -699,6 +817,11 @@ pub fn parse_app_with(
     over: Option<&AppOverride>,
 ) -> Result<AppConfig, String> {
     let file: AppFile = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    // `[fetch.headers]` is held to the allowlist as the file writes it, not
+    // as an override leaves it: an override can take an origin off the list
+    // (its requests are then refused, header and all) but cannot give a
+    // secret header an origin `app.toml` did not.
+    let written_allow = file.fetch.allow.clone();
     let file = match over {
         Some(over) => over.apply(file),
         None => file,
@@ -792,6 +915,7 @@ pub fn parse_app_with(
         max_keys: file.kv.max_keys.unwrap_or(kv_defaults.max_keys),
         max_bytes: file.kv.max_bytes.unwrap_or(kv_defaults.max_bytes),
     };
+    let secrets = resolve_secrets(file.secrets, dir)?;
     let fetch_defaults = FetchPolicy::default();
     let fetch = FetchPolicy {
         allow: file
@@ -812,8 +936,8 @@ pub fn parse_app_with(
             .fetch
             .max_response_bytes
             .unwrap_or(fetch_defaults.max_response_bytes),
+        headers: resolve_injected_headers(file.fetch.headers, &written_allow, &secrets)?,
     };
-    let secrets = resolve_secrets(file.secrets, dir)?;
     let access = resolve_access(file.access, &secrets, dir)?;
     Ok(AppConfig {
         entry,
@@ -922,6 +1046,141 @@ mod tests {
         );
         assert!(missing.unwrap_err().contains("is not set"));
         assert!(parse_app("[secrets]\nd = { value = \"v\", env = \"E\" }\n", "x").is_err());
+    }
+
+    const OPENAI: &str = "[secrets]\nopenai = { value = \"sk-not-a-real-key\" }\n\
+                          gemini = { value = \"AIza-not-a-real-key\" }\n\
+                          [fetch]\nallow = [\"https://api.openai.com\", \
+                          \"https://generativelanguage.googleapis.com:443\", \"http://localhost:*\"]\n";
+
+    #[test]
+    fn secret_headers_are_read_and_never_print() {
+        let config = parse_app(
+            &format!(
+                "{OPENAI}[fetch.headers.\"https://api.openai.com\"]\n\
+                 Authorization = {{ secret = \"openai\", prefix = \"Bearer \" }}\n\
+                 [fetch.headers.\"https://generativelanguage.googleapis.com\"]\n\
+                 x-goog-api-key = {{ secret = \"gemini\" }}\n"
+            ),
+            "x",
+        )
+        .unwrap();
+        let headers = &config.fetch.headers;
+        assert_eq!(headers.len(), 2);
+        let openai = &headers[0];
+        assert_eq!(openai.name.as_str(), "authorization");
+        assert_eq!(openai.value.to_str().unwrap(), "Bearer sk-not-a-real-key");
+        assert!(openai.value.is_sensitive());
+        assert!(openai.applies_to("https", "api.openai.com", 443));
+        assert!(!openai.applies_to("https", "api.openai.com", 8443));
+        assert!(!openai.applies_to("http", "api.openai.com", 443));
+        assert!(!openai.applies_to("https", "evil.openai.com", 443));
+        // The default port written out matches the entry written without it.
+        let gemini = &headers[1];
+        assert_eq!(gemini.value.to_str().unwrap(), "AIza-not-a-real-key");
+        assert!(gemini.applies_to("https", "generativelanguage.googleapis.com", 443));
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("not-a-real-key"), "{printed}");
+        assert!(printed.contains("<secret `openai`>"), "{printed}");
+    }
+
+    #[test]
+    fn secret_headers_are_held_to_their_rules() {
+        for (headers, wanted) in [
+            (
+                "[fetch.headers.\"https://api.example.com\"]\nx-key = { secret = \"openai\" }\n",
+                "is not an entry of `[fetch] allow`",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com:8443\"]\nx-key = { secret = \"openai\" }\n",
+                "is not an entry of `[fetch] allow`",
+            ),
+            (
+                "[fetch.headers.\"http://localhost:*\"]\nx-key = { secret = \"openai\" }\n",
+                "is not an origin",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com/v1\"]\nx-key = { secret = \"openai\" }\n",
+                "is not an origin",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com\"]\nx-key = { secret = \"nope\" }\n",
+                "names no `[secrets]` entry",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com\"]\n\"x key\" = { secret = \"openai\" }\n",
+                "is not a header name",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com\"]\n\
+                 x-key = { secret = \"openai\", prefix = \"a\\nb\" }\n",
+                "`prefix`",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com\"]\nx-key = { env = \"OPENAI\" }\n",
+                "env",
+            ),
+            (
+                "[fetch.headers.\"https://api.openai.com\"]\nx-key = \"literal\"\n",
+                "",
+            ),
+        ] {
+            let error = parse_app(&format!("{OPENAI}{headers}"), "x").unwrap_err();
+            assert!(error.contains(wanted), "{headers}: {error}");
+            assert!(!error.contains("not-a-real-key"), "{headers}: {error}");
+        }
+        // A secret that cannot be a header value is refused without quoting it.
+        let error = parse_app(
+            "[secrets]\nbad = { value = \"line\\nbreak-not-a-real-key\" }\n\
+             [fetch]\nallow = [\"https://api.openai.com\"]\n\
+             [fetch.headers.\"https://api.openai.com\"]\nx-key = { secret = \"bad\" }\n",
+            "x",
+        )
+        .unwrap_err();
+        assert!(error.contains("secret `bad` cannot be sent"), "{error}");
+        assert!(!error.contains("not-a-real-key"), "{error}");
+    }
+
+    #[test]
+    fn an_override_cannot_move_a_secret_header() {
+        let text = format!(
+            "{OPENAI}[fetch.headers.\"https://api.openai.com\"]\n\
+             authorization = {{ secret = \"openai\", prefix = \"Bearer \" }}\n"
+        );
+        // Taking the origin off the allowlist loads: requests there are
+        // refused, and the header goes nowhere else.
+        let removed = AppOverride {
+            fetch_allow_remove: vec!["https://api.openai.com".to_string()],
+            fetch_allow_add: vec!["https://api.example.com".to_string()],
+            ..AppOverride::none()
+        };
+        let config = parse_app_with(&text, "x", None, Some(&removed)).unwrap();
+        assert!(!config.fetch.admits("https", "api.openai.com", 443));
+        assert!(config.fetch.admits("https", "api.example.com", 443));
+        assert!(config.fetch.headers.iter().all(|header| !header.applies_to(
+            "https",
+            "api.example.com",
+            443
+        )));
+        // An origin only an override allows cannot be given a secret header.
+        let added = AppOverride {
+            fetch_allow_add: vec!["https://api.example.com".to_string()],
+            ..AppOverride::none()
+        };
+        let error = parse_app_with(
+            &format!(
+                "{OPENAI}[fetch.headers.\"https://api.example.com\"]\n\
+                 x-key = {{ secret = \"openai\" }}\n"
+            ),
+            "x",
+            None,
+            Some(&added),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("is not an entry of `[fetch] allow`"),
+            "{error}"
+        );
     }
 
     #[test]
