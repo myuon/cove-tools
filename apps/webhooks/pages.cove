@@ -12,7 +12,7 @@ fn h(value: String) -> String {
 }
 
 /// The response headers every admin page carries: no script but the page's
-/// own, no framing, no sniffing, no caching, no referrer.
+/// own, no framing, no sniffing, no caching, no referrer to another site.
 fn pageHeaders(contentType: String) -> Map<String, String> {
   Map.of(
     MapEntry(key: "content-type", value: contentType),
@@ -22,7 +22,7 @@ fn pageHeaders(contentType: String) -> Map<String, String> {
     ),
     MapEntry(key: "x-content-type-options", value: "nosniff"),
     MapEntry(key: "x-frame-options", value: "DENY"),
-    MapEntry(key: "referrer-policy", value: "no-referrer"),
+    MapEntry(key: "referrer-policy", value: "same-origin"),
     MapEntry(key: "cache-control", value: "no-store"),
   )
 }
