@@ -11,6 +11,8 @@
 //! | request | does |
 //! | --- | --- |
 //! | `POST /apps/<app>/update` | loads `<apps>/<app>` as the app's next version and routes to it if it loads; a new name adds the app. 200 with the old and new versions; 422 with the diagnostics, the current version still serving; 404 for no such directory |
+//! | `POST /apps/<app>/deploy` | body: a tar archive of the app ([`crate::deploy`]). Checks it with this host's config; only if it loads, writes it to `<apps>/<app>` (keeping the version it replaces) and updates to it. 200 as `update`; 422 with the diagnostics, no file changed and the current version still serving; 400 for an archive that is refused |
+//! | `POST /apps/<app>/rollback` | swaps `<apps>/<app>` with the version the last deploy replaced, and updates to it if it loads. 200 as `update`; 404 if none is kept; 422 as `update` |
 //! | `DELETE /apps/<app>` | stops routing to the app; what is in flight finishes |
 //! | `POST /apps/<app>/enable`, `/disable` | routes to the app again, or stops ([`crate::manage`]); its data stays |
 //! | `POST /apps/<app>/reset` | drops the admin app's changes to the app's configuration and reloads it from `app.toml` |
@@ -34,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -43,8 +45,10 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
 
 use crate::convert::Reply;
+use crate::deploy::{self, Limits};
 use crate::manage::{ChangeError, Via};
 use crate::ops::{self, OpsListener};
+use crate::sched::Installed;
 use crate::server::{is_ops_path, json_reply, to_response, Front, UpdateError};
 
 /// Serves the admin listener until the runtime stops.
@@ -144,24 +148,28 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
             changed(front.reset(&name, &Via::Listener).await)
         }
         (Method::POST, _) if verb == "update" && !name.is_empty() => {
-            match front.update(&name).await {
-                Ok(installed) => {
-                    let mut reply = json_reply(&json!({
-                        "app": installed.app,
-                        "version": installed.version,
-                        "previous": installed.previous,
-                    }));
-                    reply.status = 200;
-                    reply
+            updated("update", &name, front.update(&name).await)
+        }
+        (Method::POST, _) if verb == "rollback" && !name.is_empty() => {
+            updated("rollback", &name, front.rollback(&name).await)
+        }
+        (Method::POST, _) if verb == "deploy" && !name.is_empty() => {
+            let limits = Limits::standard();
+            let body = match Limited::new(request.into_body(), limits.max_archive_bytes() as usize)
+                .collect()
+                .await
+            {
+                Ok(body) => body.to_bytes(),
+                Err(e) => {
+                    return Reply::text(
+                        400,
+                        format!("deploy of `{name}` refused: cannot read the archive: {e}\n"),
+                    )
                 }
-                Err(UpdateError::NotFound(why)) => Reply::text(404, format!("{why}\n")),
-                Err(UpdateError::Refused { current, why }) => Reply::text(
-                    422,
-                    format!(
-                        "update of `{name}` refused; still serving {}:\n{why}\n",
-                        current.as_deref().unwrap_or("nothing")
-                    ),
-                ),
+            };
+            match deploy::unpack(&body, limits) {
+                Ok(files) => updated("deploy", &name, front.deploy(&name, files).await),
+                Err(why) => Reply::text(400, format!("deploy of `{name}` refused: {why}\n")),
             }
         }
         (Method::DELETE, _) if !name.is_empty() && verb.is_empty() => match front.remove(&name) {
@@ -171,7 +179,31 @@ async fn reply(front: &Front, request: Request<Incoming>) -> Reply {
         _ => Reply::text(
             404,
             "cove-host admin: POST /apps/<app>/update, DELETE /apps/<app>, \
-             POST /apps/<app>/enable|disable|reset, GET /apps, GET /changes\n",
+             POST /apps/<app>/deploy|rollback|enable|disable|reset, GET /apps, \
+             GET /changes\n",
+        ),
+    }
+}
+
+/// The answer to an update, a deploy or a rollback.
+fn updated(action: &str, name: &str, result: Result<Installed, UpdateError>) -> Reply {
+    match result {
+        Ok(installed) => {
+            let mut reply = json_reply(&json!({
+                "app": installed.app,
+                "version": installed.version,
+                "previous": installed.previous,
+            }));
+            reply.status = 200;
+            reply
+        }
+        Err(UpdateError::NotFound(why)) => Reply::text(404, format!("{why}\n")),
+        Err(UpdateError::Refused { current, why }) => Reply::text(
+            422,
+            format!(
+                "{action} of `{name}` refused; still serving {}:\n{why}\n",
+                current.as_deref().unwrap_or("nothing")
+            ),
         ),
     }
 }

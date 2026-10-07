@@ -7,9 +7,10 @@
 #
 # Public:  127.0.0.1:8790, which the Cloudflare Tunnel forwards
 #          https://covtools.ramda.io to (deploy/cloudflare.md).
-# Admin:   127.0.0.1:8791 — updates (token in data/admin.token) and the
-#          read-only operations views under /_host/. Never put it in the
-#          tunnel; reach it with `ssh -L 8791:127.0.0.1:8791 whisky`.
+# Admin:   127.0.0.1:8791 — updates and deploys (token in data/admin.token)
+#          and the read-only operations views under /_host/. Never put it in
+#          the tunnel; deploy with `ssh whisky ... cove-host deploy -` (README
+#          "Deploying an app") or reach it with `ssh -L 8791:127.0.0.1:8791 whisky`.
 
 [Unit]
 Description=cove-tools (Cove apps on cove-host)
@@ -53,13 +54,15 @@ MemoryMax=2G
 TasksMax=256
 LimitNOFILE=8192
 
-# Hardening. Everything is read-only but the data directory.
+# Hardening. Everything is read-only but the data directory and the apps
+# directory, which `cove-host deploy` and `rollback` write (the staged and
+# kept copies are inside it, so each switch is a rename within one mount).
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ioijoi/cove-tools/data
+ReadWritePaths=/home/ioijoi/cove-tools/data /home/ioijoi/cove-tools/apps
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

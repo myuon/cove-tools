@@ -4,10 +4,13 @@
 #
 #   deploy/smoke.sh TARBALL
 #
-# It runs install.sh as on the server, takes ExecStart from
+# It runs install.sh as on the server (with the bundled apps; then checks a
+# reinstall leaves an app that is not the release's alone, and refuses to
+# switch while an installed app does not check), takes ExecStart from
 # cove-tools.service with /home/ioijoi moved to the scratch home, starts
 # it, checks the public and admin listeners answer as deployed (apps on
-# 8790, /_host/ only on 8791, Cloudflare Access on), stops it with SIGTERM as
+# 8790, /_host/ only on 8791, Cloudflare Access on), deploys an app onto it
+# from an archive on stdin and rolls it back, stops it with SIGTERM as
 # systemd would, starts it again with Access off to check the token way in,
 # and runs backup.sh. Linux, x86-64; ports 8790 and 8791 free.
 set -euo pipefail
@@ -23,12 +26,39 @@ root="$HOME/cove-tools"
 
 fail() { echo "smoke.sh: $*" >&2; exit 1; }
 
-bash "$here/install.sh" "$tarball"
+bundled="webhooks ledger algo admin"
+bash "$here/install.sh" --with-bundled-apps "$bundled" "$tarball"
 [ -L "$root/current" ] || fail "no current link"
 [ "$(stat -c %a "$root/env")" = 600 ] || fail "env is not mode 0600"
-for app in webhooks ledger algo admin; do
+for app in $bundled; do
   [ -f "$root/apps/$app/app.toml" ] || fail "app $app not installed"
 done
+[ ! -e "$root/apps/hello" ] || fail "a sample app was installed unasked"
+
+# An app that is not the release's, deployed into the apps directory: a
+# release must not remove it, and must refuse to switch while it would not
+# load.
+"$root/current/cove-host" deploy "$root/current/apps/hello" --into "$root/apps" > /dev/null \
+  || fail "cove-host deploy --into refused the hello app"
+bash "$here/install.sh" "$tarball" > /dev/null
+[ -f "$root/apps/hello/hello.cove" ] || fail "a reinstall removed an app that is not the release's"
+for app in $bundled; do
+  [ -f "$root/apps/$app/app.toml" ] || fail "a reinstall without --with-bundled-apps removed $app"
+  [ ! -e "$root/apps/.previous/$app" ] || fail "a reinstall without --with-bundled-apps redeployed $app"
+done
+echo 'fn broken( {' >> "$root/apps/hello/hello.cove"
+ln -sfn releases/before "$root/current"
+if bash "$here/install.sh" "$tarball" > "$scratch/refused.log" 2>&1; then
+  fail "install.sh switched with an installed app that does not check"
+fi
+grep -q 'nothing switched' "$scratch/refused.log" || fail "install.sh did not say why it refused: $(cat "$scratch/refused.log")"
+[ "$(readlink "$root/current")" = releases/before ] || fail "install.sh switched current although an app does not check"
+grep -q 'fn broken' "$root/apps/hello/hello.cove" || fail "install.sh touched the app it refused"
+sed -i '/^fn broken( {$/d' "$root/apps/hello/hello.cove"
+# Redeploying the bundled apps keeps the versions they replace.
+bash "$here/install.sh" --with-bundled-apps "$bundled" "$tarball" > /dev/null
+[ -f "$root/apps/.previous/webhooks/app.toml" ] || fail "a redeploy did not keep the webhook lab's previous version"
+[ -f "$root/apps/hello/hello.cove" ] || fail "a redeploy of the bundled apps removed hello"
 # Installing the same release again is allowed (a reinstall). A secret the
 # env lacks is appended fresh, and the others are left as they were.
 webhooks_before="$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")"
@@ -105,6 +135,21 @@ header -H "$admin_host" http://127.0.0.1:8790/ | grep -qi '^www-authenticate' \
 [ "$(status -X POST --data hi http://127.0.0.1:8790/webhooks/in/0000000000000000)" = 404 ] \
   || fail "a receive URL asked for credentials"
 [ "$(status http://127.0.0.1:8790/admin/)" = 404 ] || fail "the admin app is on the main hostname"
+
+# Deploying onto the running host, as from another repository over ssh: an
+# archive on stdin, checked, written and updated to.
+[ "$(status http://127.0.0.1:8790/hello/)" = 200 ] || fail "the deployed hello app is not served"
+deployed="$(tar -C "$root/current/apps/hello" -c . \
+  | "$root/current/cove-host" deploy - --name hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token")" \
+  || fail "cove-host deploy - failed"
+case "$deployed" in
+  *'"version": "v2-'*) ;;
+  *) fail "cove-host deploy - did not update the running host: $deployed" ;;
+esac
+[ -d "$root/apps/.previous/hello" ] || fail "the deploy kept no previous version"
+"$root/current/cove-host" rollback hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token" > /dev/null \
+  || fail "cove-host rollback failed"
+[ "$(status http://127.0.0.1:8790/hello/)" = 200 ] || fail "hello is not served after the rollback"
 stop_host
 
 # 2. Access off (no team): the apps' tokens are the way in, as before.

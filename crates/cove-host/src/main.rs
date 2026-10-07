@@ -1,11 +1,12 @@
 //! `cove-host`: serve, check and test the Cove apps in a directory.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use cove_host::toolchain;
+use cove_host::{deploy, toolchain};
 use cove_host::{Backend, Forwarding, Host, HostModules, OpsListener, PublicOrigin, ServeOptions};
 
 #[derive(Parser)]
@@ -89,6 +90,32 @@ enum Command {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Send an app's directory to the running host, which checks it with its
+    /// config and env and, only if it loads, writes it to `<apps>/<name>`
+    /// (keeping the version it replaces for `rollback`) and updates to it.
+    /// Packs `app.toml` and the `.cove` files only; refuses symbolic links.
+    Deploy {
+        /// The app's directory, or `-` for a tar archive of it on stdin
+        /// (`tar -C <dir> -c . | cove-host deploy - --name <app>`).
+        source: PathBuf,
+        /// The app's name; the directory's name by default.
+        #[arg(long)]
+        name: Option<String>,
+        /// Write into this apps directory instead, with no running host,
+        /// checking as `cove-host check` does; the host loads it at its next
+        /// start (or `cove-host update`). What `deploy/install.sh` uses.
+        #[arg(long, value_name = "APPS")]
+        into: Option<PathBuf>,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Put back the version of an app its last deploy replaced, through the
+    /// same update (a second rollback undoes the first).
+    Rollback {
+        app: String,
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
     /// Stop routing to an app on the running host.
     Remove {
         app: String,
@@ -148,6 +175,16 @@ struct AdminArgs {
 
 /// Sends one admin request; prints the answer; fails unless it was a 2xx.
 fn admin(args: &AdminArgs, method: reqwest::Method, path: &str) -> ExitCode {
+    admin_with(args, method, path, None)
+}
+
+/// [`admin`], with a body.
+fn admin_with(
+    args: &AdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> ExitCode {
     let token = match std::fs::read_to_string(&args.token_file) {
         Ok(token) => token.trim().to_string(),
         Err(e) => {
@@ -170,12 +207,16 @@ fn admin(args: &AdminArgs, method: reqwest::Method, path: &str) -> ExitCode {
         }
     };
     let answer = runtime.block_on(async {
-        let response = reqwest::Client::new()
+        let mut request = reqwest::Client::new()
             .request(method, &url)
             .bearer_auth(token)
-            .timeout(Duration::from_secs(600))
-            .send()
-            .await?;
+            .timeout(Duration::from_secs(600));
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/x-tar")
+                .body(body);
+        }
+        let response = request.send().await?;
         let status = response.status();
         Ok::<_, reqwest::Error>((status, response.text().await?))
     });
@@ -254,6 +295,17 @@ fn main() -> ExitCode {
         Command::Update { app, admin: args } => {
             admin(&args, reqwest::Method::POST, &format!("/apps/{app}/update"))
         }
+        Command::Deploy {
+            source,
+            name,
+            into,
+            admin: args,
+        } => deploy_command(&source, name, into.as_deref(), &args),
+        Command::Rollback { app, admin: args } => admin(
+            &args,
+            reqwest::Method::POST,
+            &format!("/apps/{app}/rollback"),
+        ),
         Command::Remove { app, admin: args } => {
             admin(&args, reqwest::Method::DELETE, &format!("/apps/{app}"))
         }
@@ -300,4 +352,89 @@ fn finish(report: Result<toolchain::Report, String>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `cove-host deploy`: packs the app (or reads it from stdin), then sends it
+/// to the running host or, with `--into`, writes it into an apps directory.
+fn deploy_command(
+    source: &Path,
+    name: Option<String>,
+    into: Option<&Path>,
+    args: &AdminArgs,
+) -> ExitCode {
+    let limits = deploy::Limits::standard();
+    let from_stdin = source == Path::new("-");
+    let files = if from_stdin {
+        let mut archive = Vec::new();
+        let read = std::io::stdin()
+            .lock()
+            .take(limits.max_archive_bytes() + 1)
+            .read_to_end(&mut archive);
+        if let Err(e) = read {
+            eprintln!("cove-host: cannot read the archive from stdin: {e}");
+            return ExitCode::FAILURE;
+        }
+        deploy::unpack(&archive, limits)
+    } else {
+        deploy::collect(source, limits)
+    };
+    let files = match files {
+        Ok(files) => files,
+        Err(why) => {
+            eprintln!("cove-host: deploy refused: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let name = match name {
+        Some(name) => name,
+        None if from_stdin => {
+            eprintln!("cove-host: `deploy -` needs `--name <app>`");
+            return ExitCode::FAILURE;
+        }
+        None => match std::fs::canonicalize(source)
+            .ok()
+            .and_then(|dir| Some(dir.file_name()?.to_str()?.to_string()))
+        {
+            Some(name) => name,
+            None => {
+                eprintln!(
+                    "cove-host: cannot name the app from `{}`; pass --name",
+                    source.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if !files.skipped.is_empty() {
+        eprintln!(
+            "cove-host: not part of the app, left out: {}",
+            files.skipped.join(", ")
+        );
+    }
+    eprintln!(
+        "cove-host: deploying `{name}`: {} file(s), {} bytes",
+        files.files.len(),
+        files.bytes()
+    );
+    if let Some(apps) = into {
+        return finish(deploy::deploy_into(
+            apps,
+            &name,
+            &files,
+            &HostModules::standard(),
+        ));
+    }
+    let archive = match deploy::pack(&files) {
+        Ok(archive) => archive,
+        Err(why) => {
+            eprintln!("cove-host: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    admin_with(
+        args,
+        reqwest::Method::POST,
+        &format!("/apps/{name}/deploy"),
+        Some(archive),
+    )
 }

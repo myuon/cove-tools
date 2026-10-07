@@ -406,7 +406,7 @@ fn content_hash(dir: &Path) -> u64 {
 
 /// An app's name is its route and its main module's name, so it has to be
 /// both: a Cove identifier, and not one of the host's reserved prefixes.
-fn valid_name(name: &str) -> Result<(), String> {
+pub(crate) fn valid_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
     if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
