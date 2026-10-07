@@ -1,4 +1,5 @@
 use text
+use web
 
 fn capabilities() -> Array<String> {
   Vector.of("admin", "auth", "kv", "log").freeze()
@@ -43,5 +44,35 @@ test fn escapesWhatItShows() -> Result<Unit, Error> {
   assertEqual(h("<script>alert('x')</script>"), "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;")?
   assert(badge("<b>").contains("&lt;b&gt;"))?
   assert(!problemsNotice(Vector.of("<img src=x>").freeze()).contains("<img"))?
+  Ok(())
+}
+
+fn req(headers: Map<String, String>) -> web.Request {
+  web.Request(method: "POST", path: "/", query: Map.of(), headers: headers, body: "")
+}
+
+fn withHost(extra: Array<MapEntry<String, String>>) -> web.Request {
+  var headers = Map.of(MapEntry(key: "host", value: "app.example"))
+  for entry in extra {
+    headers = headers.inserted(entry.key, entry.value)
+  }
+  req(headers)
+}
+
+test fn sameOriginTrustsSecFetchSiteAlone() -> Result<Unit, Error> {
+  // A form posted from a `no-referrer` page: the browser says `Origin: null`.
+  assertEqual(sameOrigin(withHost([MapEntry(key: "sec-fetch-site", value: "same-origin"), MapEntry(key: "origin", value: "null")])), true)?
+  assertEqual(sameOrigin(withHost([MapEntry(key: "sec-fetch-site", value: "none")])), true)?
+  // A matching Origin does not rescue a cross-site request.
+  assertEqual(sameOrigin(withHost([MapEntry(key: "sec-fetch-site", value: "cross-site"), MapEntry(key: "origin", value: "http://app.example")])), false)?
+  assertEqual(sameOrigin(withHost([MapEntry(key: "sec-fetch-site", value: "same-site")])), false)?
+  Ok(())
+}
+
+test fn sameOriginFallsBackToOrigin() -> Result<Unit, Error> {
+  assertEqual(sameOrigin(withHost([MapEntry(key: "origin", value: "null")])), false)?
+  assertEqual(sameOrigin(withHost([MapEntry(key: "origin", value: "http://app.example")])), true)?
+  assertEqual(sameOrigin(withHost([MapEntry(key: "origin", value: "http://evil.example")])), false)?
+  assertEqual(sameOrigin(withHost([])), true)?
   Ok(())
 }

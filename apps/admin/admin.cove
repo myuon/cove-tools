@@ -183,25 +183,26 @@ fn base(request: web.Request) -> String {
 }
 
 /// Whether a request that changes something came from these pages: a
-/// browser says where a form was submitted from (`Sec-Fetch-Site`,
-/// `Origin`), and a form on another site must not be able to use the
-/// browser's stored login. A client that says neither — curl — is not a
-/// browser, and holds the secret itself.
+/// browser says where a form was submitted from, and a form on another site
+/// must not be able to use the browser's stored login. `Sec-Fetch-Site`
+/// decides alone when it is present — a browser sets it and a page cannot
+/// forge it, and it stays `same-origin` where `Origin` is serialized as
+/// `null` (a form posted from a page with `Referrer-Policy: no-referrer`).
+/// Only a browser without it falls back to `Origin`, and a `null` one is
+/// refused there. A client that says neither — curl — is not a browser, and
+/// holds the secret itself.
 fn sameOrigin(request: web.Request) -> Bool {
   match request.headers.get("sec-fetch-site") {
-    Some(site) => {
-      if site != "same-origin" && site != "none" {
-        return false
+    Some(site) => site == "same-origin" || site == "none"
+    None => {
+      match request.headers.get("origin") {
+        Some(from) => {
+          let scheme = request.headers.get("x-forwarded-proto").unwrapOr("http")
+          from == "{scheme}://{request.headers.get("host").unwrapOr("")}"
+        }
+        None => true
       }
     }
-    None => {}
-  }
-  match request.headers.get("origin") {
-    Some(from) => {
-      let scheme = request.headers.get("x-forwarded-proto").unwrapOr("http")
-      from == "{scheme}://{request.headers.get("host").unwrapOr("")}"
-    }
-    None => true
   }
 }
 
