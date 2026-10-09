@@ -1,4 +1,4 @@
-# Cloudflare: the tunnel and Access in front of cove-tools
+# Cloudflare: the tunnel and Access in front of minicloud
 
 The host listens on `127.0.0.1:8790` only (`deploy/cove-tools.service`). The
 public way in is the machine's existing **remotely-managed** Cloudflare
@@ -7,9 +7,9 @@ are edited in the dashboard, not in a file on the machine), and **Cloudflare
 Access** sits in front of every path but the few that callers outside need.
 
 ```
-browser ──https──▶ Cloudflare edge ──(Access: owner's login, or a bypass)──▶ tunnel ──▶ cloudflared ──http──▶ 127.0.0.1:8790 (cove-host, public)
+browser ──https──▶ Cloudflare edge ──(Access: owner's login, or a bypass)──▶ tunnel ──▶ cloudflared ──http──▶ 127.0.0.1:8790 (minicloud, public)
   covtools.ramda.io, covtools-admin.ramda.io: one tunnel, one port; the host routes by Host header
-                                                                                          127.0.0.1:8791 (cove-host, admin) ◀── ssh -L only
+                                                                                          127.0.0.1:8791 (minicloud, admin) ◀── ssh -L only
 ```
 
 ## 1. The public hostname
@@ -216,7 +216,7 @@ app itself), the changes it made are in `~/cove-tools/data/_host/overrides.json`
 (history in `changes.jsonl`). On the machine:
 
 ```console
-$ ~/cove-tools/current/cove-host enable|disable|reset <app> \
+$ ~/cove-tools/current/minicloud enable|disable|reset <app> \
     --token-file ~/cove-tools/data/admin.token --admin 127.0.0.1:8791
 ```
 
@@ -299,7 +299,7 @@ Access login at the edge.
 
 A script cannot use these pages through Access without an Access service
 token, and a service token carries no email, so it is not an identity here:
-use the admin listener (`cove-host enable|disable|reset`) from the machine.
+use the admin listener (`minicloud enable|disable|reset`) from the machine.
 
 ## Later, not now
 

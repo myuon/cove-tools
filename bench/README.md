@@ -1,9 +1,9 @@
 # The performance check
 
-Is cove-host slower than the server it grew out of? The Cove repository's
+Is minicloud slower than the server it grew out of? The Cove repository's
 `examples/edge` was measured against the same service in Go
 (`examples/edge/compare/README.md`, cove #589 for the VM and #593 for the
-native tier). This directory runs the same kinds of load against cove-host,
+native tier). This directory runs the same kinds of load against minicloud,
 on the same machine, so that a regression in the host's HTTP front, its
 scheduler or its isolates shows up as a number.
 
@@ -24,7 +24,7 @@ something already answers on the port.
 
 ## Method
 
-`cove-host-load` follows `cove-edge-load --from-intended`:
+`minicloud-load` follows `cove-edge-load --from-intended`:
 
 - **Open loop** (`--rate N`): request *i* is due *i* / N seconds into the
   run and its latency counts **from when it was due**, so a server that
@@ -57,7 +57,7 @@ The raw output is `results/perf-2026-10-05.txt` and
 
 ### Capacity (closed loop)
 
-| scenario | in flight | cove-host req/s | p50 / p99 ms | edge, same in flight | Go |
+| scenario | in flight | minicloud req/s | p50 / p99 ms | edge, same in flight | Go |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `hello` | 64 | **110,671** (106,675–113,331) | 0.6 / 1.0 | 84,235 (VM) | 122,725 |
 | `hello` | 256 | **105,641** (101,666–106,841) | 2.3 / 4.6 | 119,242 (VM) | 163,543 |
@@ -92,22 +92,22 @@ Every request in every run was answered 200; none failed.
 ## What it says
 
 - **No regression against the edge server.** Everywhere the two were
-  measured on the native tier, cove-host is at or above edge: `crunch`
+  measured on the native tier, minicloud is at or above edge: `crunch`
   capacity 4,809 against 2,783 req/s, and the mix's 1,831 against 1,044.
   Most of that is not the host. The edge rows predate cove #596 (the native
   tier divides in 32 bits), which this host's Cove revision has, and
   `crunch`'s run is about half as long. So the two are not comparable as a
   host-against-host measure; what they do show is that nothing in
-  cove-host's queueing, slicing or HTTP front eats the faster code.
+  minicloud's queueing, slicing or HTTP front eats the faster code.
 - **`hello` is near Go's capacity at 64 in flight (0.90×) and further
   below it at 256 (0.65×)**, and edge's own server was at 1.46× and 1.37×
   below Go. hyper on tokio is not the edge sample's hand-written HTTP/1.1,
   and the generators are not the same program, so the per-request cost is
   the honest comparison to make next (edge's profile put 29 µs of its 41 µs
-  per `hello` in its host). At 256 in flight cove-host's capacity *falls*
+  per `hello` in its host). At 256 in flight minicloud's capacity *falls*
   (106k against 111k at 64), which the edge server's did not; a profile of
   the hand-off between tokio and the workers is where to look.
-- **Slicing works through cove-host's scheduler.** `hello`'s p99 inside the
+- **Slicing works through minicloud's scheduler.** `hello`'s p99 inside the
   mix is 2.3–3.0 ms from 330 to 1,434 req/s (78% of the mix's capacity),
   within the generator's floor of `hello` alone (2.6 ms at 25,000 req/s).
   Below saturation the faster `crunch` (7 ms a request) rarely holds all four
@@ -128,7 +128,7 @@ CI does not run this: a shared runner's numbers say nothing.
 
 `bench/algo.sh` measures `hello`'s latency (open loop, 500 req/s) while K
 clients keep the algorithm playground's heavy matching run in flight
-(`cove-host-load --mix algo`, closed loop), four workers, for K = 0, 4, 8, on
+(`minicloud-load --mix algo`, closed loop), four workers, for K = 0, 4, 8, on
 one backend; it prints the `algo` app's yield counters after each. Results
 and the native-tier finding they led to are in
 [`examples/algo/README.md`](../examples/algo/README.md#responsiveness):

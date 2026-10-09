@@ -1,10 +1,12 @@
-# cove-tools
+# minicloud
 
 A small platform for web apps written in [Cove](https://github.com/myuon/cove)
 on one machine: the host that runs them, its admin app, and its deployment.
-Apps are deployed onto it from wherever they live.
+Apps are deployed onto it from wherever they live. It was called cove-tools
+until 0.5.0 (issue #43), and its binary `cove-host`; see [Names kept from
+cove-tools](#names-kept-from-cove-tools).
 
-- **`crates/cove-host`** — the host: loads `<apps>/<name>/`, checks, prepares
+- **`crates/minicloud`** — the host: loads `<apps>/<name>/`, checks, prepares
   and compiles each app once, and runs every request in its own Cove isolate
   on a shared worker pool (issue #1); it updates, deploys and rolls back apps
   on the running host, keeps their secrets, routes by hostname and verifies
@@ -25,7 +27,7 @@ the runtime needs goes to [myuon/cove](https://github.com/myuon/cove) first.
 ## Examples
 
 [`examples/`](examples) holds apps written for the host. They are not
-bundled into a release: each is deployed with `cove-host deploy` as an app
+bundled into a release: each is deployed with `minicloud deploy` as an app
 from any other repository is ([myuon/ai-daily](https://github.com/myuon/ai-daily)
 is one). They live in this repository rather than in Cove's `examples/`
 because they are checked against the host's modules — `web`, `kv`, `fetch`,
@@ -44,7 +46,7 @@ the admin token never leaves the server:
 
 ```console
 $ tar -C examples/algo -c . | ssh whisky \
-    '~/cove-tools/current/cove-host deploy - --name algo --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+    '~/cove-tools/current/minicloud deploy - --name algo --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
 ```
 
 An example that takes a secret needs it on the host first: the webhook lab's
@@ -52,15 +54,15 @@ An example that takes a secret needs it on the host first: the webhook lab's
 `~/cove-tools/env` (`install.sh` writes them from
 [`deploy/env.example`](deploy/env.example)), and the webhook lab's
 `[access]` reads the Cloudflare Access settings from there too. A deploy
-that cannot resolve one is refused and says which. `cove-host rollback
+that cannot resolve one is refused and says which. `minicloud rollback
 <app>` puts the previous version back.
 
 ## Building and running
 
 ```console
 $ cargo build --profile checked
-$ ./target/checked/cove-host serve --apps examples
-cove-host: loading apps from examples
+$ ./target/checked/minicloud serve --apps examples
+minicloud: loading apps from examples
   crunch     v1-397ddca0  requires [-]  granted [-]  ok: 227 fn on native, checked in 19.3 ms, prepared in 1.9 ms
   hello      v1-05b655c0  requires [-]  granted [-]  ok: 234 fn on native, checked in 11.6 ms, prepared in 2.4 ms
   notes      v1-cf6980a0  requires [kv, log]  granted [kv, log]  ok: 226 fn on native, checked in 3.7 ms, prepared in 2.5 ms
@@ -69,7 +71,7 @@ cove-host: loading apps from examples
 
 listening on http://127.0.0.1:8080 — 16 worker thread(s), a run yields after 2.0 ms while others wait, a fresh isolate per request, apps served round robin
   stats: curl -s http://127.0.0.1:8080/_host/stats   ops page: http://127.0.0.1:8080/_host/ui
-  admin: http://127.0.0.1:8081 (token in data/admin.token); update with `cove-host update <app>`
+  admin: http://127.0.0.1:8081 (token in data/admin.token); update with `minicloud update <app>`
 ```
 
 (`--profile checked` is release with debug assertions and overflow checks
@@ -87,7 +89,7 @@ lines on stdout), `--admin ADDR` (the admin listener for updates, default
 listener serves `/_host/`; default `public`), `--public-origin URL` and
 `--trust-proxy` (what apps are told of the client's scheme and host, behind
 a reverse proxy), and `--shutdown-grace SECONDS` (default 10). Those last
-four are for [deploying](#deploying). `cove-host --version` names the Cove
+four are for [deploying](#deploying). `minicloud --version` names the Cove
 commit the binary was built against.
 
 ### Trying the examples
@@ -235,20 +237,20 @@ rebinding its own name to 127.0.0.1. Reach them over SSH:
 any app would be refused:
 
 ```console
-$ ./target/checked/cove-host check --apps examples
+$ ./target/checked/minicloud check --apps examples
 crunch     requires [-]  granted [-]  ok
 hello      requires [-]  granted [-]  ok
 slow       requires [log, timer]  granted [log, timer]  ok
 checked 3 app(s) against the host's schemas (web, log, timer); 0 warning(s), 0 refused
-$ ./target/checked/cove-host check --apps crates/cove-host/tests/apps
-error[cove_host::spawn]: `spawner.handle` can spawn a task, which cove-host does not run
+$ ./target/checked/minicloud check --apps crates/minicloud/tests/apps
+error[minicloud::spawn]: `spawner.handle` can spawn a task, which minicloud does not run
  --> spawner/spawner.cove:6:19
   |
 6 |     let doubled = tasks.spawn { 21 * 2 }
   |                   ^^^^^^^^^^^^^^^^^^^^^^
-  rule: A spawned task runs outside the host's worker pool and keeps its parent from parking or yielding; cove-host refuses an app that can spawn.
+  rule: A spawned task runs outside the host's worker pool and keeps its parent from parking or yielding; minicloud refuses an app that can spawn.
 greedy     requires [log]  granted [-]  REFUSED: `greedy.handle` requires `log`, which app.toml does not grant
-spawner    requires [-]  granted [-]  REFUSED: `spawner.handle` can spawn a task, which cove-host does not run
+spawner    requires [-]  granted [-]  REFUSED: `spawner.handle` can spawn a task, which minicloud does not run
 checked 2 app(s) against the host's schemas (web, log, timer); 0 warning(s), 2 refused
 $ echo $?
 1
@@ -261,7 +263,7 @@ and the host's modules. A lowering that refuses an entry, in `check`, at load
 or for a test, is printed with each refusal's location:
 
 ```console
-$ ./target/checked/cove-host test --apps examples
+$ ./target/checked/minicloud test --apps examples
 ok    crunch     crunch.aSizeOutOfRangeIsRefused
 ok    crunch     crunch.countsThePrimesUpToN
 ok    hello      hello.answersABodyOfTheSizeAsked
@@ -270,7 +272,7 @@ ok    hello      hello.greetsWhoeverTheQueryNames
 ran 5 test(s), 5 passed
 ```
 
-Both take app names to narrow them (`cove-host check hello`), and `test`
+Both take app names to narrow them (`minicloud check --apps examples hello`), and `test`
 takes `--filter`.
 
 **Secrets.** Neither runs with a host, so a secret taken from the host's
@@ -281,11 +283,11 @@ is looked up in the store of the data directory `--data` names
 `test` does not: a secret only gates `auth.check` and a `[fetch.headers]`
 header, which a test should not reach for real, so a secret it cannot
 resolve — store, environment variable or file — is given the value
-`cove-host-test-placeholder-<name>`, and the run says which on stderr:
+`minicloud-test-placeholder-<name>`, and the run says which on stderr:
 
 ```console
-$ ./target/checked/cove-host test --apps crates/cove-host/tests/apps keyed
-note: `keyed` runs its tests with a placeholder for secret(s) `key`: not set here (see `cove-host test --help`)
+$ ./target/checked/minicloud test --apps crates/minicloud/tests/apps keyed
+note: `keyed` runs its tests with a placeholder for secret(s) `key`: not set here (see `minicloud test --help`)
 ok    keyed      keyed.aWrongTokenIsNotTheSecret
 ran 1 test(s), 1 passed
 ```
@@ -294,7 +296,7 @@ ran 1 test(s), 1 passed
 
 ```console
 $ $EDITOR examples/hello/hello.cove                 # Hello → Hi
-$ ./target/checked/cove-host update hello
+$ ./target/checked/minicloud update hello
 {
   "app": "hello",
   "previous": "v1-05b655c0",
@@ -304,8 +306,8 @@ $ curl -si http://127.0.0.1:8080/hello/ | grep -i -e x-cove -e hi
 x-cove-app-version: v2-11744df1
 Hi, world! (GET /)
 $ echo 'fn broken( {' >> examples/hello/hello.cove
-$ ./target/checked/cove-host update hello; echo "exit $?"
-cove-host: 422 Unprocessable Entity
+$ ./target/checked/minicloud update hello; echo "exit $?"
+minicloud: 422 Unprocessable Entity
 update of `hello` refused; still serving v2-11744df1:
 does not parse:
 error[cove::parse::unexpected_token]: expected identifier, found `{`
@@ -319,7 +321,7 @@ $ curl -s http://127.0.0.1:8080/hello/
 Hi, world! (GET /)
 ```
 
-`cove-host update <app>` asks the running host to load `<apps>/<app>` again.
+`minicloud update <app>` asks the running host to load `<apps>/<app>` again.
 The new version is parsed, checked, admitted (capabilities, `spawn`, config),
 lowered, prepared and compiled on a blocking thread — not on a worker, not on
 the I/O runtime — while the current version keeps serving. **Only if all of
@@ -343,7 +345,7 @@ current version stays and the command prints the diagnostics and exits 1
   version: they carry over. During an update both versions share the one
   store (and its quota accounting); the new version's quotas apply from the
   switch.
-- A name the host does not serve yet is **added** by `update`; `cove-host
+- A name the host does not serve yet is **added** by `update`; `minicloud
   remove <app>` stops routing to an app (in-flight requests finish; its data
   stays, and `update` brings it back as its next version).
 - One update runs at a time.
@@ -354,7 +356,7 @@ forwards the public port cannot reach them, and the admin port can stay on
 localhost whatever the public one is. Every admin request needs
 `Authorization: Bearer <token>`; the host writes a random 256-bit token to
 `<data>/admin.token` (mode 0600) the first time it starts without one, and
-`cove-host update` / `remove` read it from there (`--token-file`, `--admin`
+`minicloud update` / `remove` read it from there (`--token-file`, `--admin`
 to point them elsewhere). Anything without the token is 401 and changes
 nothing. The endpoints are `POST /apps/<app>/update`,
 `POST /apps/<app>/deploy` and `/rollback` (see [Deploying an
@@ -372,29 +374,29 @@ silent non-event.
 `update` reloads a directory that is already in the host's apps directory.
 An app that lives somewhere else — its own repository, like
 [myuon/ai-daily](https://github.com/myuon/ai-daily)'s `apps/aidaily` — is
-**deployed**: `cove-host deploy` packs it and sends it to the admin listener,
+**deployed**: `minicloud deploy` packs it and sends it to the admin listener,
 which checks it and only then writes it into the apps directory and updates
 to it.
 
 ```console
-$ ./target/checked/cove-host deploy ../elsewhere/hello     # with a README.md beside it
-cove-host: not part of the app, left out: README.md
-cove-host: deploying `hello`: 3 file(s), 2430 bytes
+$ ./target/checked/minicloud deploy ../elsewhere/hello     # with a README.md beside it
+minicloud: not part of the app, left out: README.md
+minicloud: deploying `hello`: 3 file(s), 2430 bytes
 {
   "app": "hello",
   "previous": null,
   "version": "v1-05b655c0"
 }
 $ sed -i 's/Hello,/Hi,/' ../elsewhere/hello/hello.cove
-$ ./target/checked/cove-host deploy ../elsewhere/hello 2>/dev/null | grep version
+$ ./target/checked/minicloud deploy ../elsewhere/hello 2>/dev/null | grep version
   "version": "v2-11744df1"
-$ ./target/checked/cove-host rollback hello | grep version
+$ ./target/checked/minicloud rollback hello | grep version
   "version": "v3-05b655c0"
 $ echo 'fn broken( {' >> ../elsewhere/hello/hello.cove
-$ ./target/checked/cove-host deploy ../elsewhere/hello; echo "exit $?"
-cove-host: not part of the app, left out: README.md
-cove-host: deploying `hello`: 3 file(s), 2440 bytes
-cove-host: 422 Unprocessable Entity
+$ ./target/checked/minicloud deploy ../elsewhere/hello; echo "exit $?"
+minicloud: not part of the app, left out: README.md
+minicloud: deploying `hello`: 3 file(s), 2440 bytes
+minicloud: 422 Unprocessable Entity
 deploy of `hello` refused; still serving v3-05b655c0:
 does not parse:
 error[cove::parse::unexpected_token]: expected identifier, found `{`
@@ -419,7 +421,7 @@ exit 1
   written, the current version keeps serving, and the diagnostics are
   printed (exit 1). An app that needs a secret the host does not have is
   refused here, saying which: set it first — in the admin app's Secrets
-  page or with `cove-host secret set` for a `{ store = ... }` secret
+  page or with `minicloud secret set` for a `{ store = ... }` secret
   ([Secrets set at run time](#secrets-set-at-run-time)), or in
   `~/cove-tools/env` and a restart for an `{ env = ... }` one. A `[secrets]`
   value `{ file = ... }` is not sent: keep secrets in the store or the env.
@@ -427,7 +429,7 @@ exit 1
   `<apps>/<app>` is moved to `<apps>/.previous/<app>` (replacing the one kept
   there), the new copy is renamed into place, and the host updates to it:
   requests in flight finish on the old version, as with `update`.
-- `cove-host rollback <app>` swaps `<apps>/<app>` with the kept copy — after
+- `minicloud rollback <app>` swaps `<apps>/<app>` with the kept copy — after
   loading it, so a kept version that no longer checks is refused and nothing
   moves — and updates to it. A second rollback undoes the first.
 - Both are admin requests (`POST /apps/<app>/deploy` with the archive as the
@@ -435,24 +437,24 @@ exit 1
   both go in the change history.
 
 **To whisky, over ssh.** The admin listener stays on the server's
-localhost; the archive goes over ssh's stdin to the `cove-host` installed
+localhost; the archive goes over ssh's stdin to the `minicloud` installed
 there, which sends it to the listener with the token it can read. No tunnel,
 no token on the laptop:
 
 ```console
 $ tar -C apps/aidaily -c . | ssh whisky \
-    '~/cove-tools/current/cove-host deploy - --name aidaily --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
-$ ssh whisky '~/cove-tools/current/cove-host rollback aidaily --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+    '~/cove-tools/current/minicloud deploy - --name aidaily --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+$ ssh whisky '~/cove-tools/current/minicloud rollback aidaily --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
 ```
 
 `deploy -` reads a tar archive (any `tar`'s, macOS's included: its `._`
 files are hidden and skipped) and needs `--name`. With a tunnel
 (`ssh -L 8791:127.0.0.1:8791 whisky`) and a copy of the token,
-`cove-host deploy apps/aidaily --admin 127.0.0.1:8791 --token-file <copy>`
+`minicloud deploy apps/aidaily --admin 127.0.0.1:8791 --token-file <copy>`
 works from the laptop too.
 
-`cove-host deploy <dir> --into <apps>` does the same with no running host,
-checking as `cove-host check` does with the current environment (and, with
+`minicloud deploy <dir> --into <apps>` does the same with no running host,
+checking as `minicloud check` does with the current environment (and, with
 `--data <data>`, that data directory's secret store); the host loads it at
 its next start. `deploy/install.sh` installs the bundled admin app this way, and
 checks every installed app with `--data` before it switches.
@@ -465,7 +467,7 @@ limits — by one app, the admin app (`apps/admin`, issue #17), through a host
 module of its own, and on the machine through the admin listener. No other
 app can: the capability is `admin`, and **only the app named `admin` may be
 granted it**. An `app.toml` of any other app that grants it — or a change
-that would — refuses that app at load, and `cove-host check` says so. The
+that would — refuses that app at load, and `minicloud check` says so. The
 grant is a line in the startup banner and in `/_host/stats` like every other
 (`admin  requires [admin, auth, …]  granted [admin, auth, …]`): the one app
 that can change the others is visible as such.
@@ -492,7 +494,7 @@ is reloaded on a blocking thread, as an update is), so they hold no worker.
 before a program runs, so there is nothing to take away from a run in
 progress: a change loads the app again with the change applied — parsed,
 checked, admitted, lowered, prepared, compiled — and routes to that version
-the way `cove-host update` does. Requests already admitted finish on the
+the way `minicloud update` does. Requests already admitted finish on the
 version they were admitted to.
 
 | the reload | the change | the app |
@@ -517,9 +519,9 @@ make any change that would leave it refused** — those are refused, through
 it. The admin listener can do all three, which is the point of it:
 
 ```console
-$ ./target/checked/cove-host disable notes    # or enable, reset
+$ ./target/checked/minicloud disable notes    # or enable, reset
 `notes` disabled: not routed to; in-flight requests finish
-$ ./target/checked/cove-host reset admin      # drop the admin's changes to the admin app
+$ ./target/checked/minicloud reset admin      # drop the admin's changes to the admin app
 ```
 
 **Where the changes are kept.** Not in `app.toml`: a deploy replaces an
@@ -549,7 +551,7 @@ touches:
 An API key used to mean ssh, an edit of `~/cove-tools/env` and a restart.
 A secret can instead live in the host's **secret store** and be set,
 replaced and deleted on the running host — from the admin app's Secrets
-page, the admin listener, or `cove-host secret`. An `app.toml` takes a
+page, the admin listener, or `minicloud secret`. An `app.toml` takes a
 secret from it with `store`, beside `env`, `file` and `value`:
 
 ```toml
@@ -573,13 +575,13 @@ x-goog-api-key = { secret = "gemini" }
 - **A secret that is not set refuses the app** that takes it, at load, with
   the usual diagnostic naming it — `secret `gemini`: the host's secret
   store has no `gemini` (set it on the admin app's Secrets page, or with
-  `cove-host secret set gemini`)` — which is the reason the admin app shows
+  `minicloud secret set gemini`)` — which is the reason the admin app shows
   for the app, and the Secrets page lists the name as unset and used by it.
   A name is a letter or digit, then letters, digits, `_`, `-` or `.`, at
   most 64; a value is not empty and at most 16 KiB.
 - **Setting or replacing one reloads every app that uses it** — those
   routed to whose `app.toml` names it in a `store` — through the same
-  versioned update as `cove-host update`: requests in flight finish on the
+  versioned update as `minicloud update`: requests in flight finish on the
   old value, the new version has the new one. The answer says what each
   reload came to. **The value is stored first and kept whatever the reloads
   do**: an app that does not load (its code broken on disk, say) keeps
@@ -598,19 +600,19 @@ x-goog-api-key = { secret = "gemini" }
 | --- | --- | --- | --- |
 | the admin app (`/secrets`) | the table | the row's password field, or *Set a secret* | the row's *Delete*, with *confirm* ticked (and *force* for one in use) |
 | the admin listener | `GET /secrets` | `PUT /secrets/<name>`, the value as the body | `DELETE /secrets/<name>[?force=1]` |
-| `cove-host secret` | `list` | `set <name>`, the value on stdin | `delete <name> [--force]` |
+| `minicloud secret` | `list` | `set <name>`, the value on stdin | `delete <name> [--force]` |
 
 The admin app's forms are POSTs under its usual protections: an identity
 (`auth.identity`: Cloudflare Access, or its token where Access is off), and
 a POST from another site refused (`Sec-Fetch-Site`, `Origin`). There is no
 script on its pages, so the confirmation is a required checkbox, checked
-again by the app. `cove-host secret` takes `deploy`'s `--admin` and
+again by the app. `minicloud secret` takes `deploy`'s `--admin` and
 `--token-file`; `set` reads one line without echo from a terminal, or all of
 stdin otherwise, dropping one trailing newline:
 
 ```console
-$ ssh whisky '~/cove-tools/current/cove-host secret list --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
-$ ssh -t whisky '~/cove-tools/current/cove-host secret set gemini --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+$ ssh whisky '~/cove-tools/current/minicloud secret list --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+$ ssh -t whisky '~/cove-tools/current/minicloud secret set gemini --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
 value for secret `gemini` (not echoed):
 ```
 
@@ -647,25 +649,26 @@ Access in front:
 
 | file | what |
 | --- | --- |
-| [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code; writable: `data/`, and `apps/` for `cove-host deploy`) |
+| [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code; writable: `data/`, and `apps/` for `minicloud deploy`) |
 | [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`, `ADMIN_UI_TOKEN`) and the Cloudflare Access settings (`ACCESS_TEAM_DOMAIN`, `COVTOOLS_ACCESS_AUD`, `COVTOOLS_ADMIN_ACCESS_AUD`, `ACCESS_ALLOWED_EMAILS`), as `~/cove-tools/env`; `install.sh` appends a key a release adds — a secret fresh, a setting as written there — and leaves the others |
 | [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks every app installed in `~/cove-tools/apps` with the new binary (and refuses to switch if one would be refused), deploys the bundled admin app (`--with-bundled-apps "admin"`, the default; `""` for none), points `~/cove-tools/current` at it, and prints the one `sudo` command. It never removes or replaces any other app |
 | [`deploy/backup.sh`](deploy/backup.sh) | SQLite online backups of every app's `kv.sqlite3`, kept 14 days; a user crontab line is in the file |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | the tunnel's public hostname and the Access applications, with the paths left open to outside callers |
 
 A release is a tag: pushing `v<version>` (the workspace's version) runs
-[`release.yml`](.github/workflows/release.yml), which builds `cove-host` on
+[`release.yml`](.github/workflows/release.yml), which builds `minicloud` on
 Ubuntu 24.04 with the native tier, and publishes
-`cove-host-<version>-x86_64-linux.tar.gz` (the binary, `apps/admin`,
-`deploy/`, this README — not `examples/`), its `.sha256`, and `install.sh`. CI installs the same tarball
+`minicloud-<version>-x86_64-linux.tar.gz` (the binary, `apps/admin`,
+`deploy/`, this README — not `examples/` — and a `cove-host` symbolic link to
+the binary), its `.sha256`, and `install.sh`. CI installs the same tarball
 into a scratch home and runs the unit's own command line against it
 (`deploy/smoke.sh`).
 
 On the server, as the service's user:
 
 ```console
-$ curl -fsSLO https://github.com/myuon/cove-tools/releases/download/v0.4.0/install.sh
-$ bash install.sh --with-bundled-apps admin v0.4.0
+$ curl -fsSLO https://github.com/myuon/minicloud/releases/download/v0.5.0/install.sh
+$ bash install.sh --with-bundled-apps admin v0.5.0
 ...
 first time: install the unit and start the service (needs sudo, once):
 
@@ -680,14 +683,14 @@ app](#deploying-an-app)). An upgrade is `bash install.sh v<new>`, then
 `sudo systemctl restart cove-tools` (the script says which, and when the
 unit changed). Before it switches, it checks every installed app with the
 new binary against `~/cove-tools/env`, and if one would be refused it stops
-and switches nothing (`cove-host check --deployed`: a key an installed
+and switches nothing (`minicloud check --deployed`: a key an installed
 `app.toml` may no longer say, such as `limits.fuel`, is a warning there, as it
 is when the host starts — see
 [Migrating from fuel](#migrating-from-fuel-cove-adr-0091)). The one app
 the release bundles, the admin UI, is deployed by every install
 (`--with-bundled-apps admin`, the default; `--with-bundled-apps ""` leaves
 the installed one alone), checked and its previous version kept, exactly as
-`cove-host deploy` would. The examples — the webhook lab, the ledger, the
+`minicloud deploy` would. The examples — the webhook lab, the ledger, the
 algorithm playground and the sample apps — are not in the release; asking
 for one as a bundled app is refused with a pointer to `examples/`, and they
 are deployed from a checkout like any app ([Examples](#examples)). The
@@ -696,7 +699,31 @@ service stops on SIGTERM by answering new requests 503 and waiting up to
 
 Upgrading from a release before this split: its unit made `apps/`
 read-only to the service, so install the new unit when the script says it
-changed, or `cove-host deploy` is refused with a permission error.
+changed, or `minicloud deploy` is refused with a permission error.
+
+### Names kept from cove-tools
+
+The rename to minicloud (0.5.0) renamed the repository, the crate, the
+binary and the release asset. What an installed server already depends on
+kept its name, so an upgrade from a cove-tools release is
+`bash install.sh v0.5.0` and a restart, with no sudo step but the restart:
+
+- **`cove-host`** in the release tarball is a symbolic link to `minicloud`,
+  because the installed unit runs `ExecStart=…/current/cove-host serve`.
+  The unit in `deploy/` still says `cove-host`, so it is unchanged and
+  `install.sh` does not ask for it to be reinstalled.
+- **The unit's name, `cove-tools.service`**, the server's root
+  **`~/cove-tools`** (`releases/`, `current`, `apps/`, `data/`, `env`,
+  `backups/`), and the hostnames `covtools.ramda.io` and
+  `covtools-admin.ramda.io` stay; renaming them needs sudo and a Cloudflare
+  change, and is later work.
+- **Environment variables** keep their names: `COVE_TOOLS_ROOT` (where
+  `install.sh` and `backup.sh` install and back up) and `COVE_TOOLS_BACKUPS`,
+  for which `MINICLOUD_ROOT` and `MINICLOUD_BACKUPS` are accepted as well,
+  and `COVE_HOST_TEST_BACKEND` for the tests.
+- `install.sh` still installs a release from before the rename
+  (`cove-host-<version>-x86_64-linux.tar.gz`), so going back to one is
+  `bash install.sh v0.4.0`.
 
 What the deployment relies on from the host:
 
@@ -1024,11 +1051,11 @@ What an operator changes:
   `deadline` instead — what the slowest legitimate request takes, with room
   for a busy machine, since a deadline is a time and not a count of work. A
   file that still says `fuel` is **refused by name** when it is put forward —
-  `cove-host check`, `cove-host test`, `cove-host deploy` and `cove-host
+  `minicloud check`, `minicloud test`, `minicloud deploy` and `minicloud
   update` say *`limits.fuel` was removed (Cove ADR 0091 …); bound a request
   with `limits.deadline` instead* rather than a generic unknown key.
 - **Apps already deployed** are not taken down by the upgrade.
-  `install.sh` checks the installed apps with `cove-host check --deployed`,
+  `install.sh` checks the installed apps with `minicloud check --deployed`,
   which warns about the key rather than refusing the release. At start (and
   on a rollback, an admin change or a secret reload, which reload the
   deployed files rather than new ones) a `fuel` key is ignored and the host
@@ -1150,7 +1177,7 @@ never by trusting it:
   park nor yield (ADR 0080 §2, 0084 §3), and it has no native tier (ADR
   0085). An app whose entry the checker says can reach a task `scope`
   (`FnEntry::can_spawn`, ADR 0088) is refused before it is prepared, with a
-  diagnostic at the `spawn` (`cove_host::spawn`, above) — or at the entry
+  diagnostic at the `spawn` (`minicloud::spawn`, above) — or at the entry
   when there is none to point at. That fact is a lower bound for a
   capability-open entry, so such an entry in a package where some function
   opens a scope is decided by its lowered program instead. Every run also
@@ -1217,7 +1244,7 @@ see [Deploying](#deploying).
 
 ## Performance
 
-`bench/perf.sh` runs `cove-host-load` (a small load generator in this crate)
+`bench/perf.sh` runs `minicloud-load` (a small load generator in this crate)
 against a host with four workers — the configuration of the Cove repository's
 edge/Go comparison (`examples/edge/compare/README.md`, cove #589/#593) —
 using the same method: open loop with latency measured from each request's
@@ -1226,7 +1253,7 @@ using the same method: open loop with latency measured from each request's
 full tables and the comparison; in short, on the same machine
 (i7-10700K, macOS, native tier):
 
-| | cove-host | edge (native where measured) | Go |
+| | minicloud | edge (native where measured) | Go |
 | --- | ---: | ---: | ---: |
 | `hello` capacity, 64 in flight | 110,671 req/s | 84,235 (VM) | 122,725 |
 | `crunch n=20000` capacity, 16 in flight | 4,809 req/s | 2,783 | 3,720 |
@@ -1285,7 +1312,7 @@ $ cargo t     # = cargo test --workspace --profile checked
 
 The tests run Cove programs, so they run optimised (`--profile checked`, as
 in Cove's own repository); a bare `cargo test` works, more slowly. The
-integration tests (`crates/cove-host/tests/host.rs`, `services.rs` and
+integration tests (`crates/minicloud/tests/host.rs`, `services.rs` and
 `updates.rs`, `admin.rs`, `access.rs`, `secrets.rs`, and one per real app: `webhooks.rs`, `ledger.rs`, `algo.rs`) start the host
 in-process on a free port and ask it over TCP. None asserts a duration: where
 a test needs the host in some state it waits for the host's own stats to say
@@ -1339,7 +1366,7 @@ so, and what it asserts is counted.
   does not parse, that needs an ungranted capability or that needs a secret
   the env lacks is refused with its reason and changes no file; rollback
   restores the kept version and a second undoes it; both need the token;
-  `cove-host deploy` from a directory and from stdin, and `--into`;
+  `minicloud deploy` from a directory and from stdin, and `--into`;
   `deploy/smoke.sh` (CI, Linux) checks the release packages `admin` alone,
   `install.sh` deploys it by default and refuses an example asked for as a
   bundled app, pointing at `examples/`, leaves an app that is not the
@@ -1366,7 +1393,7 @@ so, and what it asserts is counted.
   the value stored and the serving version; deleting a secret an app uses is
   409 unless forced, and forced refuses the app; the admin app sets,
   replaces and deletes from its page (a cross-site POST refused, a delete
-  needing *confirm*, and *force* when used); `cove-host secret set|list|delete`;
+  needing *confirm*, and *force* when used); `minicloud secret set|list|delete`;
   `check --data` and `test` without the secret (on a placeholder, said); and
   the value is in none of the listener's answers, the admin pages, the stats,
   the operations views, the logs, the change history or `overrides.json`;

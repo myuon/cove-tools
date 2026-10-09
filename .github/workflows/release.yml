@@ -1,6 +1,6 @@
 name: Release
 
-# A tag `v<version>` (the workspace's version) builds cove-host for x86-64
+# A tag `v<version>` (the workspace's version) builds minicloud for x86-64
 # Linux with the native tier, packages it with the admin app and deploy/, and
 # publishes a GitHub Release. Run by hand with a tag to rebuild that tag's
 # assets (they are replaced).
@@ -39,24 +39,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: |
-          export COVE_TOOLS_COMMIT="$(git rev-parse --short=12 HEAD)"
-          cargo build --release --locked -p cove-host --bin cove-host
-          strip target/release/cove-host
-          ./target/release/cove-host --version
+          export MINICLOUD_COMMIT="$(git rev-parse --short=12 HEAD)"
+          cargo build --release --locked -p minicloud --bin minicloud
+          strip target/release/minicloud
+          ./target/release/minicloud --version
       - name: check and test the bundled app and the examples on the release binary
         env:
           WEBHOOKS_ADMIN_TOKEN: ci
           LEDGER_TOKEN: ci
           ADMIN_UI_TOKEN: ci
         run: |
-          ./target/release/cove-host check --apps apps
-          ./target/release/cove-host test --apps apps
-          ./target/release/cove-host check --apps examples
-          ./target/release/cove-host test --apps examples
+          ./target/release/minicloud check --apps apps
+          ./target/release/minicloud test --apps apps
+          ./target/release/minicloud check --apps examples
+          ./target/release/minicloud test --apps examples
       - name: package
         id: package
         run: |
-          tarball="$(deploy/package.sh "${{ steps.version.outputs.version }}" target/release/cove-host dist)"
+          tarball="$(deploy/package.sh "${{ steps.version.outputs.version }}" target/release/minicloud dist)"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           ls -l dist
       - name: install and run as deployed
@@ -68,9 +68,9 @@ jobs:
         run: |
           cp deploy/install.sh dist/install.sh
           {
-            echo "cove-host $VERSION for x86-64 Linux (glibc 2.39+, built on Ubuntu 24.04), native tier enabled, with the admin app and deploy/."
+            echo "minicloud $VERSION for x86-64 Linux (glibc 2.39+, built on Ubuntu 24.04), native tier enabled, with the admin app and deploy/. The tarball keeps a cove-host link to the binary for units that run cove-host."
             echo
-            echo "    $(./target/release/cove-host --version)"
+            echo "    $(./target/release/minicloud --version)"
             echo
             echo "Install on the server, as the service's user:"
             echo
@@ -78,12 +78,12 @@ jobs:
             echo "    bash install.sh $TAG"
             echo
             echo "An install deploys the one bundled app, admin (--with-bundled-apps \"\" for none), and never removes or replaces any other app."
-            echo "The example apps are not in the release: deploy them from the repository's examples/ with cove-host deploy (README \"Examples\")."
+            echo "The example apps are not in the release: deploy them from the repository's examples/ with minicloud deploy (README \"Examples\")."
             echo
             echo "See the README's Deploying section and deploy/cloudflare.md."
           } > "$RUNNER_TEMP/notes.md"
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* --title "cove-tools $TAG" --notes-file "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" dist/* --title "minicloud $TAG" --notes-file "$RUNNER_TEMP/notes.md"
           fi

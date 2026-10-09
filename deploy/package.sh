@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Packages a built cove-host as the release tarball the install script takes:
+# Packages a built minicloud as the release tarball the install script takes:
 #
 #   deploy/package.sh VERSION BINARY OUTDIR
 #
-# writes OUTDIR/cove-host-VERSION-x86_64-linux.tar.gz (the binary, apps/ —
-# the one bundled app, admin; not examples/ — deploy/ and README.md under
-# one directory of that name) and its .sha256.
+# writes OUTDIR/minicloud-VERSION-x86_64-linux.tar.gz (the binary, a
+# `cove-host` symbolic link to it, apps/ — the one bundled app, admin; not
+# examples/ — deploy/ and README.md under one directory of that name) and its
+# .sha256.
 # Run from the repository's root. The release workflow and CI both use it.
 set -euo pipefail
 
@@ -13,12 +14,15 @@ set -euo pipefail
 version="$1"
 binary="$2"
 out="$3"
-name="cove-host-$version-x86_64-linux"
+name="minicloud-$version-x86_64-linux"
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name" "$out"
-install -m755 "$binary" "$stage/$name/cove-host"
+install -m755 "$binary" "$stage/$name/minicloud"
+# The name before 0.5.0, for an installed unit that runs
+# `.../current/cove-host serve`.
+ln -s minicloud "$stage/$name/cove-host"
 mkdir -p "$stage/$name/apps"
 cp -R apps/admin "$stage/$name/apps/"
 cp -R deploy README.md "$stage/$name/"

@@ -12,8 +12,8 @@
 # somewhere else for a backup that survives the machine.
 set -euo pipefail
 
-ROOT="${COVE_TOOLS_ROOT:-$HOME/cove-tools}"
-DEST="${COVE_TOOLS_BACKUPS:-$ROOT/backups}"
+ROOT="${MINICLOUD_ROOT:-${COVE_TOOLS_ROOT:-$HOME/cove-tools}}"
+DEST="${MINICLOUD_BACKUPS:-${COVE_TOOLS_BACKUPS:-$ROOT/backups}}"
 KEEP_DAYS="${KEEP_DAYS:-14}"
 
 command -v sqlite3 >/dev/null || { echo "backup.sh: needs sqlite3" >&2; exit 1; }

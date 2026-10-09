@@ -1,5 +1,5 @@
 #!/bin/sh
-# The performance check: cove-host under the load the Cove repository's
+# The performance check: minicloud under the load the Cove repository's
 # examples/edge/compare measured edge and Go with, at four workers.
 #
 #   cargo build --profile checked
@@ -8,7 +8,7 @@
 #
 # Starts its own host on port 18180 (admin off, a scratch data directory)
 # with --workers 4, runs each scenario REPS times (default 3), and stops it.
-# Each line of the output is one cove-host-load run; bench/README.md reads
+# Each line of the output is one minicloud-load run; bench/README.md reads
 # them.
 set -eu
 REPS=${1:-3}
@@ -38,7 +38,7 @@ for app in crunch slow proxy hello; do
 max_in_flight = 10000\
 max_queued = 10000|' "$toml"
 done
-"$BIN/cove-host" serve --apps "$APPS" --data "$DATA" --addr "$ADDR" --workers 4 \
+"$BIN/minicloud" serve --apps "$APPS" --data "$DATA" --addr "$ADDR" --workers 4 \
   --slice "$SLICE" --backend "$BACKEND" --no-admin --quiet 2> "$DATA/host.err" &
 HOST=$!
 trap 'kill $HOST 2>/dev/null; rm -rf "$DATA" "$APPS"' EXIT
@@ -47,7 +47,7 @@ echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ) $(uname -sm) backend=$BACKEND slice=$SLIC
 head -6 "$DATA/host.err" | sed 's/^/# /'
 load() {
   echo "## $*"
-  "$BIN/cove-host-load" --addr "$ADDR" "$@"
+  "$BIN/minicloud-load" --addr "$ADDR" "$@"
 }
 for rep in $(seq 1 "$REPS"); do
   echo "# rep $rep"

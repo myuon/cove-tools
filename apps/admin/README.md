@@ -22,7 +22,7 @@ in the main README, [Administering apps at run time](../../README.md#administeri
 | `POST /apps/<app>/enable`, `/disable` | routes to the app again, or stops (503; its data stays) |
 | `POST /apps/<app>/configure` | the grant (`cap.<name>` checkboxes), the allowlist (`allow`, one per line) and every limit (`maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) |
 | `POST /apps/<app>/reset` | drops the changes made here, back to `app.toml` |
-| `GET /history` | every change, made here or by `cove-host` on the machine, refused ones included |
+| `GET /history` | every change, made here or by `minicloud` on the machine, refused ones included |
 | `GET /secrets` | the host's secret store: each secret stored or used by an app — set or unset, when it was set, which apps use it — **never a value** |
 | `POST /secrets/set` | `name` and `value` (a password field, never filled back in): stores it and reloads the apps that use it; the page says what each reload came to |
 | `POST /secrets/delete` | `name`, `confirm` (a required checkbox: there is no script for a dialog), and `force` for a secret an app uses, which leaves those apps refused |
@@ -81,12 +81,12 @@ is a capability to give to code you trust, which is why one app holds it.
 The admin app is an app like the others: if it is refused or broken, the host
 and every other app run on. It cannot disable itself, take `admin` away from
 itself, or make any change that would leave it refused. On the machine, the
-admin listener still can — `cove-host enable|disable|reset <app>` — and the
+admin listener still can — `minicloud enable|disable|reset <app>` — and the
 changes are plain JSON in `<data>/_host/overrides.json`, which can be edited
 or deleted before a restart.
 
 ```console
-$ ADMIN_UI_TOKEN=secret ./target/checked/cove-host serve --apps apps
+$ ADMIN_UI_TOKEN=secret ./target/checked/minicloud serve --apps apps
 $ curl -s -u x:secret http://admin.localhost:8080/ | head
 $ open http://admin.localhost:8080/
 ```

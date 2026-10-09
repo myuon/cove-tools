@@ -10,7 +10,7 @@
 # HEAVY (default "0 4 8"), K connections ask for
 # `/algo/matching?example=large&algorithm=augmenting&part=result` (or, with
 # MIX=algo-sat, `/algo/sat?example=hard&part=result`) as fast as they are
-# answered (`cove-host-load --mix algo`, closed loop) while a second
+# answered (`minicloud-load --mix algo`, closed loop) while a second
 # generator asks `hello` at RATE req/s (default 500) for REQUESTS requests
 # (default 5000), latency from the intended start. After each, the algo
 # app's yield counters, as /_host/stats has them, cumulative.
@@ -33,7 +33,7 @@ if curl -s -o /dev/null "http://$ADDR/"; then
 fi
 APPS=$(mktemp -d)
 cp -R examples/hello examples/algo "$APPS"/
-"$BIN/cove-host" serve --apps "$APPS" --data "$DATA" --addr "$ADDR" --workers 4 \
+"$BIN/minicloud" serve --apps "$APPS" --data "$DATA" --addr "$ADDR" --workers 4 \
   --backend "$BACKEND" --no-admin --quiet 2> "$DATA/host.err" &
 HOST=$!
 trap 'kill $HOST 2>/dev/null; rm -rf "$DATA" "$APPS"' EXIT
@@ -52,13 +52,13 @@ for rep in $(seq 1 "$REPS"); do
   for k in $HEAVY; do
     echo "## heavy=$k ($MIX) --mix hello --rate $RATE --connections 16 --requests $REQUESTS"
     if [ "$k" -gt 0 ]; then
-      "$BIN/cove-host-load" --addr "$ADDR" --mix "$MIX" --connections "$k" --requests 1000000 \
+      "$BIN/minicloud-load" --addr "$ADDR" --mix "$MIX" --connections "$k" --requests 1000000 \
         --warmup 0 > /dev/null 2>&1 &
       HEAVYPID=$!
       # Until the heavy runs hold the workers.
       sleep 1
     fi
-    "$BIN/cove-host-load" --addr "$ADDR" --mix hello --rate "$RATE" --connections 16 \
+    "$BIN/minicloud-load" --addr "$ADDR" --mix hello --rate "$RATE" --connections 16 \
       --requests "$REQUESTS"
     if [ "$k" -gt 0 ]; then
       kill "$HEAVYPID" 2>/dev/null || true

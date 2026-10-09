@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# Installs a cove-tools release (the platform: the binary and deploy/) under
-# ~/cove-tools, as the user that runs it. No sudo: the one root step (the
-# systemd unit) is printed, not run.
+# Installs a minicloud release (the platform: the binary and deploy/) under
+# ~/cove-tools (the server's root keeps its old name), as the user that runs
+# it. No sudo: the one root step (the systemd unit) is printed, not run.
 #
 #   install.sh [--with-bundled-apps "admin"] [--root DIR] VERSION|TARBALL
 #
-#   VERSION   a release tag (v0.1.0 or 0.1.0): downloaded from GitHub
-#   TARBALL   a local cove-host-<version>-x86_64-linux.tar.gz, with its
+#   VERSION   a release tag (v0.5.0 or 0.5.0): downloaded from GitHub
+#   TARBALL   a local minicloud-<version>-x86_64-linux.tar.gz, with its
 #             .sha256 beside it
 #
+# A release before 0.5.0 (cove-host-<version>-x86_64-linux.tar.gz, binary
+# `cove-host`) installs too, so going back to one is the same command. A
+# release from 0.5.0 on ships `cove-host` as a symbolic link to `minicloud`,
+# for the unit's `ExecStart=.../current/cove-host serve`.
+#
 # The apps are not the release's: they are whatever was deployed into
-# <root>/apps (`cove-host deploy`, from any repository; README "Deploying an
+# <root>/apps (`minicloud deploy`, from any repository; README "Deploying an
 # app"). Installing a release never removes or replaces one of them, but for
 # the one app the release bundles, the admin app, which it deploys by default
 # (`--with-bundled-apps ""` deploys none). The example apps (webhooks, ledger,
 # algo, ...) are not in the release: deploy them from the repository's
-# examples/ with `cove-host deploy` (README "Examples").
+# examples/ with `minicloud deploy` (README "Examples").
 #
 # What it does:
 #   1. downloads (or takes) the tarball and verifies its sha256;
@@ -32,15 +37,15 @@
 #      (`--deployed`: a key an installed app.toml may no longer say is a
 #      warning, as it is when the host starts, not a refusal);
 #   5. deploys the bundled apps --with-bundled-apps names, from the release,
-#      with `cove-host deploy --into <root>/apps` (each checked again; the
+#      with `minicloud deploy --into <root>/apps` (each checked again; the
 #      version it replaces is kept in <root>/apps/.previous/<app>); `admin`,
 #      the only one, by default;
 #   6. points <root>/current at the release; <root>/data is never touched;
 #   7. keeps the three newest releases, and prints what to run with sudo.
 set -euo pipefail
 
-REPO=myuon/cove-tools
-ROOT="${COVE_TOOLS_ROOT:-$HOME/cove-tools}"
+REPO=myuon/minicloud
+ROOT="${MINICLOUD_ROOT:-${COVE_TOOLS_ROOT:-$HOME/cove-tools}}"
 BUNDLED="admin"
 SOURCE=""
 
@@ -51,7 +56,7 @@ while [ $# -gt 0 ]; do
     --with-bundled-apps) BUNDLED="$2"; shift 2 ;;
     --apps) die "--apps is gone: a release no longer replaces the apps; --with-bundled-apps \"${2:-}\" deploys those of the release" ;;
     --root) ROOT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     -*) die "unknown option $1" ;;
     *) [ -z "$SOURCE" ] || die "one VERSION or TARBALL"; SOURCE="$1"; shift ;;
   esac
@@ -77,14 +82,26 @@ if [ -f "$SOURCE" ]; then
   name="$(basename "$tarball")"
 else
   version="${SOURCE#v}"
-  name="cove-host-$version-x86_64-linux.tar.gz"
   url="https://github.com/$REPO/releases/download/v$version"
-  echo "downloading $url/$name"
-  curl -fsSL -o "$work/$name" "$url/$name"
+  # minicloud-<v> from 0.5.0 on; cove-host-<v> before.
+  for product in minicloud cove-host; do
+    name="$product-$version-x86_64-linux.tar.gz"
+    echo "downloading $url/$name"
+    if curl -fsSL -o "$work/$name" "$url/$name"; then
+      break
+    fi
+    rm -f "$work/$name"
+  done
+  [ -f "$work/$name" ] || die "no release asset for v$version at $url"
   curl -fsSL -o "$work/$name.sha256" "$url/$name.sha256"
 fi
 (cd "$work" && sha256sum -c "$name.sha256") || die "checksum mismatch for $name"
-version="${name#cove-host-}"
+case "$name" in
+  minicloud-*) product=minicloud ;;
+  cove-host-*) product=cove-host ;;
+  *) die "not a release tarball: $name" ;;
+esac
+version="${name#"$product"-}"
 version="${version%-x86_64-linux.tar.gz}"
 if [ -z "$version" ] || [ "$version" = "$name" ]; then
   die "cannot read a version from $name"
@@ -94,20 +111,22 @@ fi
 mkdir -p "$ROOT/releases"
 chmod 700 "$ROOT"
 tar -xzf "$work/$name" -C "$work"
-top="$work/cove-host-$version-x86_64-linux"
-[ -x "$top/cove-host" ] || die "$name has no cove-host binary"
+top="$work/$product-$version-x86_64-linux"
+[ -x "$top/$product" ] || die "$name has no $product binary"
 release="$ROOT/releases/$version"
 rm -rf "$release.tmp"
 mv "$top" "$release.tmp"
 rm -rf "$release"
 mv "$release.tmp" "$release"
-"$release/cove-host" --version || die "the binary does not run on this machine"
+# The binary, under either name.
+bin="$release/$product"
+"$bin" --version || die "the binary does not run on this machine"
 
 # The bundled apps asked for are the release's, before anything is changed.
 for app in $BUNDLED; do
   if [ ! -f "$release/apps/$app/app.toml" ]; then
     bundled="$(for dir in "$release"/apps/*/; do if [ -f "$dir/app.toml" ]; then basename "$dir"; fi; done | tr '\n' ' ')"
-    die "the release bundles only: ${bundled% }; \`$app\` is not one of them. The example apps (webhooks, ledger, algo, ...) live in the repository's examples/ and are deployed like any app: cove-host deploy examples/$app --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token (README \"Examples\"); nothing switched"
+    die "the release bundles only: ${bundled% }; \`$app\` is not one of them. The example apps (webhooks, ledger, algo, ...) live in the repository's examples/ and are deployed like any app: minicloud deploy examples/$app --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token (README \"Examples\"); nothing switched"
   fi
 done
 
@@ -180,12 +199,12 @@ done
 for app in $BUNDLED; do
   cp -R "$release/apps/$app" "$check/$app"
 done
-with_env "$release/cove-host" check --deployed --apps "$check" --data "$ROOT/data" \
+with_env "$bin" check --deployed --apps "$check" --data "$ROOT/data" \
   || die "an app does not check against this release, $ROOT/env and the secret store (see above; a new secret?); nothing switched"
 
 # 5. The bundled apps asked for, deployed as any app is.
 for app in $BUNDLED; do
-  with_env "$release/cove-host" deploy "$release/apps/$app" --name "$app" --into "$ROOT/apps" --data "$ROOT/data" >/dev/null \
+  with_env "$bin" deploy "$release/apps/$app" --name "$app" --into "$ROOT/apps" --data "$ROOT/data" >/dev/null \
     || die "deploying the bundled app \`$app\` failed (see above); nothing switched"
 done
 
@@ -206,10 +225,10 @@ unit=/etc/systemd/system/cove-tools.service
 echo
 installed="$(for dir in "$ROOT"/apps/*/; do if [ -f "$dir/app.toml" ]; then basename "$dir"; fi; done | tr '\n' ' ')"
 installed="${installed% }"
-echo "installed cove-tools $version in $ROOT (apps: ${installed:-none})"
+echo "installed minicloud $version in $ROOT (apps: ${installed:-none})"
 if [ -z "$installed" ]; then
   echo "no apps are installed: run again without --with-bundled-apps \"\" for the admin app,"
-  echo "or deploy one with: $ROOT/current/cove-host deploy <app-dir> --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token"
+  echo "or deploy one with: $ROOT/current/$product deploy <app-dir> --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token"
 fi
 if [ ! -f "$unit" ]; then
   echo "first time: install the unit and start the service (needs sudo, once):"
@@ -229,4 +248,4 @@ echo "then: curl -s http://127.0.0.1:8790/ && curl -s http://127.0.0.1:8791/_hos
 echo "logs: journalctl -u cove-tools -f   (per app: $ROOT/data/<app>/log.txt)"
 echo "admin UI: https://covtools-admin.ramda.io/ (the Cloudflare Access login; ACCESS_* in $ROOT/env)"
 echo "roll back the platform: ln -sfn releases/<old> $ROOT/current && sudo systemctl restart cove-tools"
-echo "roll back an app: $ROOT/current/cove-host rollback <app> --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token"
+echo "roll back an app: $ROOT/current/$product rollback <app> --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token"
