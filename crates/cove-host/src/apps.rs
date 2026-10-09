@@ -25,8 +25,8 @@ use cove_sema::resolve::{FnEntry, Program};
 use cove_sema::{Compiler, HostSchemas};
 
 use crate::config::{
-    read_app_with, AppConfig, AppLimits, AppOverride, FetchPolicy, KvLimits, SecretSource, Secrets,
-    ADMIN_APP,
+    read_app_with, AppConfig, AppLimits, AppOverride, FetchPolicy, KvLimits, RemovedKeys,
+    SecretSource, Secrets, ADMIN_APP,
 };
 use crate::hosts::{AppContext, HostModules};
 use crate::logs::LogRing;
@@ -72,6 +72,10 @@ pub struct LoadOptions {
     pub io: tokio::runtime::Handle,
     /// What the admin app's `host` module acts on; given to that app only.
     pub control: Option<Arc<Control>>,
+    /// What a removed `app.toml` key does: refuses the app when it is being
+    /// put forward (a deploy, an update), is ignored with a warning when an
+    /// app already deployed is loaded again (the host's start).
+    pub removed_keys: RemovedKeys,
 }
 
 impl LoadOptions {
@@ -299,7 +303,14 @@ pub fn load_all(root: &Path, options: &LoadOptions) -> Result<Vec<App>, String> 
 /// compiled; refused if the config does not read. `store` secrets are
 /// looked up in `source`.
 pub fn describe(name: &str, dir: &Path, source: &SecretSource) -> (App, Option<AppConfig>) {
-    describe_as(name, dir, Lineage::first(), None, source)
+    describe_as(
+        name,
+        dir,
+        Lineage::first(),
+        None,
+        source,
+        RemovedKeys::Refuse,
+    )
 }
 
 /// What a version of an app inherits from the versions before it: its
@@ -330,6 +341,7 @@ pub fn describe_as(
     lineage: Lineage,
     over: Option<&AppOverride>,
     source: &SecretSource,
+    removed: RemovedKeys,
 ) -> (App, Option<AppConfig>) {
     let mut app = App {
         name: name.to_string(),
@@ -356,7 +368,7 @@ pub fn describe_as(
         app.state = AppState::Refused(why);
         return (app, None);
     }
-    match read_app_with(dir, name, over, source) {
+    match read_app_with(dir, name, over, source, removed) {
         Ok(config) => {
             app.hosts = config.hosts.clone();
             app.fetch_allow = config.file_allow.clone();
@@ -457,11 +469,22 @@ pub fn load_with(
     lineage: Lineage,
     over: Option<&AppOverride>,
 ) -> App {
-    let (mut app, config) = describe_as(name, dir, lineage, over, &options.secret_source());
+    let (mut app, config) = describe_as(
+        name,
+        dir,
+        lineage,
+        over,
+        &options.secret_source(),
+        options.removed_keys,
+    );
     if let Some(data) = &options.data {
         if valid_name(name).is_ok() {
             app.logs.attach(data.join(name).join("log.txt"));
         }
+    }
+    for warning in config.iter().flat_map(|config| &config.warnings) {
+        eprintln!("cove-host: [{name}] warning: {warning}");
+        app.logs.push("host", &format!("warning: {warning}"));
     }
     if config.is_none() {
         return app;

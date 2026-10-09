@@ -223,7 +223,7 @@ pub fn app_stats(host: &Host, app: &str) -> Json {
     host.stats()["apps"][app].clone()
 }
 
-/// A counter of one app's stats, by its JSON path (`"errors.fuel"`).
+/// A counter of one app's stats, by its JSON path (`"errors.deadline"`).
 pub fn count(host: &Host, app: &str, path: &str) -> u64 {
     let mut value = app_stats(host, app);
     for key in path.split('.') {

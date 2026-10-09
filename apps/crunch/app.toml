@@ -5,8 +5,9 @@
 grant = []
 
 [limits]
-# `n = 200000`, the cap, spends about 22 million.
-fuel = 30000000
+# The deadline is what bounds it: `n = 200000`, the cap, takes a fraction of
+# a second, so ten seconds admits every size it accepts with room to spare
+# on a busy machine.
 deadline = "10s"
 max_in_flight = 8
 max_queued = 64

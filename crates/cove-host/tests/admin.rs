@@ -91,7 +91,7 @@ fn the_list_shows_every_app_its_state_and_its_capabilities() {
         notes.contains("granted=[kv,log] required=[kv,log]"),
         "{notes}"
     );
-    assert!(notes.contains("fuel=50000000"), "{notes}");
+    assert!(notes.contains("hostcalls=1000"), "{notes}");
     assert!(notes.contains("admin=false"), "{notes}");
     let greedy = line(&host, "greedy");
     assert!(greedy.contains(" refused "), "{greedy}");
@@ -191,8 +191,7 @@ fn a_change_that_is_wrong_is_refused_with_the_reason_and_changes_nothing() {
     let before = line(&host, "hello");
     for (change, reason) in [
         ("inflight=0", "`maxInFlight` must be at least 1"),
-        ("fuel=-5", "`fuel` cannot be negative"),
-        ("fuel=0", "`fuel` must be at least 1"),
+        ("hostcalls=-5", "`maxHostCalls` cannot be negative"),
         ("deadline=0", "`deadlineMs` must be at least 1"),
         ("heap=9999999999", "largest heap a run can have"),
         ("allow=ftp://nope", "is not an allowlist entry"),
@@ -217,18 +216,18 @@ fn a_change_that_is_wrong_is_refused_with_the_reason_and_changes_nothing() {
             .lines()
             .filter(|l| l.contains("| hello | configure | refused: "))
             .count(),
-        8,
+        7,
         "{history}"
     );
 
     // A change that is right is kept.
     let fine = op(
         &host,
-        "/configure?app=hello&fuel=3000000&inflight=7&allow=https://example.com",
+        "/configure?app=hello&hostcalls=3000&inflight=7&allow=https://example.com",
     );
     assert_eq!(fine.status, 200, "{}", fine.body);
     let after = line(&host, "hello");
-    assert!(after.contains("fuel=3000000"), "{after}");
+    assert!(after.contains("hostcalls=3000"), "{after}");
     assert!(after.contains("inflight=7"), "{after}");
     assert!(after.contains("allow=[https://example.com]"), "{after}");
     assert!(after.contains("version=v2-"), "{after}");
@@ -284,17 +283,17 @@ fn the_admin_app_cannot_disable_itself_or_drop_admin_but_the_listener_can() {
     assert!(drop.body.contains("keeps `admin`"), "{}", drop.body);
     assert!(line(&host, "admin").contains(" serving "));
     // Its own limits it may change.
-    assert_eq!(op(&host, "/configure?app=admin&fuel=60000000").status, 200);
+    assert_eq!(op(&host, "/configure?app=admin&hostcalls=2000").status, 200);
 
     // The emergency exit: the listener disables, enables and resets it.
     let off = listener(&host, "POST", "/apps/admin/disable");
     assert_eq!(off.status, 200, "{}", off.body);
     assert_eq!(op(&host, "/apps").status, 503);
     assert_eq!(listener(&host, "POST", "/apps/admin/enable").status, 200);
-    assert!(line(&host, "admin").contains("changed=[fuel]"));
+    assert!(line(&host, "admin").contains("changed=[max_host_calls]"));
     let reset = listener(&host, "POST", "/apps/admin/reset");
     assert_eq!(reset.status, 200, "{}", reset.body);
-    assert!(line(&host, "admin").contains("fuel=50000000"));
+    assert!(line(&host, "admin").contains("hostcalls=1000"));
     assert!(line(&host, "admin").contains("changed=[]"));
     assert_eq!(listener(&host, "POST", "/apps/nope/disable").status, 404);
     // The listener's changes are in the history too.
@@ -316,7 +315,7 @@ fn changes_survive_a_restart_and_a_release_that_replaces_the_apps() {
     let first = apps(&[control(), sample("notes"), sample("hello"), sample("slow")]);
     let host = start(&first, 2);
     assert_eq!(op(&host, "/enable?app=slow&on=false").status, 200);
-    assert_eq!(op(&host, "/configure?app=hello&fuel=3000000").status, 200);
+    assert_eq!(op(&host, "/configure?app=hello&hostcalls=3000").status, 200);
     assert_eq!(op(&host, "/configure?app=notes&grant=log").status, 200);
     drop(host);
 
@@ -325,7 +324,7 @@ fn changes_survive_a_restart_and_a_release_that_replaces_the_apps() {
     let check = |host: &Host| {
         assert!(line(host, "slow").contains(" disabled "));
         assert_eq!(get(host.addr, "/slow/?ms=1").status, 503);
-        assert!(line(host, "hello").contains("fuel=3000000"));
+        assert!(line(host, "hello").contains("hostcalls=3000"));
         assert!(line(host, "notes").contains(" refused "));
         assert!(line(host, "notes").contains("removed=[kv]"));
         assert_eq!(get(host.addr, "/hello/").status, 200);
@@ -355,7 +354,7 @@ fn the_history_says_who_when_and_what() {
     assert_eq!(
         op(
             &host,
-            "/configure?app=hello&fuel=4000000&who=owner@example.com"
+            "/configure?app=hello&hostcalls=4000&who=owner@example.com"
         )
         .status,
         200
@@ -379,7 +378,7 @@ fn the_history_says_who_when_and_what() {
         configure["detail"]
             .as_str()
             .unwrap()
-            .contains("fuel=4000000"),
+            .contains("max_host_calls=4000"),
         "{configure}"
     );
 }
@@ -474,10 +473,10 @@ fn same_site() -> String {
     )
 }
 
-/// The configure form for hello, every limit as given.
-fn hello_form(fuel: &str) -> String {
+/// The configure form for hello, every limit as given but its host calls.
+fn hello_form(host_calls: &str) -> String {
     format!(
-        "allow=&fuel={fuel}&maxHostCalls=1000&deadlineMs=2000&maxHeapWords=0&maxInFlight=64\
+        "allow=&maxHostCalls={host_calls}&deadlineMs=2000&maxHeapWords=0&maxInFlight=64\
          &maxQueued=256&maxRequestBytes=1048576&maxResponseBytes=4194304"
     )
 }
@@ -598,13 +597,28 @@ fn the_pages_enable_disable_configure_and_reset() {
     assert!(
         wrong
             .body
-            .contains("fuel per request: `lots` is not a whole number"),
+            .contains("host calls per request: `lots` is not a whole number"),
         "{}",
         wrong.body
     );
     assert!(
         wrong.body.contains("value=\"lots\""),
         "the form comes back as posted"
+    );
+    // A form from a page served before the fuel limit was removed (Cove ADR
+    // 0091) is refused by name, not applied without it.
+    let stale = ui(
+        &host,
+        "POST",
+        "/apps/hello/configure",
+        &same_site(),
+        &format!("fuel=3000000&{}", hello_form("1000")),
+    );
+    assert_eq!(stale.status, 422);
+    assert!(
+        stale.body.contains("removed (Cove ADR 0091)"),
+        "{}",
+        stale.body
     );
     // A form the host refuses: its reason, and nothing done.
     let refused = ui(
@@ -632,20 +646,20 @@ fn the_pages_enable_disable_configure_and_reset() {
         "POST",
         "/apps/hello/configure",
         &same_site(),
-        &hello_form("3000000"),
+        &hello_form("3000"),
     );
     assert_eq!(applied.status, 303, "{}", applied.body);
     let page = ui(&host, "GET", "/apps/hello?done=configure", &authed(), "");
     assert!(page.body.contains("Applied."), "{}", page.body);
     assert!(
-        page.body.contains("3000000 <span class=added"),
+        page.body.contains("3000 <span class=added"),
         "{}",
         page.body
     );
-    assert_eq!(app_stats(&host, "hello")["limits"]["fuel"], 3000000);
+    assert_eq!(app_stats(&host, "hello")["limits"]["max_host_calls"], 3000);
     // Taking `kv` from notes refuses notes, and the page says why.
     let form = "cap.log=on&".to_string()
-        + &hello_form("50000000").replace("deadlineMs=2000", "deadlineMs=10000");
+        + &hello_form("1000").replace("deadlineMs=2000", "deadlineMs=10000");
     let taken = ui(&host, "POST", "/apps/notes/configure", &same_site(), &form);
     assert_eq!(taken.status, 303, "{}", taken.body);
     assert_eq!(get(addr, "/notes/x").status, 503);
@@ -716,4 +730,27 @@ fn the_pages_escape_what_they_show() {
         "{}",
         echoed.body
     );
+}
+
+/// An `overrides.json` written by a host from before Cove's ADR 0091 can
+/// set `limits.fuel`. It is the operator's data, so the host starts and the
+/// app serves: the key is dropped on load, and the rest of the change kept.
+#[test]
+fn a_persisted_override_with_the_removed_fuel_limit_does_not_stop_the_app() {
+    let apps = apps(&[control(), sample("hello")]);
+    std::fs::create_dir_all(apps.data.join("_host")).unwrap();
+    std::fs::write(
+        apps.data.join("_host/overrides.json"),
+        r#"{ "apps": { "hello": { "limits": { "fuel": 3000000, "max_host_calls": 3000 } } } }"#,
+    )
+    .unwrap();
+    let host = start(&apps, 2);
+    assert_eq!(get(host.addr, "/hello/").status, 200);
+    assert_eq!(app_stats(&host, "hello")["limits"]["max_host_calls"], 3000);
+    let hello = line(&host, "hello");
+    assert!(hello.contains(" serving "), "{hello}");
+    assert!(hello.contains("changed=[max_host_calls]"), "{hello}");
+    // The next change written leaves it out.
+    assert_eq!(op(&host, "/configure?app=hello&inflight=7").status, 200);
+    assert!(!overrides(&apps.data).contains("fuel"));
 }

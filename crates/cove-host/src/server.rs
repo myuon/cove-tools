@@ -45,6 +45,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, Semaphore};
 
 use crate::apps::{load_all, load_as, App, AppState, Backend, Lineage, LoadOptions};
+use crate::config::RemovedKeys;
 use crate::convert::{AppRequest, Reply};
 use crate::hosts::HostModules;
 use crate::ops::{self, OpsContext, OpsListener};
@@ -176,6 +177,10 @@ impl Host {
             data: options.data.clone(),
             io: runtime.handle().clone(),
             control: Some(Arc::clone(&control)),
+            // Every app found at start is one already deployed: an `app.toml`
+            // an earlier host accepted is not refused for a key this one
+            // removed. A deploy or an update refuses it (`load_next`).
+            removed_keys: RemovedKeys::Ignore,
         };
         let mut apps = load_all(&options.apps, &load)?;
         refuse_taken_hostnames(&mut apps);
@@ -784,7 +789,7 @@ impl Front {
                 self.options.apps.display()
             )));
         }
-        let app = self.load_next(name, &dir).await?;
+        let app = self.load_next(name, &dir, RemovedKeys::Refuse).await?;
         Ok(self.install_loaded(name, app))
     }
 
@@ -803,7 +808,10 @@ impl Front {
             places.unstage();
             return Err(refused(why));
         }
-        let mut app = match self.load_next(name, &places.staged).await {
+        let mut app = match self
+            .load_next(name, &places.staged, RemovedKeys::Refuse)
+            .await
+        {
             Ok(app) => app,
             Err(error) => {
                 places.unstage();
@@ -827,7 +835,11 @@ impl Front {
                 "no previous version of `{name}` is kept (a deploy keeps the one it replaces)"
             )));
         }
-        let mut app = self.load_next(name, &places.previous).await?;
+        // The version a deploy replaced was accepted once; it is put back,
+        // not put forward, so a key removed since is ignored, not refused.
+        let mut app = self
+            .load_next(name, &places.previous, RemovedKeys::Ignore)
+            .await?;
         places.swap().map_err(|why| UpdateError::Refused {
             current: self.current_version(name),
             why,
@@ -836,9 +848,15 @@ impl Front {
         Ok(self.install_loaded(name, app))
     }
 
-    /// Loads `dir` as the app `name`'s next version; a refusal is counted and
+    /// Loads `dir` as the app `name`'s next version, with a removed
+    /// `app.toml` key treated as `removed` says; a refusal is counted and
     /// logged, and is the error. Called with the update lock held.
-    async fn load_next(&self, name: &str, dir: &std::path::Path) -> Result<App, UpdateError> {
+    async fn load_next(
+        &self,
+        name: &str,
+        dir: &std::path::Path,
+        removed: RemovedKeys,
+    ) -> Result<App, UpdateError> {
         let slot = self.engine.slot_named(name);
         let current = self.current_version(name);
         let lineage = match &slot {
@@ -849,7 +867,10 @@ impl Front {
             },
             None => Lineage::first(),
         };
-        let load = self.load.clone();
+        let load = LoadOptions {
+            removed_keys: removed,
+            ..self.load.clone()
+        };
         let owned = name.to_string();
         let dir = dir.to_path_buf();
         let mut app = tokio::task::spawn_blocking(move || load_as(&owned, &dir, &load, lineage))

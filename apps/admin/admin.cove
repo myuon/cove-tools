@@ -226,7 +226,6 @@ struct LimitField {
 
 fn limitFields() -> Array<LimitField> {
   Vector.of(
-    LimitField(name: "fuel", label: "fuel per request", least: 1),
     LimitField(name: "maxHostCalls", label: "host calls per request", least: 0),
     LimitField(name: "deadlineMs", label: "deadline per request (ms)", least: 1),
     LimitField(name: "maxHeapWords", label: "heap per request (words; 0 = the runtime's 4194304)", least: 0),
@@ -240,9 +239,7 @@ fn limitFields() -> Array<LimitField> {
 
 /// The value of a limit in `limits`, by its field name.
 fn limitValue(limits: host.Limits, name: String) -> Int {
-  if name == "fuel" {
-    limits.fuel
-  } else if name == "maxHostCalls" {
+  if name == "maxHostCalls" {
     limits.maxHostCalls
   } else if name == "deadlineMs" {
     limits.deadlineMs
@@ -288,6 +285,11 @@ fn settingsFrom(form: Map<String, String>, capabilities: Array<String>) -> Read 
       }
     }
   }
+  // A form from a page served before Cove's ADR 0091: the field is gone,
+  // and saying so beats dropping what the user typed.
+  if form.contains("fuel") {
+    problems.push("fuel per request: removed (Cove ADR 0091); a request is bounded by its deadline")
+  }
   var values: Map<String, Int> = Map.of()
   for field in limitFields() {
     let written = form.get(field.name).unwrapOr("").trim()
@@ -308,7 +310,6 @@ fn settingsFrom(form: Map<String, String>, capabilities: Array<String>) -> Read 
       grant: grant.freeze(),
       fetchAllow: allow.freeze(),
       limits: host.Limits(
-        fuel: values.get("fuel").unwrapOr(0),
         maxHostCalls: values.get("maxHostCalls").unwrapOr(0),
         deadlineMs: values.get("deadlineMs").unwrapOr(0),
         maxHeapWords: values.get("maxHeapWords").unwrapOr(0),

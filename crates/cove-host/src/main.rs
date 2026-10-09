@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use cove_host::config::RemovedKeys;
 use cove_host::{deploy, toolchain};
 use cove_host::{Backend, Forwarding, Host, HostModules, OpsListener, PublicOrigin, ServeOptions};
 
@@ -157,6 +158,12 @@ enum Command {
         /// is no store, and an app that takes a secret from it is refused.
         #[arg(long)]
         data: Option<PathBuf>,
+        /// The apps are already deployed, not being put forward: a key
+        /// `app.toml` may no longer say (`limits.fuel`, Cove ADR 0091) is a
+        /// warning, as when the host starts, rather than a refusal.
+        /// `install.sh` checks the installed apps this way.
+        #[arg(long)]
+        deployed: bool,
         /// Only these apps.
         names: Vec<String>,
     },
@@ -373,11 +380,21 @@ fn main() -> ExitCode {
         Command::Reset { app, admin: args } => {
             admin(&args, reqwest::Method::POST, &format!("/apps/{app}/reset"))
         }
-        Command::Check { apps, data, names } => finish(toolchain::check_with(
+        Command::Check {
+            apps,
+            data,
+            deployed,
+            names,
+        } => finish(toolchain::check_as(
             &apps,
             &names,
             &HostModules::standard(),
             data.as_deref(),
+            if deployed {
+                RemovedKeys::Ignore
+            } else {
+                RemovedKeys::Refuse
+            },
         )),
         Command::Test {
             apps,

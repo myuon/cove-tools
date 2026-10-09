@@ -6,7 +6,7 @@ use web
 /// Ported from the Cove repository's `examples/edge/tenants/crunch`. It
 /// reaches nothing outside the run and never parks: what it costs is worker
 /// time alone. `n` is capped so that no request can ask for more than its
-/// fuel.
+/// deadline allows.
 export fn handle(request: web.Request) -> web.Response {
   let asked = Int.parse(request.query.get("n").unwrapOr("20000")).unwrapOr(-1)
   if asked < 2 || asked > 200000 {

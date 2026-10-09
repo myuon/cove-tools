@@ -154,7 +154,7 @@ fn a_failed_update_keeps_the_current_version_and_says_why() {
 
     let source = || std::fs::read_to_string(fixtures().join("versioned/versioned.cove")).unwrap();
     let dir = apps.root.join("versioned");
-    let cases: [(&str, Breaker); 4] = [
+    let cases: [(&str, Breaker); 5] = [
         (
             "does not parse",
             Box::new(|| {
@@ -182,12 +182,24 @@ fn a_failed_update_keeps_the_current_version_and_says_why() {
             }),
         ),
         (
-            "unknown field `fuell`",
+            "unknown field `deadlin`",
             Box::new(|| {
                 write_version(
                     &apps,
                     "bad",
-                    Some("grant = [\"timer\"]\n[limits]\nfuell = 1\n"),
+                    Some("grant = [\"timer\"]\n[limits]\ndeadlin = \"5s\"\n"),
+                );
+            }),
+        ),
+        // A key Cove removed (ADR 0091) is refused by name when it is put
+        // forward, not as an unknown field.
+        (
+            "`limits.fuel` was removed (Cove ADR 0091",
+            Box::new(|| {
+                write_version(
+                    &apps,
+                    "bad",
+                    Some("grant = [\"timer\"]\n[limits]\nfuel = 1000000\n"),
                 );
             }),
         ),
@@ -285,19 +297,19 @@ fn the_operations_page_escapes_what_apps_say() {
     let dir = apps.root.join("versioned");
     std::fs::write(
         dir.join("versioned.cove"),
-        "use web\nuse log\n\n/// Logs markup, then spins out of fuel.\nexport fn handle(request: web.Request) -> web.Response {\n  \
+        "use web\nuse log\n\n/// Logs markup, then spins past its deadline.\nexport fn handle(request: web.Request) -> web.Response {\n  \
          log.info(\"<script>alert(1)</script>\")\n  var turns = 0\n  while turns >= 0 {\n    \
          turns += 1\n  }\n  web.Response(status: 200, headers: Map.of(), body: \"{turns}\")\n}\n",
     )
     .unwrap();
     std::fs::write(
         dir.join("app.toml"),
-        "grant = [\"log\"]\n[limits]\nfuel = 100000\n",
+        "grant = [\"log\"]\n[limits]\ndeadline = \"300ms\"\n",
     )
     .unwrap();
     let updated = update(&host, "versioned");
     assert_eq!(updated.status, 200, "{}", updated.body);
-    assert_eq!(get(host.addr, "/versioned/").status, 500);
+    assert_eq!(get(host.addr, "/versioned/").status, 504);
     assert_eq!(super_put(host.addr), 201);
 
     let page = get(host.addr, "/_host/ui");
@@ -308,12 +320,16 @@ fn the_operations_page_escapes_what_apps_say() {
     );
     assert!(!page.body.contains("<script>"), "{}", page.body);
     assert!(page.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-    assert!(page.body.contains("fuel budget of 100000 exhausted"));
+    assert!(
+        page.body.contains("deadline of 300ms exceeded"),
+        "{}",
+        page.body
+    );
     // The store's usage against its quota.
     assert!(page.body.contains("1 / 10000 keys"), "{}", page.body);
 
     let detail = host.app_detail("versioned").unwrap();
-    assert_eq!(detail["recent_errors"][0]["kind"], "fuel");
+    assert_eq!(detail["recent_errors"][0]["kind"], "deadline");
     assert!(detail["recent_errors"][0]["version"]
         .as_str()
         .unwrap()

@@ -103,13 +103,12 @@ pub struct Tally {
 }
 
 /// The headers every answer of a run carries, saying what the run cost: the
-/// runtime's fuel and instruction counts, how often it yielded, declined to
+/// runtime's instruction count, how often it yielded, declined to
 /// yield and parked, its time on a worker and from admission to answer (both
 /// in microseconds). An app cannot read its own meter, so this is where a page
 /// that wants to show "this took N instructions" finds it — `fetch` the page
 /// and read the headers.
-pub const RUN_HEADERS: [&str; 7] = [
-    "x-cove-run-fuel",
+pub const RUN_HEADERS: [&str; 6] = [
     "x-cove-run-instructions",
     "x-cove-run-yields",
     "x-cove-run-yields-declined",
@@ -119,7 +118,7 @@ pub const RUN_HEADERS: [&str; 7] = [
 ];
 
 /// The header a run that a limit stopped is answered with: the
-/// [`ErrorKind`]'s name — `fuel`, `deadline`, `cancelled`, `host_calls`,
+/// [`ErrorKind`]'s name — `deadline`, `cancelled`, `host_calls`,
 /// `call_depth`, `heap`, `queue_timeout`, … — so a page can say why without
 /// reading the diagnostic.
 pub const STOP_HEADER: &str = "x-cove-stop";
@@ -793,7 +792,7 @@ impl Engine {
         flight: Flight,
         kind: ErrorKind,
         reply: Reply,
-        meter: Option<(u64, u64, u64)>,
+        meter: Option<(u64, u64)>,
     ) {
         let app = &flight.version;
         app.counters.error(kind);
@@ -814,17 +813,10 @@ impl Engine {
         match step {
             Step::Answered(vm, outcome) => {
                 let heap = vm.heap_words();
-                let meter = (
-                    vm.meter().fuel_spent(),
-                    vm.instructions(),
-                    vm.yields_declined(),
-                );
+                let meter = (vm.instructions(), vm.yields_declined());
                 counters
                     .instructions
                     .fetch_add(vm.instructions(), Ordering::Relaxed);
-                counters
-                    .fuel
-                    .fetch_add(vm.meter().fuel_spent(), Ordering::Relaxed);
                 note_progress(&mut flight.tally, counters, heap, vm.yields_declined());
                 let answered = match outcome {
                     // The heap's capacity is the app's `max_heap_words`
@@ -1023,7 +1015,6 @@ fn kind_of(error: &RuntimeError) -> ErrorKind {
         return ErrorKind::Heap;
     }
     match error.outcome {
-        RunOutcome::Fuel => ErrorKind::Fuel,
         RunOutcome::Deadline => ErrorKind::Deadline,
         RunOutcome::HostCalls => ErrorKind::HostCalls,
         RunOutcome::CallDepth => ErrorKind::CallDepth,
@@ -1059,11 +1050,10 @@ async fn sleep_at_most(left: Duration) {
 }
 
 /// `reply` with the [`RUN_HEADERS`] of a run that has `tally` and, if it ran
-/// to an answer, `fuel`, `instructions` and `declined` yields.
-fn with_run_headers(reply: Reply, flight: &Flight, meter: Option<(u64, u64, u64)>) -> Reply {
-    let (fuel, instructions, declined) = meter.unwrap_or_default();
+/// to an answer, `instructions` and `declined` yields.
+fn with_run_headers(reply: Reply, flight: &Flight, meter: Option<(u64, u64)>) -> Reply {
+    let (instructions, declined) = meter.unwrap_or_default();
     let values = [
-        fuel,
         instructions,
         flight.tally.yields,
         declined,

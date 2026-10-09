@@ -51,8 +51,8 @@ fn matchingExamples() -> Array<Example> {
     ),
     Example(
       name: "heavy",
-      title: "random 5000 × 5000, 50000 edges (augmenting runs out of fuel)",
-      graph: "# Hopcroft–Karp finishes this in a fraction of its fuel. The simple\n# algorithm searches the whole graph again for most left vertices and\n# runs out: compare the two to see the stop reason.\nrandom 5000 5000 50000 1\n",
+      title: "random 30000 × 30000, 300000 edges (augmenting is stopped by the deadline)",
+      graph: "# Hopcroft–Karp finishes this in about a second. The simple algorithm\n# searches the whole graph again for most left vertices and is still\n# searching when the run's deadline passes: compare the two to see the\n# stop reason.\nrandom 30000 30000 300000 1\n",
       algorithm: "both",
     ),
   ]
@@ -60,7 +60,7 @@ fn matchingExamples() -> Array<Example> {
 
 /// The largest graph the page takes.
 fn matchingBounds() -> matching.Bounds {
-  matching.Bounds(vertices: 5000, edges: 50000)
+  matching.Bounds(vertices: 30000, edges: 300000)
 }
 
 /// The largest graph drawn: per side, and edges.

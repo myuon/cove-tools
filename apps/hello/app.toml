@@ -3,6 +3,6 @@
 grant = []
 
 [limits]
-# `/spin` loops until this runs out: one failed request, nothing else.
-fuel = 2000000
+# `/spin` loops until the deadline stops it (504): one failed request,
+# nothing else.
 deadline = "2s"

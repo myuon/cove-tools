@@ -31,7 +31,7 @@ use cove_sema::resolve::DeclaredTest;
 use cove_sema::HostSchemas;
 
 use crate::apps::{self, App, AppState, Compiled};
-use crate::config::SecretSource;
+use crate::config::{RemovedKeys, SecretSource};
 use crate::hosts::HostModules;
 use crate::secrets::SecretStore;
 
@@ -66,6 +66,21 @@ pub fn check_with(
     modules: &HostModules,
     data: Option<&Path>,
 ) -> Result<Report, String> {
+    check_as(root, only, modules, data, RemovedKeys::Refuse)
+}
+
+/// [`check_with`], with a removed `app.toml` key treated as `removed` says:
+/// [`RemovedKeys::Ignore`] for apps that are already deployed (`cove-host
+/// check --deployed`, which `install.sh` runs over the installed apps before
+/// it switches to a new release), whose removed keys are warnings, printed,
+/// rather than refusals.
+pub fn check_as(
+    root: &Path,
+    only: &[String],
+    modules: &HostModules,
+    data: Option<&Path>,
+    removed: RemovedKeys,
+) -> Result<Report, String> {
     let source = SecretSource {
         store: store_of(data)?,
         placeholders: false,
@@ -75,7 +90,13 @@ pub fn check_with(
     let mut warnings = 0;
     let dirs = apps::app_dirs(root, only)?;
     for (name, dir) in &dirs {
-        let (mut app, config) = apps::describe(name, dir, &source);
+        let (mut app, config) =
+            apps::describe_as(name, dir, apps::Lineage::first(), None, &source, removed);
+        for warning in config.iter().flat_map(|config| &config.warnings) {
+            report
+                .err
+                .push_str(&format!("warning: [{name}] {warning}\n"));
+        }
         if config.is_some() {
             app.state = match apps::compile(dir, name, modules) {
                 Ok(compiled) => {

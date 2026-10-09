@@ -217,16 +217,27 @@ fn sat_answers_known_formulas_and_checks_its_models() {
 }
 
 #[test]
-fn a_sat_run_out_of_fuel_says_so() {
+fn a_sat_example_too_hard_for_its_budget_gives_up_and_says_so() {
     let apps = apps(&[sample("algo")]);
     let host = start(&apps, 1);
+    // The example's link fills in its own decision budget.
+    let page = get(host.addr, "/algo/sat?example=heavy");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("value=\"50000\""), "{}", page.body);
+    // Run from it, the search stops at that budget: the app's own stop,
+    // said in the page, under the host's limits.
     let answer = send_raw(
         host.addr,
         b"GET /algo/sat?example=heavy&part=result HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(answer.status, 500, "{answer:?}");
-    assert_eq!(answer.header("x-cove-stop"), Some("fuel"));
-    assert!(answer.body.contains("fuel budget of 400000000 exhausted"));
+    assert_eq!(verdict(&answer), "unknown");
+    assert!(answer.body.contains("data-stop=app"), "{}", answer.body);
+    assert!(
+        answer.body.contains("budget of 50,000 decisions"),
+        "{}",
+        answer.body
+    );
+    assert_eq!(answer.header("x-cove-stop"), None);
 }
 
 /// Runs the annealing page with `query` and answers the result.
@@ -288,7 +299,7 @@ fn annealing_compares_two_runs_reproducibly() {
     // What it cannot run is answered with why.
     for (query, why) in [
         ("n=3", "4 to 500 points"),
-        ("a_iterations=0", "run A takes 1 to 5,000,000 iterations"),
+        ("a_iterations=0", "run A takes 1 to 50,000,000 iterations"),
         ("b_start=-1", "run B&#39;s temperatures"),
         ("a_seed=x", "run A&#39;s seed"),
     ] {
@@ -303,10 +314,10 @@ fn annealing_compares_two_runs_reproducibly() {
     let page = get(addr, "/algo/anneal?example=circle");
     assert!(page.body.contains("data-autorun"));
     assert!(page.body.contains("value=circle checked"));
-    // Too much for the fuel: the host stops it and says so.
-    let heavy = get(addr, "/algo/anneal?example=heavy&part=result");
-    assert_eq!(heavy.status, 500, "{heavy:?}");
-    assert_eq!(heavy.header("x-cove-stop"), Some("fuel"));
+    // `heavy` asks for more than the deadline allows; that it is stopped is
+    // `a_run_a_limit_stops_says_which_limit`'s, under a shorter deadline.
+    let heavy = get(addr, "/algo/anneal?example=heavy");
+    assert!(heavy.body.contains("value=\"50000000\""), "{}", heavy.body);
 }
 
 #[test]
@@ -381,11 +392,7 @@ fn the_pages_carry_the_meter_and_escape_what_they_are_given() {
     assert!(script.body.contains("x-cove-stop"));
     // Every answer of a run says what the run cost.
     let answer = run_matching(addr, "a x\nb y\n", "hopcroft-karp");
-    for name in [
-        "x-cove-run-fuel",
-        "x-cove-run-instructions",
-        "x-cove-run-worker-us",
-    ] {
+    for name in ["x-cove-run-instructions", "x-cove-run-worker-us"] {
         let value: u64 = answer.header(name).unwrap().parse().unwrap();
         assert!(value > 0, "{name}");
     }
@@ -403,8 +410,8 @@ fn the_pages_carry_the_meter_and_escape_what_they_are_given() {
     assert_eq!(bad.status, 200);
     assert!(bad.body.contains("data-stop=app"), "{}", bad.body);
     assert!(bad.body.contains("line 1"));
-    let big = run_matching(addr, "random 6000 10 10 1", "hopcroft-karp");
-    assert!(big.body.contains("1 to 5000 vertices"), "{}", big.body);
+    let big = run_matching(addr, "random 40000 10 10 1", "hopcroft-karp");
+    assert!(big.body.contains("1 to 30000 vertices"), "{}", big.body);
     // The form posts without the script, and the answer is the whole page.
     let body = format!("graph={}&algorithm=both", form_value("a x\na y\nb x\n"));
     let posted = send_raw(
@@ -422,62 +429,42 @@ fn the_pages_carry_the_meter_and_escape_what_they_are_given() {
 
 #[test]
 fn a_run_a_limit_stops_says_which_limit() {
-    // The shipped limits, with less fuel, and a second copy with a short
-    // deadline instead.
+    // The shipped limits but for a deadline of a second, which nothing about
+    // a heavy example's answer depends on: they ask for many times the
+    // shipped ten seconds' work on any tier, so a shorter deadline stops
+    // them at the same place, sooner. What is asserted is which limit
+    // stopped them, never how long they took.
     let shipped = std::fs::read_to_string(samples().join("algo/app.toml")).unwrap();
     assert!(
-        shipped.contains("fuel = 400000000"),
+        shipped.contains("deadline = \"10s\""),
         "the shipped app.toml changed shape"
     );
-    let low_fuel = shipped.replace("fuel = 400000000", "fuel = 20000000");
-    let short = shipped.replace("deadline = \"10s\"", "deadline = \"30ms\"");
-    let apps = apps(&[
-        AppSpec {
-            name: "algo",
-            from: samples().join("algo"),
-            config: Some(&low_fuel),
-        },
-        AppSpec {
-            name: "hurried",
-            from: samples().join("algo"),
-            config: Some(&short),
-        },
-    ]);
+    let short = shipped.replace("deadline = \"10s\"", "deadline = \"1s\"");
+    let apps = apps(&[AppSpec {
+        name: "algo",
+        from: samples().join("algo"),
+        config: Some(&short),
+    }]);
     let host = start(&apps, 2);
     let addr = host.addr;
-    let heavy = "random 5000 5000 50000 1";
-    let out_of_fuel = run_matching(addr, heavy, "augmenting");
-    assert_eq!(out_of_fuel.status, 500, "{out_of_fuel:?}");
-    assert_eq!(out_of_fuel.header("x-cove-stop"), Some("fuel"));
-    assert!(out_of_fuel
-        .body
-        .contains("fuel budget of 20000000 exhausted"));
-    let fuel: u64 = out_of_fuel
-        .header("x-cove-run-fuel")
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(fuel >= 20_000_000, "{fuel}");
-    assert_eq!(count(&host, "algo", "errors.fuel"), 1);
-    // A small graph is still fine on the same budget.
-    assert_eq!(proved_size(&run_matching(addr, "a x\n", "both")), 1);
-
-    let body = format!(
-        "graph={}&algorithm=augmenting&part=result",
-        form_value(heavy)
-    );
-    let late = send_raw(
+    // Matching's `heavy`, both algorithms: the simple one is still
+    // searching when the deadline passes.
+    let late = get(
         addr,
-        format!(
-            "POST /hurried/matching HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-             Content-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .as_bytes(),
+        "/algo/matching?example=heavy&algorithm=both&part=result",
     );
     assert_eq!(late.status, 504, "{late:?}");
     assert_eq!(late.header("x-cove-stop"), Some("deadline"));
-    assert_eq!(count(&host, "hurried", "errors.deadline"), 1);
+    assert!(late.body.contains("deadline of"), "{}", late.body);
+    // The meter is still on the answer of a stopped run.
+    assert!(late.header("x-cove-run-worker-us").is_some());
+    // Annealing's `heavy`, the same.
+    let heavy = get(addr, "/algo/anneal?example=heavy&part=result");
+    assert_eq!(heavy.status, 504, "{heavy:?}");
+    assert_eq!(heavy.header("x-cove-stop"), Some("deadline"));
+    assert_eq!(count(&host, "algo", "errors.deadline"), 2);
+    // A small graph is still fine under the same deadline.
+    assert_eq!(proved_size(&run_matching(addr, "a x\n", "both")), 1);
 }
 
 #[test]
@@ -487,7 +474,7 @@ fn a_client_that_goes_away_cancels_its_run() {
     let addr = host.addr;
     let body = format!(
         "graph={}&algorithm=augmenting&part=result",
-        form_value("random 5000 5000 50000 1")
+        form_value("random 30000 30000 300000 1")
     );
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -509,7 +496,7 @@ fn a_client_that_goes_away_cancels_its_run() {
         count(&host, "algo", "errors.cancelled") == 1
     });
     assert_eq!(count(&host, "algo", "in_flight"), 0);
-    assert_eq!(count(&host, "algo", "errors.fuel"), 0);
+    assert_eq!(count(&host, "algo", "errors.deadline"), 0);
     // The app serves the next request as usual.
     assert_eq!(
         proved_size(&run_matching(addr, "a x\n", "hopcroft-karp")),

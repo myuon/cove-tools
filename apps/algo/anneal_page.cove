@@ -47,13 +47,13 @@ fn annealExamples() -> Array<AnnealExample> {
     ),
     AnnealExample(
       name: "long",
-      title: "200 points, 200,000 iterations each (about 70% of the fuel budget)",
+      title: "200 points, 200,000 iterations each (well within the deadline)",
       fields: Map.of(field("n", "200"), field("a_iterations", "200000"), field("b_iterations", "200000"), field("b_start", "0.5"), field("b_seed", "2")),
     ),
     AnnealExample(
       name: "heavy",
-      title: "500 points, 5,000,000 iterations each (runs out of fuel)",
-      fields: Map.of(field("n", "500"), field("a_iterations", "5000000"), field("b_iterations", "5000000"), field("b_start", "0.5"), field("b_seed", "2")),
+      title: "500 points, 50,000,000 iterations each (stopped by the deadline)",
+      fields: Map.of(field("n", "500"), field("a_iterations", "50000000"), field("b_iterations", "50000000"), field("b_start", "0.5"), field("b_seed", "2")),
     ),
   ]
 }
@@ -82,8 +82,10 @@ fn maxPoints() -> Int {
   500
 }
 
+/// Large enough that a run can outlast the app's deadline on any tier —
+/// what `heavy` shows: nothing but the deadline bounds a run's work.
 fn maxIterations() -> Int {
-  5000000
+  50000000
 }
 
 /// `GET` or `POST /anneal`, as `/matching` is.

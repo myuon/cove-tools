@@ -80,11 +80,11 @@ diagnostic:
 
 ```console
 $ curl -i 'http://127.0.0.1:8080/hello/spin'
-HTTP/1.1 500 Internal Server Error
+HTTP/1.1 504 Gateway Timeout
 content-type: text/plain; charset=utf-8
-content-length: 363
+content-length: 365
 
-error[cove::runtime]: execution stopped: fuel budget of 2000000 exhausted
+error[cove::runtime]: execution stopped: wall-clock deadline of 2s exceeded
   --> hello/hello.cove:46:9
    |
 46 |   while turns >= 0 {
@@ -185,7 +185,7 @@ rebinding its own name to 127.0.0.1. Reach them over SSH:
 `hosts` (its `[route] hosts`), `overridden` (whether the admin app changed its configuration),
 `served`, `ok`, `errors` by kind, `rejected` by reason (`disabled` among them), `in_flight`,
 `queued`, `parked`, `parks`, `yields`, `yield_requests`, `yields_declined`,
-`overdue_yields`, `blocking_host_calls`, `instructions`, `fuel`, `worker_ms`,
+`overdue_yields`, `blocking_host_calls`, `instructions`, `worker_ms`,
 `heap_peak_words`, `fetch` (`calls`, `refused`, `errors`), `kv` (`keys`,
 `bytes`, `max_keys`, `max_bytes`, for an app granted `kv`), `updates`,
 `updates_refused`, `versions_alive` and `programs_alive`; and the server's `connections`,
@@ -439,7 +439,7 @@ refuses a package module that shadows a host module):
 
 | operation | answers |
 | --- | --- |
-| `host.apps()` | `Array<host.App>`: every app — `state` (`serving`, `disabled`, `refused`, `removed`) and `reason`, `version`, `tier`, `entry`, `hosts`, `required` and `granted` (and `grantAdded`/`grantRemoved`, what the admin changed), `fetchAllow`, `limits` (`host.Limits`: `fuel`, `maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) and `limitsChanged`, `isAdmin`, its counters (`served`, `ok`, `errors`, `rejected`, `inFlight`, `queued`, `kvKeys`, `kvBytes`) and its ten newest `recentErrors` |
+| `host.apps()` | `Array<host.App>`: every app — `state` (`serving`, `disabled`, `refused`, `removed`) and `reason`, `version`, `tier`, `entry`, `hosts`, `required` and `granted` (and `grantAdded`/`grantRemoved`, what the admin changed), `fetchAllow`, `limits` (`host.Limits`: `maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) and `limitsChanged`, `isAdmin`, its counters (`served`, `ok`, `errors`, `rejected`, `inFlight`, `queued`, `kvKeys`, `kvBytes`) and its ten newest `recentErrors` |
 | `host.capabilities()` | `Array<String>`: what a grant may name |
 | `host.history(limit)` | `Array<host.Change>`: `atMs`, `who`, `app`, `action`, `detail`, `outcome`, newest first |
 | `host.setEnabled(app, enabled, who)` | `Result<String, Error>` |
@@ -463,7 +463,7 @@ version they were admitted to.
 | --- | --- | --- |
 | loads | kept | serves the new version |
 | is refused because its entry requires a capability the change took away | kept | **refused**: answers 503 with the reason; every other app serves |
-| anything else: a limit out of range (fuel, deadline or in-flight below 1, a negative number, a heap above the runtime's), an allowlist entry that does not parse, a capability the host does not have, `admin` for another app | **not kept** | as before; the answer is the reason |
+| anything else: a limit out of range (deadline or in-flight below 1, a negative number, a heap above the runtime's), an allowlist entry that does not parse, a capability the host does not have, `admin` for another app | **not kept** | as before; the answer is the reason |
 
 Taking a capability away from an app that needs it is how an app is stopped
 from using it, so that is applied; a change that is merely wrong is not.
@@ -499,7 +499,10 @@ touches:
   start, on `update`, on a change), so it survives a restart and a release.
   It is plain JSON and the last way out: delete an app's entry, or the file,
   and restart. A file that does not read stops the host from starting —
-  running without it would quietly re-enable and re-grant.
+  running without it would quietly re-enable and re-grant. A `limits.fuel`
+  written by a host from before Cove ADR 0091 is dropped when the file is
+  read, with a warning naming the app (see
+  [Migrating from fuel](#migrating-from-fuel-cove-adr-0091)).
 - `<data>/_host/changes.jsonl`: the history — who (what the admin app says
   of its user, or `admin listener`), when, which app, what was asked and
   what came of it, refused attempts included — one JSON line each, appended.
@@ -641,7 +644,10 @@ app](#deploying-an-app)). An upgrade is `bash install.sh v<new>`, then
 `sudo systemctl restart cove-tools` (the script says which, and when the
 unit changed). Before it switches, it checks every installed app with the
 new binary against `~/cove-tools/env`, and if one would be refused it stops
-and switches nothing. This repository's apps — the webhook lab, the ledger,
+and switches nothing (`cove-host check --deployed`: a key an installed
+`app.toml` may no longer say, such as `limits.fuel`, is a warning there, as it
+is when the host starts — see
+[Migrating from fuel](#migrating-from-fuel-cove-adr-0091)). This repository's apps — the webhook lab, the ledger,
 the algorithm playground and the admin UI — are deployed only when asked:
 `--with-bundled-apps "webhooks ledger algo admin"` deploys those of the
 release, each checked and its previous version kept, exactly as `cove-host
@@ -868,7 +874,6 @@ entry = "hello.handle"          # optional; `<app>.handle` by default
 grant = ["log", "timer"]        # the capabilities granted; none by default
 
 [limits]                        # every key optional; the defaults are shown
-fuel = 50000000                 # per request
 max_host_calls = 1000           # per request
 deadline = "10s"                # per request, parked time included ("ms" or "s")
 max_call_depth = 512            # per request (the runtime's own default if absent)
@@ -956,10 +961,55 @@ so a path an app does not guard — the webhook lab's receive URLs — needs no
 token and fetches no keys.
 
 An unknown key is refused, so a misspelt limit is never silently not
-applied. A config that does not read, an app that does not check (warnings
-included), an entry that requires a capability the app is not granted, or
-code that can `spawn` refuses **that app**: it is answered 503 with the
-reason, and every other app starts.
+applied; `limits.fuel` is refused by name (see
+[Migrating from fuel](#migrating-from-fuel-cove-adr-0091)). A config that
+does not read, an app that does not check (warnings included), an entry
+that requires a capability the app is not granted, or code that can `spawn`
+refuses **that app**: it is answered 503 with the reason, and every other
+app starts.
+
+### Migrating from fuel (Cove ADR 0091)
+
+Cove's [ADR 0091](https://github.com/myuon/cove/blob/main/docs/adr/0091-a-run-is-stopped-by-its-host-not-a-fuel-allowance.md)
+removed the fuel allowance from the runtime: a request's run is bounded by
+its wall-clock `deadline` (10 s unless `app.toml` says otherwise), its host
+calls and its heap, and is stopped early only by a cancellation. There is no
+`limits.fuel`, no `fuel` error kind or stop (`x-cove-stop: fuel`,
+`errors.fuel`), no `fuel` counter or total in `/_host/stats`, no
+`x-cove-run-fuel` header, and no `fuel` in the admin app's limits.
+
+What an operator changes:
+
+- **`app.toml`**: delete `fuel = …` from `[limits]`. If the app relied on it
+  to stop runaway work sooner than the default ten seconds, set a
+  `deadline` instead — what the slowest legitimate request takes, with room
+  for a busy machine, since a deadline is a time and not a count of work. A
+  file that still says `fuel` is **refused by name** when it is put forward —
+  `cove-host check`, `cove-host test`, `cove-host deploy` and `cove-host
+  update` say *`limits.fuel` was removed (Cove ADR 0091 …); bound a request
+  with `limits.deadline` instead* rather than a generic unknown key.
+- **Apps already deployed** are not taken down by the upgrade.
+  `install.sh` checks the installed apps with `cove-host check --deployed`,
+  which warns about the key rather than refusing the release. At start (and
+  on a rollback, an admin change or a secret reload, which reload the
+  deployed files rather than new ones) a `fuel` key is ignored and the host
+  logs, to its standard error and the app's log, a warning naming the app and
+  ADR 0091. The app runs under its `deadline` from then on.
+- **Persisted admin overrides**: a `limits.fuel` that the admin app set
+  before the upgrade lives in `<data>/_host/overrides.json`, as
+  `{"apps": {"<app>": {"limits": {"fuel": N, …}}}}`. It is dropped when the
+  host reads the file, with a warning naming the app; the rest of the
+  override stays, and the next change written leaves it out. Nothing needs
+  editing by hand, but a warning at start says which apps had one.
+- **Scripts and dashboards** that read `x-cove-run-fuel`, `errors.fuel` or
+  the stats' `fuel` should read `x-cove-run-worker-us`,
+  `x-cove-run-instructions` or `worker_ms` instead, and expect
+  `x-cove-stop: deadline` (504) where they expected `fuel` (500).
+
+The order of a rollout: **upgrade the host first, then redeploy each app
+without `fuel`.** A host from before the upgrade gives an app without `fuel`
+its default allowance, which may be too little for an app that set more; the
+new host ignores the key on a deployed app but refuses it on a new deploy.
 
 ### Limits and what they answer
 
@@ -974,7 +1024,7 @@ reason, and every other app starts.
 | the server already has `--max-in-flight` requests admitted | **503**, `Retry-After: 1` |
 | `--max-connections` connections open | 503, `Retry-After: 1`, connection closed |
 | the request waited in the queue longer than the app's deadline | 503, `Retry-After: 1`, not run |
-| fuel, host calls, call depth spent | 500, the runtime's diagnostic |
+| host calls, call depth spent | 500, the runtime's diagnostic |
 | deadline passed, running or parked | 504, the runtime's diagnostic |
 | other runtime error (an assertion, an overflow, out of memory) | 500, the runtime's diagnostic |
 | the run's heap needs more than `max_heap_words` | 500 while it allocates, `x-cove-stop: heap` |
@@ -983,11 +1033,12 @@ reason, and every other app starts.
 | a `kv.put` past a quota, a `fetch` off the allowlist or past its limits | not a status: the app's `Err` to answer as it likes |
 
 **Every answer of a run says what the run cost**, in headers the host adds:
-`x-cove-run-fuel` and `x-cove-run-instructions` (the runtime's counts),
+`x-cove-run-instructions` (the runtime's count; compiled code dispatches
+none, so on the native tier it undercounts — `x-cove-run-worker-us` does not),
 `x-cove-run-yields`, `x-cove-run-yields-declined`, `x-cove-run-parks`,
 `x-cove-run-worker-us` (time on a worker, every slice summed) and
 `x-cove-run-wall-us` (admission to answer). **A run a limit stopped also
-says which**: `x-cove-stop` is the error kind's name — `fuel`, `deadline`,
+says which**: `x-cove-stop` is the error kind's name — `deadline`,
 `host_calls`, `call_depth`, `heap`, `queue_timeout`, `response_too_large`,
 `cancelled`, `runtime`, … — so a page that runs a request with `fetch` can
 say why without reading the diagnostic (`apps/algo` does). An app cannot
@@ -1170,7 +1221,7 @@ $ python3 bench/summarize.py bench/results/perf-*.txt
 | criterion | where it is shown |
 | --- | --- |
 | an app enabled and disabled from the browser; a disabled app does not answer; enabled again, its KV data is there | `admin.rs::the_pages_enable_disable_configure_and_reset`, `::a_disabled_app_answers_503_finishes_what_it_had_and_keeps_its_data` (a parked request finishes; the store survives) |
-| a change of grant or budget is applied only when it checks; a wrong one keeps the current config and says why | `admin.rs::a_change_that_is_wrong_is_refused_with_the_reason_and_changes_nothing` (eight kinds), `::the_pages_enable_disable_configure_and_reset` (the form's problems and the host's reason, on the page) |
+| a change of grant or budget is applied only when it checks; a wrong one keeps the current config and says why | `admin.rs::a_change_that_is_wrong_is_refused_with_the_reason_and_changes_nothing` (seven kinds), `::the_pages_enable_disable_configure_and_reset` (the form's problems and the host's reason, on the page) |
 | an app whose needed capability is taken away is refused, and the others answer | `admin.rs::taking_away_a_needed_capability_refuses_that_app_and_no_other` |
 | `admin` cannot be granted to any app but the admin app | `admin.rs::only_the_admin_app_may_be_granted_admin` (at load, by `check`, and by a change); the admin app cannot disable itself or drop it: `::the_admin_app_cannot_disable_itself_or_drop_admin_but_the_listener_can` |
 | changes survive a restart; unauthenticated and cross-site operations are refused | `admin.rs::changes_survive_a_restart_and_a_release_that_replaces_the_apps`, `::the_admin_app_needs_its_secret`, `::a_cross_site_form_changes_nothing`; the history: `::the_history_says_who_when_and_what`; escaping: `::the_pages_escape_what_they_show`; the hostname: `::the_admin_app_is_reached_by_its_hostname_only`, `::an_app_with_a_hostname_is_reached_by_it_and_by_nothing_else` |
@@ -1183,7 +1234,7 @@ $ python3 bench/summarize.py bench/results/perf-*.txt
 | two or more independent Cove apps run at once | `host.rs::two_or_more_apps_are_served_concurrently`; the walkthrough above serves five |
 | per-app KV isolation, and persistence across a restart | `services.rs::an_apps_keys_are_its_own`, `::the_store_survives_a_restart`; manual: the `notes` walkthrough, restart, `GET /notes/todo` |
 | a light app keeps answering beside a CPU-heavy and an I/O app | `host.rs::hello_answers_while_crunch_saturates_the_workers_and_slow_is_parked`; measured: [Performance](#performance), `hello`'s p99 in the mix |
-| budget overrun, overload and an invalid update stop no other app | `host.rs::a_budget_overrun_ends_that_request_only`, `::overload_is_rejected_explicitly_and_other_apps_still_answer`, `updates.rs::a_failed_update_keeps_the_current_version_and_says_why` (another app answering throughout four kinds of refused update) |
+| budget overrun, overload and an invalid update stop no other app | `host.rs::a_budget_overrun_ends_that_request_only`, `::overload_is_rejected_explicitly_and_other_apps_still_answer`, `updates.rs::a_failed_update_keeps_the_current_version_and_says_why` (another app answering throughout five kinds of refused update, `limits.fuel` among them) |
 | requests on the old version complete during an update | `updates.rs::in_flight_requests_finish_on_the_old_version_and_new_ones_get_the_new` (parked, running, yielded and queued, each answered by v1; the next by v2; v1 and its program dropped after) |
 | tests, and procedures for starting, updating and checking performance | [Tests](#tests); [Building and running](#building-and-running), [Updating an app](#updating-an-app), [Performance](#performance) |
 
@@ -1208,7 +1259,8 @@ so, and what it asserts is counted.
 - an app past its `max_queued` gets 429 with `Retry-After` while another app
   answers; the server past `--max-in-flight` gets 503; past
   `--max-connections`, 503;
-- fuel, deadline (while parked) and host-call overruns end only that request;
+- deadline (while running and while parked) and host-call overruns end only
+  that request;
 - an over-reaching app and a spawning app are refused at load, the others
   serve, and `check` agrees;
 - request (declared and chunked) and response size limits;

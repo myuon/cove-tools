@@ -52,7 +52,8 @@ use serde_json::Value as Json;
 
 use crate::apps::{load_as, load_with, AppState, Lineage};
 use crate::config::{
-    read_app_with, store_references, AppOverride, LimitsFile, ADMIN_APP, ADMIN_CAPABILITY,
+    read_app_with, store_references, AppOverride, LimitsFile, RemovedKeys, ADMIN_APP,
+    ADMIN_CAPABILITY,
 };
 use crate::server::Front;
 
@@ -411,11 +412,15 @@ impl Front {
         // The app as its `app.toml` alone says: what the change is relative
         // to.
         let source = self.load.secret_source();
-        let file = read_app_with(&dir, name, None, &source).map_err(|why| {
-            ChangeError::Refused(format!(
-                "its app.toml does not read, so nothing is changed: {why}"
-            ))
-        })?;
+        // The `app.toml` is the deployed one, which the admin is not putting
+        // forward: a key removed since it was deployed is ignored here as it
+        // is at the host's start (`load_with` logs it).
+        let file =
+            read_app_with(&dir, name, None, &source, RemovedKeys::Ignore).map_err(|why| {
+                ChangeError::Refused(format!(
+                    "its app.toml does not read, so nothing is changed: {why}"
+                ))
+            })?;
         let current = self
             .control
             .overrides
@@ -455,7 +460,8 @@ impl Front {
             },
         };
         // The config's own rules first: they need no compiling.
-        read_app_with(&dir, name, Some(&next), &source).map_err(ChangeError::Refused)?;
+        read_app_with(&dir, name, Some(&next), &source, RemovedKeys::Ignore)
+            .map_err(ChangeError::Refused)?;
 
         let lineage = Lineage {
             counters: Arc::clone(&slot.counters),
