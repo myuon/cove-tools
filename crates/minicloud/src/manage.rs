@@ -198,6 +198,27 @@ fn sum(group: &Json) -> u64 {
         .unwrap_or_default()
 }
 
+/// One key of an app's store, as the admin app sees it.
+pub(crate) struct KvRow {
+    pub key: String,
+    pub value: String,
+    /// The whole value's length in bytes.
+    pub bytes: u64,
+    /// Whether `value` is shorter than the whole.
+    pub cut: bool,
+}
+
+impl From<crate::kv::Peek> for KvRow {
+    fn from(peek: crate::kv::Peek) -> KvRow {
+        KvRow {
+            key: peek.key,
+            value: peek.value,
+            bytes: peek.bytes,
+            cut: peek.cut,
+        }
+    }
+}
+
 impl Front {
     /// Every app the host has, in load order.
     pub(crate) fn app_infos(&self) -> Vec<AppInfo> {
@@ -302,6 +323,51 @@ impl Front {
         capabilities.sort();
         capabilities.dedup();
         capabilities
+    }
+
+    /// The file of `app`'s store, for an app the host has: a name that is
+    /// not one of its slots names nothing, so no path leaves the data
+    /// directory.
+    fn kv_path(&self, app: &str) -> Option<std::path::PathBuf> {
+        self.engine.slot_named(app)?;
+        let data = self.options.data.as_ref()?;
+        Some(data.join(app).join("kv.sqlite3"))
+    }
+
+    /// Keys of `app`'s store. Empty for an app that has none — not granted
+    /// `kv`, never written to, or a host with no data directory.
+    pub(crate) fn app_kv(
+        &self,
+        app: &str,
+        prefix: &str,
+        from: &str,
+        limit: i64,
+    ) -> Result<Vec<KvRow>, String> {
+        let Some(path) = self.kv_path(app) else {
+            return Ok(Vec::new());
+        };
+        Ok(crate::kv::peek(&path, prefix, from, limit)?
+            .into_iter()
+            .map(KvRow::from)
+            .collect())
+    }
+
+    /// One key of `app`'s store, whole (cut past
+    /// [`crate::kv::READ_VALUE_CHARS`]).
+    pub(crate) fn app_kv_value(&self, app: &str, key: &str) -> Result<Option<KvRow>, String> {
+        let Some(path) = self.kv_path(app) else {
+            return Ok(None);
+        };
+        Ok(crate::kv::read(&path, key)?.map(KvRow::from))
+    }
+
+    /// The last `n` lines of `app`'s log, oldest first; empty for an app the
+    /// host does not have.
+    pub(crate) fn app_logs(&self, app: &str, n: usize) -> Vec<crate::logs::Line> {
+        self.engine
+            .slot_named(app)
+            .map(|slot| slot.logs.tail_lines(n))
+            .unwrap_or_default()
     }
 
     /// Records a change refused before anything was tried.

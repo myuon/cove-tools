@@ -1,3 +1,4 @@
+use host
 use text
 use web
 
@@ -50,6 +51,37 @@ test fn escapesWhatItShows() -> Result<Unit, Error> {
   assert(badge("<b>").contains("&lt;b&gt;"))?
   assert(!problemsNotice(Vector.of("<img src=x>").freeze()).contains("<img"))?
   Ok(())
+}
+
+test fn showsALogLineAsItCame() -> Result<Unit, Error> {
+  let said = logTable(
+    Vector.of(
+      host.LogLine(atMs: 1791170989566, level: "warn", text: "<img src=x> & on"),
+    )
+      .freeze(),
+  )
+  assert(said.contains("lvl-warn"))?
+  assert(said.contains("&lt;img src=x&gt; &amp; on"))?
+  assert(!said.contains("<img"))?
+  // 2026-10-05T03:29:49.566Z, as the clock of the day.
+  assert(said.contains("03:29:49.566"))?
+  // A level the host grows later still reads, without a colour of its own.
+  assertEqual(levelClass("fatal"), "lvl-info")?
+  assertEqual(levelClass("error"), "lvl-error")?
+  Ok(())
+}
+
+test fn asksForTheLinesItIsAskedFor() -> Result<Unit, Error> {
+  assertEqual(logLines(asking(Map.of())), 200)?
+  assertEqual(logLines(asking(Map.of(MapEntry(key: "n", value: " 40 ")))), 40)?
+  assertEqual(logLines(asking(Map.of(MapEntry(key: "n", value: "0")))), 1)?
+  assertEqual(logLines(asking(Map.of(MapEntry(key: "n", value: "9999")))), 1000)?
+  assertEqual(logLines(asking(Map.of(MapEntry(key: "n", value: "lots")))), 200)?
+  Ok(())
+}
+
+fn asking(query: Map<String, String>) -> web.Request {
+  web.Request(method: "GET", path: "/", query: query, headers: Map.of(), body: "")
 }
 
 fn req(headers: Map<String, String>) -> web.Request {

@@ -233,6 +233,9 @@ refuses a package module that shadows a host module):
 | `host.secrets()` | `Array<host.Secret>`: every secret stored or used — `name`, `set`, `updatedMs` (0 when unset), `apps` that use it — never a value |
 | `host.setSecret(name, value, who)` | `Result<String, Error>`: stores it and reloads the apps that use it; the message is what each reload came to |
 | `host.deleteSecret(name, force, who)` | `Result<String, Error>`: refused while an app uses it unless `force` |
+| `host.kv(app, prefix, after, limit)` | `Array<host.KvEntry>`: a page of another app's store — `key`, `value` cut to 512 characters, `bytes` (the whole value's), `cut` — ascending, at most 500 |
+| `host.kvValue(app, key)` | `Result<host.KvEntry, Error>`: one key, its value whole up to 64 KiB; `Err` when the store has no such key |
+| `host.logs(app, limit)` | `Array<host.LogLine>`: the last `limit` lines of the app's ring — `atMs`, `level`, `text` — oldest first |
 
 The five that change something park the run while the host works (an app
 is reloaded on a blocking thread, as an update is), so they hold no worker.
@@ -243,6 +246,32 @@ progress: a change loads the app again with the change applied — parsed,
 checked, admitted, lowered, prepared, compiled — and routes to that version
 the way `minicloud update` does. Requests already admitted finish on the
 version they were admitted to.
+
+### Reading another app's store and log
+
+The three reads above are how the admin app shows what an app holds and
+what it said, and they are **reads only**: there is no operation that
+writes to another app's store, so the one app granted `admin` cannot change
+another app's data, only its configuration.
+
+- **The store** is read from `<data>/<app>/kv.sqlite3` without opening it as
+  the app does. A store a running version has open is read through that
+  `Store`, so the page sees what the app has just written; one no version
+  has open is opened read-only, and only if the file is there — the admin
+  app looking at an app that has never written must not be what creates its
+  store. The value is cut in SQL (`substr`), not after reading: a page of
+  500 keys of up to 1 MiB each would otherwise be half a gigabyte to throw
+  away. `bytes` is the whole value's length, the same measure the quota
+  uses, so a cut value still says how large it is.
+- **The log** is the ring of [Logs](#logs) — in memory, the last 1,000 lines,
+  emptied by a restart — parsed back into `atMs`, `level` and `text` by the
+  module that writes it. The file beside it (`<data>/<app>/log.txt`) is not
+  read: a page that tails a rotating file is a different thing, and the ring
+  is what a browser wants.
+- **The app is named, not the path.** Both take an app's name and resolve it
+  through the host's slots; a name the host does not serve answers empty
+  rather than reaching into the data directory, so `..` in a name reads
+  nothing.
 
 | the reload | the change | the app |
 | --- | --- | --- |

@@ -3,7 +3,8 @@ use host
 
 /// Each path is one operation of the `host` module (capability `admin`),
 /// its arguments in the query, its answer as text: `/apps`,
-/// `/capabilities`, `/history?n=`, `/enable?app=&on=`,
+/// `/capabilities`, `/history?n=`, `/kv?app=&prefix=&after=&n=`,
+/// `/kvValue?app=&key=`, `/logs?app=&n=`, `/enable?app=&on=`,
 /// `/configure?app=&grant=&allow=&hostcalls=&…` and `/reset?app=`; and `/origin`,
 /// what the app is told of how it was reached.
 export fn handle(request: web.Request) -> web.Response {
@@ -29,6 +30,27 @@ export fn handle(request: web.Request) -> web.Response {
     var lines = Vector.of()
     for change in host.history(Int.parse(query.get("n").unwrapOr("50")).unwrapOr(50)) {
       lines.push("{change.who} | {change.app} | {change.action} | {change.outcome}")
+    }
+    return answer(200, "\n".join(lines.freeze()))
+  }
+  if request.path == "/kv" {
+    var lines = Vector.of()
+    let n = Int.parse(query.get("n").unwrapOr("100")).unwrapOr(100)
+    for entry in host.kv(app, query.get("prefix").unwrapOr(""), query.get("after").unwrapOr(""), n) {
+      lines.push("{entry.key} | {entry.value} | {entry.bytes} | {entry.cut}")
+    }
+    return answer(200, "\n".join(lines.freeze()))
+  }
+  if request.path == "/kvValue" {
+    return match host.kvValue(app, query.get("key").unwrapOr("")) {
+      Ok(entry) => answer(200, "{entry.key} | {entry.value} | {entry.bytes} | {entry.cut}")
+      Err(error) => answer(404, error.message)
+    }
+  }
+  if request.path == "/logs" {
+    var lines = Vector.of()
+    for line in host.logs(app, Int.parse(query.get("n").unwrapOr("50")).unwrapOr(50)) {
+      lines.push("{line.atMs} | {line.level} | {line.text}")
     }
     return answer(200, "\n".join(lines.freeze()))
   }

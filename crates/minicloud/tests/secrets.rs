@@ -534,7 +534,12 @@ fn minicloud(args: &[&str], stdin: &[u8]) -> (bool, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    // A subcommand that refuses its arguments — `secret set "a b"` — is
+    // gone before this is written, and a closed pipe is its answer, not a
+    // failure of the test: what it said is asserted on below.
+    if let Err(error) = child.stdin.take().unwrap().write_all(stdin) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+    }
     let output = child.wait_with_output().unwrap();
     (
         output.status.success(),

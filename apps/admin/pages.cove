@@ -111,6 +111,21 @@ table.cards tr.head:hover th\{background:var(--soft)\}
 table.facts th\{width:34%;background:transparent;color:var(--muted);font-weight:600;white-space:nowrap\}
 td .state\{margin-right:.3em\}
 .nums\{white-space:nowrap;font-variant-numeric:tabular-nums\}
+.crumb\{margin:0 0 .2em;font-size:13px;color:var(--muted)\}
+.crumb a\{color:var(--muted)\}
+.lvl\{display:inline-block;min-width:4.2em;padding:.08em .5em;border-radius:.4em;font-family:ui-monospace,monospace;font-size:11.5px;font-weight:700;text-align:center\}
+.lvl-info\{color:var(--off);background:var(--off-bg)\}
+.lvl-warn\{color:var(--warn);background:var(--warn-bg)\}
+.lvl-error\{color:var(--bad);background:var(--bad-bg)\}
+.lvl-host\{color:var(--link);background:var(--soft)\}
+table.log td\{padding:.3em .8em;border-bottom:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px\}
+table.log td.at\{white-space:nowrap;color:var(--muted)\}
+table.log td.said\{width:100%;white-space:pre-wrap;word-break:break-word\}
+table.log td.said .lvl\{margin-right:.6em\}
+table.log tr:nth-child(odd) td\{background:var(--soft)\}
+table.log tr:hover td\{background:var(--line)\}
+td.value\{max-width:52em\}
+td.value code\{display:inline-block;max-width:100%;white-space:pre-wrap;word-break:break-all\}
 @media (min-width:761px)\{td.nowrap\{white-space:nowrap\}\}
 .when\{white-space:nowrap;color:var(--muted);font-size:13px\}"
 }
@@ -141,6 +156,7 @@ button.danger:hover\{border-color:var(--bad);background:var(--bad-bg)\}
 .actions\{display:flex;flex-wrap:wrap;align-items:center;gap:.6em .9em;margin:.9em 0 0\}
 .actions p,.actions .muted\{margin:0;font-size:13px\}
 .inline\{display:flex;flex-wrap:wrap;align-items:center;gap:.4em\}
+.inline input\{width:18em\}
 .inline input[type=password]\{width:11em\}
 .inline label\{display:flex;align-items:center;gap:.35em;font-size:13px\}"
 }
@@ -165,6 +181,11 @@ table.cards td.title::before\{content:none\}
 table.cards td.block\{text-align:left\}
 table.cards td.block::before\{float:none;display:block;max-width:none;margin:0 0 .3em\}
 table.facts th\{width:40%\}
+table.log,table.log tr\{display:block;width:auto\}
+table.log tr\{padding:.3em .1em\}
+table.log td\{display:inline;padding:0\}
+table.log td.at\{margin-right:.5em;font-size:11.5px\}
+td.value\{max-width:none\}
 .fields\{grid-template-columns:1fr\}
 .caps\{grid-template-columns:repeat(auto-fill,minmax(10em,1fr))\}
 .inline input[type=password]\{width:100%\}
@@ -309,13 +330,14 @@ fn appPage(
     let changed = if app.limitsChanged.contains(limitKey(field.name)) { " <span class=added title=\"set here, not in app.toml\">(changed)</span>" } else { "" }
     limitRows.push("<tr><th>{h(field.label)}</th><td class=nums>{limitValue(app.limits, field.name)}{changed}</td></tr>")
   }
-  let store = if app.kvKeys < 0 { "<span class=muted>–</span>" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
+  let held = if app.kvKeys < 0 { "<span class=muted>–</span>" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
+  let store = if app.granted.contains("kv") { "{held} · <a href=\"{h(at)}/kv\">browse</a>" } else { held }
   let facts = "<div class=\"scroll narrow\"><table class=facts><tr><th>state</th><td>{badge(app.state)}</td></tr><tr><th>version</th><td><code>{h(app.version)}</code> <span class=muted>{h(app.tier)}</span></td></tr><tr><th>entry</th><td><code>{h(app.entry)}</code></td></tr><tr><th>reached</th><td>{if app.hosts.length() > 0 { "by hostname {names(app.hosts)} only" } else { "<code>/{h(app.name)}/</code>" }}</td></tr><tr><th>code requires</th><td>{names(app.required)}{if app.requiredOpen { " <span class=muted>(at least: it makes a call the checker cannot follow)</span>" } else { "" }}</td></tr><tr><th>granted</th><td>{grantList(app)}</td></tr><tr><th>fetch allowlist</th><td>{names(app.fetchAllow)}</td></tr><tr><th>requests</th><td>{app.served} served, {app.ok} ok, {app.errors} errors, {app.rejected} rejected; {app.inFlight} in flight, {app.queued} queued</td></tr><tr><th>store</th><td>{store}</td></tr></table></div><h2>Limits</h2><div class=\"scroll narrow\"><table class=facts>{"".join(limitRows.freeze())}</table></div>"
   layout(
     base,
     "apps",
     app.name,
-    "<h1>{h(app.name)} {badge(app.state)}</h1>{notice}{reason}{facts}{enableForm(at, app)}{configureForm(at, app, capabilities, posted)}{resetForm(at)}{errorsTable(app.recentErrors)}",
+    "<h1>{h(app.name)} {badge(app.state)}</h1>{notice}{reason}{facts}{enableForm(at, app)}{configureForm(at, app, capabilities, posted)}{resetForm(at)}{errorsTable(app.recentErrors)}{logSection(at, app)}",
   )
 }
 
@@ -414,6 +436,202 @@ fn errorsTable(errors: Array<host.Failure>) -> String {
     )
   }
   "<h2>Recent errors</h2><div class=\"scroll cardwrap\"><table class=cards><tr class=head><th>at (UTC)</th><th>kind</th><th>status</th><th>version</th><th>message</th></tr>{"".join(rows.freeze())}</table></div>"
+}
+
+// ------------------------------------------- an app's store and its log
+
+/// How many keys a page of the store shows.
+fn storePageSize() -> Int {
+  50
+}
+
+/// The path of an app's pages.
+fn appAt(base: String, app: host.App) -> String {
+  "{base}/apps/{app.name}"
+}
+
+/// Where the page is, above its heading.
+fn crumb(base: String, app: host.App, here: String) -> String {
+  "<p class=crumb><a href=\"{h(base)}/\">apps</a> / <a href=\"{h(appAt(base, app))}\">{h(app.name)}</a> / {h(here)}</p>"
+}
+
+/// The time of day of `millis`, the whole stamp as its title.
+fn atTime(millis: Int) -> String {
+  let stamp = text.isoTime(millis)
+  let clock = stamp.sliceBytes(11, 23).unwrapOr(stamp)
+  "<span title=\"{h(stamp)}\">{h(clock)}</span>"
+}
+
+/// One app's store: a page of its keys, or — with `?key=` — one key whole.
+/// Reading only: the admin app has no way to write to another app's store,
+/// and the host gives it none.
+fn storePage(base: String, app: host.App, request: web.Request) -> String {
+  let key = request.query.get("key").unwrapOr("")
+  if key != "" {
+    return storeKeyPage(base, app, key)
+  }
+  let at = appAt(base, app)
+  let prefix = request.query.get("prefix").unwrapOr("")
+  let after = request.query.get("after").unwrapOr("")
+  if !app.granted.contains("kv") {
+    return layout(
+      base,
+      "apps",
+      "{app.name} store",
+      "{crumb(base, app, "store")}<h1>{h(app.name)} <span class=muted>store</span></h1><p class=lead><code>{h(app.name)}</code> is not granted <code>kv</code>: it has no store, and the host keeps no file for it.</p>",
+    )
+  }
+  // One more than the page, to know whether there is another page.
+  let size = storePageSize()
+  let found = host.kv(app.name, prefix, after, size + 1)
+  var rows = Vector.of()
+  var at_ = 0
+  var last = ""
+  for entry in found {
+    if at_ < size {
+      let link = "{at}/kv?key={text.urlEncode(entry.key)}"
+      // The host cut at its own length; a row of a table wants less again.
+      let preview = text.truncateBytes(entry.value, 140)
+      let cut = entry.cut || preview.byteLength() < entry.value.byteLength()
+      let shown = if cut { "{h(preview)}<span class=muted>…</span>" } else { h(preview) }
+      rows.push(
+        "<tr><td class=title data-label=key><a href=\"{h(link)}\"><code>{h(entry.key)}</code></a></td><td class=\"value block\" data-label=value><code>{shown}</code></td><td class=nums data-label=size>{text.bytes(entry.bytes)}</td></tr>",
+      )
+      last = entry.key
+    }
+    at_ = at_ + 1
+  }
+  let more = at_ > size
+  let table = if rows.length() == 0 {
+    let why = if prefix == "" && after == "" {
+      "This store has no keys yet."
+    } else {
+      "No key here."
+    }
+    "<p class=muted>{h(why)}</p>"
+  } else {
+    "<div class=\"scroll cardwrap\"><table class=cards><tr class=head><th>key</th><th>value</th><th>size</th></tr>{"".join(rows.freeze())}</table></div>"
+  }
+  let filter = "<form class=inline method=get action=\"{h(at)}/kv\"><label for=prefix>keys starting with</label><input id=prefix name=prefix value=\"{h(prefix)}\" placeholder=\"(any)\"><button>Show</button></form>"
+  var steps = Vector.of()
+  if after != "" {
+    steps.push("<a href=\"{h("{at}/kv?prefix={text.urlEncode(prefix)}")}\">← the first {size}</a>")
+  }
+  if more {
+    steps.push("<a href=\"{h("{at}/kv?prefix={text.urlEncode(prefix)}&after={text.urlEncode(last)}")}\">the next {size} →</a>")
+  }
+  let paging = if steps.length() == 0 { "" } else { "<p class=actions>{" ".join(steps.freeze())}</p>" }
+  let held = if app.kvKeys < 0 {
+    "The host has not opened this store since it started."
+  } else {
+    "{app.kvKeys} keys, {text.bytes(app.kvBytes)} in all."
+  }
+  layout(
+    base,
+    "apps",
+    "{app.name} store",
+    "{crumb(base, app, "store")}<h1>{h(app.name)} <span class=muted>store</span></h1><p class=lead>{h(held)} A value longer than the column is cut; the key opens it whole. Nothing here writes: the admin app reads another app's store and cannot change it.</p>{filter}{table}{paging}",
+  )
+}
+
+/// One key of an app's store, its value whole (cut at what the host
+/// carries, which the page says).
+fn storeKeyPage(base: String, app: host.App, key: String) -> String {
+  let at = appAt(base, app)
+  let back = "<p class=actions><a href=\"{h(at)}/kv\">← every key</a></p>"
+  match host.kvValue(app.name, key) {
+    Ok(entry) => {
+      let cut = if entry.cut { " <span class=muted>(cut: the whole value is {text.bytes(entry.bytes)})</span>" } else { "" }
+      let facts = "<div class=\"scroll narrow\"><table class=facts><tr><th>key</th><td><code>{h(entry.key)}</code></td></tr><tr><th>size</th><td>{text.bytes(entry.bytes)}{cut}</td></tr></table></div>"
+      layout(
+        base,
+        "apps",
+        "{app.name} store",
+        "{crumb(base, app, "store")}<h1>{h(app.name)} <span class=muted>key</span></h1>{facts}<h2>Value</h2><pre>{h(entry.value)}</pre>{back}",
+      )
+    }
+    Err(error) => layout(
+      base,
+      "apps",
+      "{app.name} store",
+      "{crumb(base, app, "store")}<h1>{h(app.name)} <span class=muted>key</span></h1><div class=problem><b>Not read.</b> The host said:<pre>{h(error.message)}</pre></div>{back}",
+    )
+  }
+}
+
+/// The last few lines of an app's log, on the app's own page, with the
+/// way to the rest of them.
+fn logSection(at: String, app: host.App) -> String {
+  let lines = host.logs(app.name, 10)
+  let more = "<p class=actions><a href=\"{h(at)}/logs\">the last 200 lines →</a></p>"
+  "<h2>Log</h2>{logTable(lines)}{more}"
+}
+
+/// The lines of a log, oldest first, as a table of the time and what was
+/// said. `lines` is what the host gave: it is never markup.
+fn logTable(lines: Array<host.LogLine>) -> String {
+  if lines.length() == 0 {
+    return "<p class=muted>No lines yet.</p>"
+  }
+  var rows = Vector.of()
+  for line in lines {
+    rows.push(
+      "<tr><td class=at>{atTime(line.atMs)}</td><td class=said><span class=\"lvl {levelClass(line.level)}\">{h(line.level)}</span>{h(line.text)}</td></tr>",
+    )
+  }
+  "<div class=scroll><table class=log>{"".join(rows.freeze())}</table></div>"
+}
+
+/// The class a level is shown with; anything the host grows later reads as
+/// a level of its own without a colour of its own.
+fn levelClass(level: String) -> String {
+  if level == "info" || level == "warn" || level == "error" || level == "host" {
+    return "lvl-{level}"
+  }
+  "lvl-info"
+}
+
+/// How many lines a log page shows, as asked for.
+fn logLines(request: web.Request) -> Int {
+  match Int.parse(request.query.get("n").unwrapOr("").trim()) {
+    Ok(asked) => {
+      if asked < 1 {
+        1
+      } else if asked > 1000 {
+        1000
+      } else {
+        asked
+      }
+    }
+    Err(_) => 200
+  }
+}
+
+/// One app's log: the host's ring of its last lines, oldest first.
+fn logPage(base: String, app: host.App, request: web.Request) -> String {
+  let at = appAt(base, app)
+  let n = logLines(request)
+  let lines = host.logs(app.name, n)
+  var steps = Vector.of()
+  for size in Vector.of(50, 200, 1000).freeze() {
+    if size == n {
+      steps.push("<b>{size}</b>")
+    } else {
+      steps.push("<a href=\"{h("{at}/logs?n={size}")}\">{size}</a>")
+    }
+  }
+  let how = "<p class=actions><span class=muted>lines:</span> {" ".join(steps.freeze())}</p>"
+  layout(
+    base,
+    "apps",
+    "{app.name} log",
+    "{crumb(base, app, "log")}<h1>{h(app.name)} <span class=muted>log</span></h1><p class=lead>What the app logged and what the host said of it, oldest first: {lines.length()} lines, of the last {logKept()} the host keeps in memory, which a restart empties. Every line is also appended to <code>&lt;data&gt;/{h(app.name)}/log.txt</code>, which this page does not read.</p>{how}{logTable(lines)}{how}",
+  )
+}
+
+/// How many lines the host's ring keeps (`crate::logs::LOG_LINES`).
+fn logKept() -> Int {
+  1000
 }
 
 /// What a `?done=` says after a change went through.

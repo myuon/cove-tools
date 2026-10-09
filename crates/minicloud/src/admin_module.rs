@@ -12,6 +12,9 @@
 //! | `host.apps()` | `Array<host.App>`: every app the host has, in load order — its state (`serving`, `disabled`, `refused`, `removed`) and why, version, tier, hostnames, what its entry requires and what it is granted (and which of those grants the admin changed), its fetch allowlist, its limits, its counters and its recent errors |
 //! | `host.capabilities()` | `Array<String>`: every capability the host's modules declare, the ones a grant may name |
 //! | `host.history(limit)` | `Array<host.Change>`: the newest `limit` changes, newest first |
+//! | `host.kv(app, prefix, after, limit)` | `Array<host.KvEntry>`: keys of the app's store starting with `prefix` and greater than `after` (`""` for the first page), ascending, at most `limit` (0–500); each value cut to [`crate::kv::PEEK_VALUE_CHARS`] — read only, and empty for an app with no store |
+//! | `host.kvValue(app, key)` | `Result<host.KvEntry, Error>`: one key, its value cut past [`crate::kv::READ_VALUE_CHARS`]; an `Err` when the app has no such key |
+//! | `host.logs(app, limit)` | `Array<host.LogLine>`: the last `limit` (0–[`crate::logs::LOG_LINES`]) lines of the app's log, oldest first |
 //! | `host.setEnabled(app, enabled, who)` | `Result<String, Error>`: routes to the app again, or stops; nothing is reloaded |
 //! | `host.configure(app, settings, who)` | `Result<String, Error>`: the app's grant, allowlist and limits become `settings`, if the app loads with them |
 //! | `host.reset(app, who)` | `Result<String, Error>`: drops the admin's changes, back to `app.toml` |
@@ -41,7 +44,8 @@ use cove_runtime::{
 
 use crate::config::{LimitsFile, ADMIN_CAPABILITY};
 use crate::hosts::{AppContext, HostModule, PendingWork};
-use crate::manage::{AppInfo, SecretInfo, Settings, Via};
+use crate::logs::Line;
+use crate::manage::{AppInfo, KvRow, SecretInfo, Settings, Via};
 use crate::overrides::{Change, Control};
 
 const STR: HostType = HostType::String;
@@ -98,6 +102,24 @@ pub const ADMIN: ModuleSchema = ModuleSchema {
             "history",
             &[INT],
             HostType::Array(&HostType::Named("host.Change")),
+            Effect::Read,
+        ),
+        op(
+            "kv",
+            &[STR, STR, STR, INT],
+            HostType::Array(&HostType::Named("host.KvEntry")),
+            Effect::Read,
+        ),
+        op(
+            "kvValue",
+            &[STR, STR],
+            HostType::Result(&HostType::Named("host.KvEntry"), &HostType::Error),
+            Effect::Read,
+        ),
+        op(
+            "logs",
+            &[STR, INT],
+            HostType::Array(&HostType::Named("host.LogLine")),
             Effect::Read,
         ),
         op(
@@ -214,6 +236,23 @@ pub const ADMIN: ModuleSchema = ModuleSchema {
                 // The apps whose app.toml takes a secret from it.
                 field("apps", STRINGS),
             ],
+        },
+        TypeSchema {
+            name: "KvEntry",
+            cases: &[],
+            fields: &[
+                field("key", STR),
+                field("value", STR),
+                // The whole value's length in bytes.
+                field("bytes", INT),
+                // Whether `value` is shorter than the whole.
+                field("cut", HostType::Bool),
+            ],
+        },
+        TypeSchema {
+            name: "LogLine",
+            cases: &[],
+            fields: &[field("atMs", INT), field("level", STR), field("text", STR)],
         },
         TypeSchema {
             name: "Change",
@@ -348,6 +387,29 @@ fn secret_value(info: SecretInfo) -> Value {
             ("set", Value::bool(info.set)),
             ("updatedMs", int(info.updated_ms.unwrap_or(0))),
             ("apps", strings(info.apps)),
+        ],
+    )
+}
+
+fn kv_value(row: KvRow) -> Value {
+    Value::structure(
+        "host.KvEntry",
+        vec![
+            ("key", Value::string(row.key)),
+            ("value", Value::string(row.value)),
+            ("bytes", int(row.bytes)),
+            ("cut", Value::bool(row.cut)),
+        ],
+    )
+}
+
+fn log_line_value(line: Line) -> Value {
+    Value::structure(
+        "host.LogLine",
+        vec![
+            ("atMs", int(line.at_ms)),
+            ("level", Value::string(line.level)),
+            ("text", Value::string(line.text)),
         ],
     )
 }
@@ -545,6 +607,42 @@ impl HostApi for AdminHost {
                     .ok_or_else(|| RuntimeError::new("admin: the host is shutting down"))?;
                 Ok(Value::array(
                     front.secret_infos().into_iter().map(secret_value),
+                ))
+            }
+            "kv" => {
+                let front = control
+                    .front()
+                    .ok_or_else(|| RuntimeError::new("admin: the host is shutting down"))?;
+                let text = |at: usize| args.get(at).and_then(Value::as_str).unwrap_or_default();
+                let limit = args.get(3).and_then(Value::as_int).unwrap_or(0);
+                let rows = front
+                    .app_kv(text(0), text(1), text(2), limit.clamp(0, 500))
+                    .map_err(|why| RuntimeError::new(format!("admin: kv: {why}")))?;
+                Ok(Value::array(rows.into_iter().map(kv_value)))
+            }
+            "kvValue" => {
+                let front = control
+                    .front()
+                    .ok_or_else(|| RuntimeError::new("admin: the host is shutting down"))?;
+                let text = |at: usize| args.get(at).and_then(Value::as_str).unwrap_or_default();
+                let (app, key) = (text(0), text(1));
+                Ok(match front.app_kv_value(app, key) {
+                    Ok(Some(row)) => Value::ok(kv_value(row)),
+                    Ok(None) => {
+                        Value::err(Value::error(format!("no key `{key}` in `{app}`'s store")))
+                    }
+                    Err(why) => Value::err(Value::error(why)),
+                })
+            }
+            "logs" => {
+                let front = control
+                    .front()
+                    .ok_or_else(|| RuntimeError::new("admin: the host is shutting down"))?;
+                let limit = args.get(1).and_then(Value::as_int).unwrap_or(0);
+                let limit = limit.clamp(0, crate::logs::LOG_LINES as i64) as usize;
+                let app = args.first().and_then(Value::as_str).unwrap_or_default();
+                Ok(Value::array(
+                    front.app_logs(app, limit).into_iter().map(log_line_value),
                 ))
             }
             "history" => {

@@ -108,6 +108,66 @@ fn the_list_shows_every_app_its_state_and_its_capabilities() {
 }
 
 #[test]
+fn the_admin_app_reads_another_apps_store_and_log_and_makes_no_store() {
+    let apps = apps(&[control(), sample("notes"), sample("hello")]);
+    let host = start(&apps, 2);
+    for (name, body) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
+        let request = format!(
+            "PUT /notes/{name} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(send_raw(host.addr, request.as_bytes()).status, 201);
+    }
+
+    let all = op(&host, "/kv?app=notes&n=10");
+    assert_eq!(all.status, 200, "{}", all.body);
+    assert_eq!(
+        all.body.lines().collect::<Vec<_>>(),
+        [
+            "note:alpha | one | 3 | false",
+            "note:beta | two | 3 | false",
+            "note:gamma | three | 5 | false"
+        ]
+    );
+    let some = op(&host, "/kv?app=notes&prefix=note:&after=note:alpha&n=1");
+    assert_eq!(some.body.trim(), "note:beta | two | 3 | false");
+    let none = op(&host, "/kv?app=notes&prefix=zzz&n=10");
+    assert_eq!(none.body.trim(), "");
+
+    let one = op(&host, "/kvValue?app=notes&key=note:gamma");
+    assert_eq!(one.status, 200, "{}", one.body);
+    assert_eq!(one.body.trim(), "note:gamma | three | 5 | false");
+    let missing = op(&host, "/kvValue?app=notes&key=todo");
+    assert_eq!(missing.status, 404);
+    assert!(
+        missing.body.contains("no key `todo` in `notes`'s store"),
+        "{}",
+        missing.body
+    );
+
+    let logs = op(&host, "/logs?app=notes&n=20");
+    assert_eq!(logs.status, 200, "{}", logs.body);
+    assert!(
+        logs.body
+            .lines()
+            .any(|l| l.contains(" | info | stored gamma")),
+        "{}",
+        logs.body
+    );
+
+    // An app with no store has none made by being looked at, and a name
+    // that is no app reads nothing.
+    let hello = op(&host, "/kv?app=hello&n=10");
+    assert_eq!(hello.status, 200, "{}", hello.body);
+    assert_eq!(hello.body.trim(), "");
+    assert!(!apps.data.join("hello").join("kv.sqlite3").exists());
+    assert_eq!(op(&host, "/kv?app=..&n=10").body.trim(), "");
+    assert_eq!(op(&host, "/kvValue?app=hello&key=x").status, 404);
+    assert!(!apps.data.join("hello").join("kv.sqlite3").exists());
+}
+
+#[test]
 fn a_disabled_app_answers_503_finishes_what_it_had_and_keeps_its_data() {
     let apps = apps(&[control(), sample("notes"), sample("slow"), sample("hello")]);
     let host = start(&apps, 2);
@@ -753,4 +813,69 @@ fn a_persisted_override_with_the_removed_fuel_limit_does_not_stop_the_app() {
     // The next change written leaves it out.
     assert_eq!(op(&host, "/configure?app=hello&inflight=7").status, 200);
     assert!(!overrides(&apps.data).contains("fuel"));
+}
+
+#[test]
+fn the_pages_read_an_apps_store_and_its_log() {
+    let apps = ui_apps();
+    let host = deployed(&apps);
+    // What `notes` holds and what it said of holding it.
+    // The third key's path is encoded: its key holds a space and an `&`.
+    for (key, value) in [("todo", "buy milk"), ("zeta", "last"), ("a%20b%26c", "odd")] {
+        let put = send_raw(
+            host.addr,
+            format!(
+                "PUT /notes/{key} HTTP/1.1\r\nHost: covtools.ramda.io\r\nConnection: close\r\n\
+                 Content-Length: {}\r\n\r\n{value}",
+                value.len()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(put.status, 201, "{}", put.body);
+    }
+    let store = ui(&host, "GET", "/apps/notes/kv", &authed(), "");
+    assert_eq!(store.status, 200, "{}", store.body);
+    assert!(store.body.contains("note:todo"), "{}", store.body);
+    assert!(store.body.contains("buy milk"), "{}", store.body);
+    // A key of its own, whatever is in the key: the link carries it encoded.
+    // `notes` keys by the path as it came, so this key holds the `%20` and
+    // the `%26` themselves, and the link encodes those percent signs again.
+    let odd = "key=note%3Aa%2520b%2526c";
+    assert!(store.body.contains(odd), "{}", store.body);
+    let followed = ui(
+        &host,
+        "GET",
+        &format!("/apps/notes/kv?{odd}"),
+        &authed(),
+        "",
+    );
+    assert_eq!(followed.status, 200, "{}", followed.body);
+    assert!(followed.body.contains(">odd<"), "{}", followed.body);
+    let key = ui(
+        &host,
+        "GET",
+        "/apps/notes/kv?key=note%3Atodo",
+        &authed(),
+        "",
+    );
+    assert_eq!(key.status, 200, "{}", key.body);
+    assert!(key.body.contains("buy milk"), "{}", key.body);
+    let missing = ui(&host, "GET", "/apps/notes/kv?key=nothing", &authed(), "");
+    assert_eq!(missing.status, 200, "{}", missing.body);
+    assert!(missing.body.contains("Not read."), "{}", missing.body);
+    // The log, with the level of each line.
+    let log = ui(&host, "GET", "/apps/notes/logs?n=50", &authed(), "");
+    assert_eq!(log.status, 200, "{}", log.body);
+    assert!(log.body.contains("lvl-info"), "{}", log.body);
+    assert!(log.body.contains("stored todo"), "{}", log.body);
+    // An app with no store says so, and is given none by being looked at.
+    let none = ui(&host, "GET", "/apps/hello/kv", &authed(), "");
+    assert_eq!(none.status, 200, "{}", none.body);
+    assert!(none.body.contains("is not granted"), "{}", none.body);
+    assert!(!apps.data.join("hello/kv.sqlite3").exists());
+    // Neither page writes, whatever is posted to it.
+    for path in ["/apps/notes/kv", "/apps/notes/logs"] {
+        let posted = ui(&host, "POST", path, &same_site(), "");
+        assert_eq!(posted.status, 404, "{path}: {}", posted.body);
+    }
 }
