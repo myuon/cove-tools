@@ -64,6 +64,43 @@ export fn urlDecode(text: String) -> String {
   decodeUtf8(bytes.freeze())
 }
 
+/// `text` as one value of a query string: every byte but the unreserved
+/// ones (`A-Z a-z 0-9 - . _ ~`) written `%XX`, so that a key holding a
+/// space, an `&` or a `#` survives being read back by the host. A space is
+/// `%20` rather than `+`: this is a URL, not a form body.
+export fn urlEncode(text: String) -> String {
+  var out = Vector.of()
+  let end = text.byteLength()
+  var at = 0
+  while at < end {
+    let byte = text.byteAt(at)
+    if unreserved(byte) {
+      out.push(text.sliceBytes(at, at + 1).unwrapOr(""))
+    } else {
+      out.push("%{hexDigit(floorDiv(byte, 16))}{hexDigit(byte % 16)}")
+    }
+    at += 1
+  }
+  "".join(out.freeze())
+}
+
+/// Whether `byte` is one `urlEncode` leaves as it is. Every one of them is
+/// ASCII, so a byte of a multi-byte character is never left alone.
+fn unreserved(byte: Int) -> Bool {
+  (byte >= 65 && byte <= 90) ||
+    (byte >= 97 && byte <= 122) ||
+    (byte >= 48 && byte <= 57) ||
+    byte == 45 ||
+    byte == 46 ||
+    byte == 95 ||
+    byte == 126
+}
+
+/// `value`, 0 to 15, as an upper-case hexadecimal digit.
+fn hexDigit(value: Int) -> String {
+  "0123456789ABCDEF".sliceBytes(value, value + 1).unwrapOr("0")
+}
+
 /// UTF-8 bytes as text; a sequence that is not UTF-8 is U+FFFD.
 export fn decodeUtf8(bytes: Array<Int>) -> String {
   var parts = Vector.of()

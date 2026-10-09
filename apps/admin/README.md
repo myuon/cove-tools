@@ -2,7 +2,9 @@
 
 What the host runs, and the forms that change it (issue #17): enable or
 disable an app, change its grant, its fetch allowlist and its limits, reset
-it to its `app.toml`, and read the change history. Pages, form reading,
+it to its `app.toml`, and read the change history. What each app holds and
+what it said are there to read as well — a page of its `kv` store and the
+last lines of its log — and only to read. Pages, form reading,
 validation and rendering are Cove; everything it learns of the host and every
 change it makes go through one host module, `host`, whose capability is
 `admin` — and **only this app may be granted `admin`**. The startup banner
@@ -22,6 +24,8 @@ in [docs/design.md, Administering apps at run time](../../docs/design.md#adminis
 | `POST /apps/<app>/enable`, `/disable` | routes to the app again, or stops (503; its data stays) |
 | `POST /apps/<app>/configure` | the grant (`cap.<name>` checkboxes), the allowlist (`allow`, one per line) and every limit (`maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) |
 | `POST /apps/<app>/reset` | drops the changes made here, back to `app.toml` |
+| `GET /apps/<app>/kv` | a page of the app's store: 50 keys at a time (`prefix` to narrow, `after` to go on), each value cut to a line; `?key=<key>` is one key, its value whole. **Reading only** — nothing here writes to another app's store |
+| `GET /apps/<app>/logs` | the last lines the app logged and the host said of it, oldest first, with their level; `?n=` how many (1–1000, 200 by default). The ring is in memory, so a restart empties it |
 | `GET /history` | every change, made here or by `minicloud` on the machine, refused ones included |
 | `GET /secrets` | the host's secret store: each secret stored or used by an app — set or unset, when it was set, which apps use it — **never a value** |
 | `POST /secrets/set` | `name` and `value` (a password field, never filled back in): stores it and reloads the apps that use it; the page says what each reload came to |

@@ -491,7 +491,10 @@ name, so upgrading from cove-tools is `install.sh` and a restart:
 [`apps/admin`](apps/admin/README.md) is the browser's way to run the host:
 every app's state, version, grant, limits, counters and recent errors;
 enable and disable; change an app's grant, fetch allowlist and limits; the
-change history; and the secret store. It is reached only by its own
+change history; and the secret store. It also reads what an app holds and
+what it said — a page of its `kv` store, one key at a time, and the last
+lines of its log — which it can only read: the host gives it no way to
+write to another app's store. It is reached only by its own
 hostnames (`[route] hosts`): on the server `https://covtools-admin.ramda.io`
 behind Cloudflare Access, and locally `http://admin.localhost:8080/` with
 `ADMIN_UI_TOKEN` as the password:
@@ -620,6 +623,8 @@ update, a run that would not yield) are kept in memory (the last 1,000, at
 `/_host/apps/<app>/logs`) and written to `<data>/<app>/log.txt`, rotated to
 `log.1.txt` past 1 MiB. Without `--quiet`, `log` lines also go to stdout; the
 host's own messages go to stderr — on the server, `journalctl -u cove-tools`.
+The admin app shows the same ring, a line at a time with its level
+(`/apps/<app>/logs`), so the lines are there in a browser as well.
 
 ## Security
 

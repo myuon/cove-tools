@@ -16,6 +16,18 @@ test fn decodesForms() -> Result<Unit, Error> {
   Ok(())
 }
 
+test fn encodesQueryValues() -> Result<Unit, Error> {
+  assertEqual(urlEncode("plain-value_1.0~"), "plain-value_1.0~")?
+  assertEqual(urlEncode("a b&c=d#e/f"), "a%20b%26c%3Dd%23e%2Ff")?
+  // Every byte of a multi-byte character is written, none left alone.
+  assertEqual(urlEncode("éあ"), "%C3%A9%E3%81%82")?
+  assertEqual(urlEncode(""), "")?
+  // What it writes, `urlDecode` reads back.
+  assertEqual(urlDecode(urlEncode("a b&c=d#e/f")), "a b&c=d#e/f")?
+  assertEqual(urlDecode(urlEncode("éあ")), "éあ")?
+  Ok(())
+}
+
 test fn writesIsoTimes() -> Result<Unit, Error> {
   assertEqual(isoTime(0), "1970-01-01T00:00:00.000Z")?
   assertEqual(isoTime(951782400000), "2000-02-29T00:00:00.000Z")?

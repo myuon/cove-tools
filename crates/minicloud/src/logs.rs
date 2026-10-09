@@ -78,6 +78,49 @@ impl LogRing {
         }
         out
     }
+
+    /// The last `n` lines, oldest first, each split into its parts.
+    pub fn tail_lines(&self, n: usize) -> Vec<Line> {
+        let lines = self.lines.lock().unwrap();
+        let skip = lines.len().saturating_sub(n);
+        lines.iter().skip(skip).map(|l| Line::parse(l)).collect()
+    }
+}
+
+/// One line of an app's log: when it was written, at what level, and what it
+/// said.
+pub struct Line {
+    /// Milliseconds since the epoch; 0 for a line this module cannot read.
+    pub at_ms: u64,
+    pub level: String,
+    pub text: String,
+}
+
+impl Line {
+    /// Reads a line as [`LogRing::push`] writes it, `<secs>.<millis> <level>:
+    /// <text>`; one of any other shape is all `text`, with no time or level.
+    fn parse(entry: &str) -> Line {
+        let parsed = (|| {
+            let (stamp, rest) = entry.split_once(' ')?;
+            let (secs, millis) = stamp.split_once('.')?;
+            let (level, text) = rest.split_once(": ")?;
+            if millis.len() != 3 || level.is_empty() || level.contains(char::is_whitespace) {
+                return None;
+            }
+            let at_ms =
+                secs.parse::<u64>().ok()?.checked_mul(1000)? + millis.parse::<u64>().ok()?;
+            Some(Line {
+                at_ms,
+                level: level.to_string(),
+                text: text.to_string(),
+            })
+        })();
+        parsed.unwrap_or_else(|| Line {
+            at_ms: 0,
+            level: String::new(),
+            text: entry.to_string(),
+        })
+    }
 }
 
 /// The one thread that appends to log files.
@@ -139,6 +182,46 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[1].ends_with(&format!("info: line {}", LOG_LINES + 4)));
         assert_eq!(ring.tail(usize::MAX).lines().count(), LOG_LINES);
+    }
+
+    #[test]
+    fn lines_split_into_time_level_and_text() {
+        let ring = LogRing::default();
+        ring.push("warn", "disk: nearly full");
+        ring.push("info", "second");
+        ring.push("info", "third");
+        let lines = ring.tail_lines(2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            (lines[0].level.as_str(), lines[0].text.as_str()),
+            ("info", "second")
+        );
+        assert!(lines[0].at_ms > 1_000_000_000_000);
+        let all = ring.tail_lines(usize::MAX);
+        assert_eq!(all[0].level, "warn");
+        assert_eq!(all[0].text, "disk: nearly full");
+        let line = Line::parse("1700000000.042 host: hello");
+        assert_eq!(
+            (line.at_ms, line.level.as_str(), line.text.as_str()),
+            (1_700_000_000_042, "host", "hello")
+        );
+    }
+
+    #[test]
+    fn a_line_of_another_shape_is_all_text() {
+        for broken in [
+            "",
+            "no stamp here",
+            "12.5 info: short millis",
+            "x.123 info: nan",
+            "1.123 info no colon",
+        ] {
+            let line = Line::parse(broken);
+            assert_eq!(
+                (line.at_ms, line.level.as_str(), line.text.as_str()),
+                (0, "", broken)
+            );
+        }
     }
 
     #[test]

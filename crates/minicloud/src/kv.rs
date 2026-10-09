@@ -49,7 +49,7 @@ use cove_runtime::{
     Effect, FieldSchema, HostApi, HostType, ModuleSchema, OperationSchema, RuntimeError,
     TypeSchema, Value,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::config::KvLimits;
 use crate::hosts::{AppContext, HostModule};
@@ -409,6 +409,122 @@ pub fn usage(path: &Path) -> Option<(u64, u64)> {
     Some(usage)
 }
 
+/// The longest value a listing carries; a longer one is cut and `bytes`
+/// says how long the whole of it is.
+pub const PEEK_VALUE_CHARS: usize = 512;
+
+/// The longest value one key's read carries.
+pub const READ_VALUE_CHARS: usize = 64 * 1024;
+
+/// One key as the admin sees it: its value cut to what was asked for, and
+/// how long the whole value is.
+pub struct Peek {
+    pub key: String,
+    pub value: String,
+    /// The whole value's length in bytes, as the quotas count it.
+    pub bytes: u64,
+    /// Whether `value` is shorter than the whole.
+    pub cut: bool,
+}
+
+/// Keys of the store at `path` starting with `prefix`, beyond `from` (`""`
+/// from the start), at most `limit`, oldest key first.
+///
+/// Reads only: the store the running app holds if one is open, else the file
+/// opened read-only — never created, so an app with no store gets none from
+/// being looked at. A store that is not there answers no keys.
+pub fn peek(path: &Path, prefix: &str, from: &str, limit: i64) -> Result<Vec<Peek>, String> {
+    let limit = limit.clamp(0, MAX_LIST);
+    with_reader(path, Vec::new(), |conn| {
+        // Every key starting with `prefix` is at least `prefix` and below
+        // `upper`, as `Store::list` has it.
+        let upper = successor(prefix);
+        let mut sql = String::from(
+            "SELECT key, substr(value, 1, ?5), length(value), length(CAST(value AS BLOB)) \
+             FROM kv WHERE key >= ?1",
+        );
+        if upper.is_some() {
+            sql.push_str(" AND key < ?2");
+        }
+        if !from.is_empty() {
+            sql.push_str(" AND key > ?3");
+        }
+        sql.push_str(" ORDER BY key LIMIT ?4");
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![
+                prefix,
+                upper.unwrap_or_default(),
+                from,
+                limit,
+                PEEK_VALUE_CHARS as i64
+            ],
+            |row| peek_row(row, PEEK_VALUE_CHARS),
+        )?;
+        rows.collect()
+    })
+}
+
+/// One key of the store at `path`, or `None` when it has none.
+///
+/// The value is cut past [`READ_VALUE_CHARS`]; otherwise as [`peek`].
+pub fn read(path: &Path, key: &str) -> Result<Option<Peek>, String> {
+    with_reader(path, None, |conn| {
+        conn.query_row(
+            "SELECT key, substr(value, 1, ?2), length(value), length(CAST(value AS BLOB)) \
+             FROM kv WHERE key = ?1",
+            params![key, READ_VALUE_CHARS as i64],
+            |row| peek_row(row, READ_VALUE_CHARS),
+        )
+        .optional()
+    })
+}
+
+/// A row of `SELECT key, substr(..), length(value), length(CAST(..))`.
+fn peek_row(row: &rusqlite::Row<'_>, chars: usize) -> rusqlite::Result<Peek> {
+    let whole: i64 = row.get(2)?;
+    let bytes: i64 = row.get(3)?;
+    Ok(Peek {
+        key: row.get(0)?,
+        value: row.get(1)?,
+        bytes: bytes.max(0) as u64,
+        cut: whole > chars as i64,
+    })
+}
+
+/// Runs `read` on the open store at `path`, or on the file opened
+/// read-only; `empty` when there is no file, or no table in it.
+fn with_reader<T>(
+    path: &Path,
+    empty: T,
+    read: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> Result<T, String> {
+    let open = open_stores()
+        .lock()
+        .unwrap()
+        .get(path)
+        .and_then(Weak::upgrade);
+    let outcome = if let Some(store) = open {
+        let store = store.lock().unwrap_or_else(|p| p.into_inner());
+        read(&store.conn)
+    } else {
+        if !path.is_file() {
+            return Ok(empty);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("`{}`: {e}", path.display()))?;
+        read(&conn)
+    };
+    match outcome {
+        Ok(found) => Ok(found),
+        Err(e) if e.to_string().contains("no such table") => Ok(empty),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn storage(why: String) -> RuntimeError {
     RuntimeError::new(format!("kv: the store failed: {why}"))
 }
@@ -591,6 +707,79 @@ mod tests {
         }
         let list = started.elapsed() / 1000;
         println!("kv on disk: put {put:?}, get {get:?}, list of 50 {list:?} per call");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("minicloud-kv-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn peek_lists_by_prefix_and_after() {
+        let dir = scratch("peek");
+        let path = dir.join("kv.sqlite3");
+        {
+            let mut kv = Store::open(&path, KvLimits::default()).unwrap();
+            for key in ["e:1", "e:2", "e:3", "d:9"] {
+                kv.put(key, &format!("v{key}")).unwrap();
+            }
+        }
+        let keys = |found: Vec<Peek>| -> Vec<String> { found.into_iter().map(|p| p.key).collect() };
+        assert_eq!(
+            keys(peek(&path, "", "", 10).unwrap()),
+            ["d:9", "e:1", "e:2", "e:3"]
+        );
+        assert_eq!(
+            keys(peek(&path, "e:", "", 10).unwrap()),
+            ["e:1", "e:2", "e:3"]
+        );
+        assert_eq!(keys(peek(&path, "e:", "e:1", 1).unwrap()), ["e:2"]);
+        let one = read(&path, "e:2").unwrap().unwrap();
+        assert_eq!((one.value.as_str(), one.bytes, one.cut), ("ve:2", 4, false));
+        assert!(read(&path, "nope").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_cuts_long_values_and_says_how_long() {
+        let dir = scratch("cut");
+        let path = dir.join("kv.sqlite3");
+        {
+            let mut kv = Store::open(&path, KvLimits::default()).unwrap();
+            kv.put("long", &"é".repeat(PEEK_VALUE_CHARS + 10)).unwrap();
+            kv.put("short", "ok").unwrap();
+        }
+        let found = peek(&path, "", "", 10).unwrap();
+        assert_eq!(found[0].key, "long");
+        assert!(found[0].cut);
+        assert_eq!(found[0].value.chars().count(), PEEK_VALUE_CHARS);
+        assert_eq!(found[0].bytes, 2 * (PEEK_VALUE_CHARS as u64 + 10));
+        assert!(!found[1].cut);
+        let whole = read(&path, "long").unwrap().unwrap();
+        assert!(!whole.cut);
+        assert_eq!(whole.value.chars().count(), PEEK_VALUE_CHARS + 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_of_a_store_that_is_not_there_is_empty_and_creates_nothing() {
+        let dir = scratch("absent");
+        let path = dir.join("app").join("kv.sqlite3");
+        assert!(peek(&path, "", "", 10).unwrap().is_empty());
+        assert!(read(&path, "k").unwrap().is_none());
+        assert!(!path.exists());
+        assert!(!dir.exists());
+        // A database with no `kv` table is empty too.
+        std::fs::create_dir_all(&dir).unwrap();
+        let bare = dir.join("bare.sqlite3");
+        Connection::open(&bare)
+            .unwrap()
+            .execute_batch("CREATE TABLE other (x);")
+            .unwrap();
+        assert!(peek(&bare, "", "", 10).unwrap().is_empty());
+        assert!(read(&bare, "k").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
