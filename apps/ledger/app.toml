@@ -3,10 +3,9 @@
 grant = ["kv", "log", "auth"]
 
 [limits]
-deadline = "10s"
 # A run of a few hundred measurements is a few hundred kilobytes of JSON,
 # read, checked and stored in one request; a page reads every run it lists.
-fuel = 500000000
+deadline = "10s"
 max_host_calls = 20000
 max_request_bytes = 4194304
 max_response_bytes = 8388608

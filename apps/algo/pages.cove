@@ -70,7 +70,7 @@ fn summary(rows: Array<Array<String>>) -> String {
   for row in rows {
     items.push("<dt>{h(row.get(0).unwrapOr(""))}</dt><dd>{row.get(1).unwrapOr("")}</dd>")
   }
-  items.push("<dt>host meter</dt><dd class=host data-host>run from the form (with scripts on) to read the host's count of this run's fuel, instructions and yields</dd>")
+  items.push("<dt>host meter</dt><dd class=host data-host>run from the form (with scripts on) to read the host's count of this run's instructions and yields</dd>")
   "<dl class=meta>{"".join(items.freeze())}</dl>"
 }
 
@@ -135,7 +135,6 @@ fn script() -> String {
   "'use strict';
 (function () \{
   var stops = \{
-    fuel: 'the run used up its fuel budget (app.toml: limits.fuel) and was stopped by the host',
     deadline: 'the run passed its wall-clock deadline (app.toml: limits.deadline) and was stopped by the host',
     cancelled: 'the request was cancelled and the host stopped the run',
     heap: 'the run grew its heap past max_heap_words (app.toml) and its answer was discarded',
@@ -147,7 +146,7 @@ fn script() -> String {
   function el(tag, cls, text) \{ var e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; \}
   function meter(response) \{
     var n = function (name) \{ var v = response.headers.get('x-cove-run-' + name); return v === null ? '–' : Number(v).toLocaleString('en-US'); \};
-    return 'fuel ' + n('fuel') + ' · instructions ' + n('instructions') + ' · yields ' + n('yields') + ' (declined ' + n('yields-declined') + ') · on a worker ' + n('worker-us') + ' µs · admission to answer ' + n('wall-us') + ' µs';
+    return 'instructions ' + n('instructions') + ' · yields ' + n('yields') + ' (declined ' + n('yields-declined') + ') · on a worker ' + n('worker-us') + ' µs · admission to answer ' + n('wall-us') + ' µs';
   \}
   function show(target, node) \{ target.replaceChildren(node); \}
   document.addEventListener('DOMContentLoaded', function () \{

@@ -476,14 +476,11 @@ fn a_fetch_is_aborted_when_the_client_goes_away() {
 
 #[test]
 fn a_client_going_away_cancels_its_run_wherever_it_is() {
-    // `/spin` under a budget it will not exhaust for a long while: only a
+    // `/spin` under a deadline it will not reach for a long while: only a
     // cancellation ends it. One worker, so with two spinning one runs
     // (yielding every slice, since the other waits) and one waits.
     let apps = apps(&[
-        sample_with(
-            "hello",
-            "[limits]\nfuel = 100000000000\ndeadline = \"120s\"\n",
-        ),
+        sample_with("hello", "[limits]\ndeadline = \"120s\"\n"),
         sample("slow"),
     ]);
     let host = start(&apps, 1);
@@ -519,7 +516,7 @@ fn a_client_going_away_cancels_its_run_wherever_it_is() {
 fn a_request_cancelled_while_queued_never_runs() {
     let apps = apps(&[sample_with(
         "hello",
-        "[limits]\nfuel = 100000000000\ndeadline = \"120s\"\nmax_in_flight = 1\n",
+        "[limits]\ndeadline = \"120s\"\nmax_in_flight = 1\n",
     )]);
     let host = start(&apps, 1);
     let running = open(host.addr, "/hello/spin");
@@ -536,7 +533,7 @@ fn a_request_cancelled_while_queued_never_runs() {
     wait_until("both to be cancelled", || {
         count(&host, "hello", "errors.cancelled") == 2
     });
-    // The queued one was dropped where it stood: it spent no fuel.
+    // The queued one was dropped where it stood: it never ran.
     assert_eq!(count(&host, "hello", "queued"), 0);
     assert_eq!(count(&host, "hello", "in_flight"), 0);
 }

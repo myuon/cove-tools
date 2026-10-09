@@ -4,10 +4,13 @@
 grant = ["time"]
 
 [limits]
-fuel = 400000000
+# What bounds a run's work: far above any example but the heavy ones,
+# on the VM too, and what stops those.
 deadline = "10s"
 max_host_calls = 64
-max_heap_words = 2097152
+# The runtime's default, 32 MiB: the matching page's largest graph, 30000
+# vertices a side and 300000 edges, needs more than half of it.
+max_heap_words = 4194304
 max_in_flight = 4
 max_queued = 32
 max_request_bytes = 262144

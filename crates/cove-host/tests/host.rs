@@ -164,14 +164,12 @@ fn a_budget_overrun_ends_that_request_only() {
     let host = start(&apps, 2);
     let addr = host.addr;
 
-    // Fuel: `/spin` loops until its 2,000,000 run out.
+    // Deadline, while running: `/spin` loops until its two seconds pass.
     let spun = get(addr, "/hello/spin");
-    assert_eq!(spun.status, 500);
-    assert!(
-        spun.body.contains("fuel budget of 2000000 exhausted"),
-        "{}",
-        spun.body
-    );
+    assert_eq!(spun.status, 504);
+    assert_eq!(spun.header("x-cove-stop"), Some("deadline"));
+    assert!(spun.body.contains("deadline of"), "{}", spun.body);
+    assert!(spun.body.contains("hello.cove"), "{}", spun.body);
 
     // Deadline, while parked: the timer would answer in five seconds.
     let late = get(addr, "/slow/?ms=5000");
@@ -194,7 +192,7 @@ fn a_budget_overrun_ends_that_request_only() {
     // Each ended its own request; the same apps answer the next one.
     assert_eq!(get(addr, HELLO).status, 200);
     assert_eq!(get(addr, "/slow/?ms=1").status, 200);
-    assert_eq!(count(&host, "hello", "errors.fuel"), 1);
+    assert_eq!(count(&host, "hello", "errors.deadline"), 1);
     assert_eq!(count(&host, "slow", "errors.deadline"), 1);
     assert_eq!(count(&host, "slow", "errors.host_calls"), 1);
     assert_eq!(count(&host, "hello", "ok"), 1);
@@ -288,7 +286,7 @@ fn an_app_flooding_its_queue_does_not_starve_another() {
         AppSpec {
             name: "flood",
             from: samples().join("crunch"),
-            config: Some("[limits]\nfuel = 30000000\nmax_in_flight = 1\nmax_queued = 64\n"),
+            config: Some("[limits]\nmax_in_flight = 1\nmax_queued = 64\n"),
         },
     ]);
     let host = start(&apps, 1);
@@ -483,4 +481,46 @@ fn a_spawn_reached_through_a_module_is_refused_where_it_is() {
         "at the spawn, in the module: {}",
         report.err
     );
+}
+
+/// `check` refuses an `app.toml` that still says `limits.fuel` (Cove ADR
+/// 0091), naming it; `check --deployed`, which `install.sh` runs over the
+/// installed apps before switching to a new release, warns instead, as the
+/// host does when it starts.
+#[test]
+fn check_refuses_the_removed_fuel_limit_unless_the_apps_are_deployed() {
+    let apps = apps(&[
+        sample_with("hello", "[limits]\nfuel = 2000000\n"),
+        sample("slow"),
+    ]);
+    let modules = cove_host::HostModules::standard();
+    let strict = cove_host::toolchain::check(&apps.root, &[], &modules).unwrap();
+    assert!(!strict.ok);
+    assert!(
+        strict.out.contains("REFUSED: `")
+            && strict
+                .out
+                .contains("`limits.fuel` was removed (Cove ADR 0091"),
+        "{}",
+        strict.out
+    );
+    let deployed = cove_host::toolchain::check_as(
+        &apps.root,
+        &[],
+        &modules,
+        None,
+        cove_host::config::RemovedKeys::Ignore,
+    )
+    .unwrap();
+    assert!(deployed.ok, "{}\n{}", deployed.out, deployed.err);
+    assert!(
+        deployed
+            .err
+            .contains("warning: [hello] `limits.fuel` in app.toml is ignored"),
+        "{}",
+        deployed.err
+    );
+    assert!(deployed
+        .out
+        .contains("hello      requires [-]  granted [-]  ok"));
 }

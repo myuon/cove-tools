@@ -6,7 +6,7 @@ fn capabilities() -> Array<String> {
 }
 
 fn limitsForm() -> String {
-  "fuel=1000&maxHostCalls=0&deadlineMs=500&maxHeapWords=0&maxInFlight=4&maxQueued=0&maxRequestBytes=10&maxResponseBytes=20"
+  "maxHostCalls=0&deadlineMs=500&maxHeapWords=0&maxInFlight=4&maxQueued=0&maxRequestBytes=10&maxResponseBytes=20"
 }
 
 test fn readsAConfigureForm() -> Result<Unit, Error> {
@@ -17,7 +17,6 @@ test fn readsAConfigureForm() -> Result<Unit, Error> {
   assertEqual(read.problems.length(), 0)?
   assertEqual(",".join(read.settings.grant), "kv,log")?
   assertEqual(",".join(read.settings.fetchAllow), "https://a.example,http://b.example:8080")?
-  assertEqual(read.settings.limits.fuel, 1000)?
   assertEqual(read.settings.limits.deadlineMs, 500)?
   assertEqual(read.settings.limits.maxInFlight, 4)?
   assertEqual(read.settings.limits.maxResponseBytes, 20)?
@@ -26,17 +25,23 @@ test fn readsAConfigureForm() -> Result<Unit, Error> {
 
 test fn namesEveryProblemOfAForm() -> Result<Unit, Error> {
   let read = settingsFrom(
-    text.parseForm("cap.teleport=on&allow=ftp%3A%2F%2Fx&fuel=0&maxHostCalls=-1&deadlineMs=soon&maxHeapWords=0&maxInFlight=0&maxQueued=0&maxRequestBytes=1&maxResponseBytes=1"),
+    text.parseForm("cap.teleport=on&allow=ftp%3A%2F%2Fx&maxHostCalls=-1&deadlineMs=soon&maxHeapWords=0&maxInFlight=0&maxQueued=0&maxRequestBytes=1&maxResponseBytes=1"),
     capabilities(),
   )
   let said = "\n".join(read.problems)
   assert(said.contains("`teleport` is not a capability"))?
   assert(said.contains("allowlist: `ftp://x`"))?
-  assert(said.contains("fuel per request: 0 is less than 1"))?
   assert(said.contains("host calls per request: -1 is less than 0"))?
   assert(said.contains("deadline per request (ms): `soon` is not a whole number"))?
   assert(said.contains("runs in flight: 0 is less than 1"))?
-  assertEqual(read.problems.length(), 6)?
+  assertEqual(read.problems.length(), 5)?
+  Ok(())
+}
+
+test fn refusesTheRemovedFuelLimitByName() -> Result<Unit, Error> {
+  let read = settingsFrom(text.parseForm("fuel=1000&{limitsForm()}"), capabilities())
+  assertEqual(read.problems.length(), 1)?
+  assert(read.problems.get(0).unwrapOr("").contains("removed (Cove ADR 0091)"))?
   Ok(())
 }
 

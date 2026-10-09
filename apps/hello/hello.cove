@@ -4,7 +4,7 @@ use web
 ///
 /// `/echo` answers the request body back; `/big?bytes=` answers a body of
 /// that many bytes (the response size limit is the host's to enforce);
-/// `/spin` loops until the fuel the host grants each request runs out.
+/// `/spin` loops until the deadline the host grants each request passes.
 export fn handle(request: web.Request) -> web.Response {
   if request.path == "/spin" {
     return spin()

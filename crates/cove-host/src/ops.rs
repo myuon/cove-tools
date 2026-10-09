@@ -58,7 +58,7 @@ pub struct OpsContext<'a> {
 }
 
 /// The keys summed into the stats' `totals`.
-const TOTALS: [&str; 15] = [
+const TOTALS: [&str; 14] = [
     "served",
     "ok",
     "in_flight",
@@ -71,7 +71,6 @@ const TOTALS: [&str; 15] = [
     "overdue_yields",
     "blocking_host_calls",
     "instructions",
-    "fuel",
     "worker_ms",
     "updates",
 ];
@@ -107,7 +106,6 @@ pub fn app_json(context: &OpsContext, slot: &Slot) -> Json {
             object.insert(
                 "limits".into(),
                 json!({
-                    "fuel": app.limits.run.fuel,
                     "deadline_ms": app.limits.run.deadline.map(|d| d.as_millis() as u64),
                     "max_host_calls": app.limits.run.max_host_calls,
                     "max_in_flight": app.limits.max_in_flight,

@@ -73,7 +73,6 @@ const fn field(name: &'static str, ty: HostType) -> FieldSchema {
 }
 
 const LIMITS_FIELDS: &[FieldSchema] = &[
-    field("fuel", INT),
     field("maxHostCalls", INT),
     field("deadlineMs", INT),
     field("maxHeapWords", INT),
@@ -271,7 +270,6 @@ fn limits_value(limits: &LimitsFile) -> Value {
     Value::structure(
         "host.Limits",
         vec![
-            ("fuel", int(limits.fuel.unwrap_or(0))),
             ("maxHostCalls", int(limits.max_host_calls.unwrap_or(0))),
             ("deadlineMs", Value::int(deadline_ms)),
             ("maxHeapWords", int(limits.max_heap_words.unwrap_or(0))),
@@ -405,7 +403,6 @@ fn settings_of(value: &Value) -> Result<Settings, String> {
     };
     let heap = get("maxHeapWords")? as u64;
     let limits = LimitsFile {
-        fuel: Some(positive("fuel")?),
         max_host_calls: Some(get("maxHostCalls")? as u64),
         deadline: Some(format!("{}ms", positive("deadlineMs")?)),
         max_call_depth: None,
@@ -414,6 +411,7 @@ fn settings_of(value: &Value) -> Result<Settings, String> {
         max_queued: Some(get("maxQueued")? as usize),
         max_request_bytes: Some(get("maxRequestBytes")? as usize),
         max_response_bytes: Some(get("maxResponseBytes")? as usize),
+        ..LimitsFile::default()
     };
     let grant: BTreeSet<String> = string_items(value.field("grant"))
         .into_iter()

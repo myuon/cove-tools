@@ -34,16 +34,16 @@ Maximum: 1,996 pairs
 ```
 
 Every answer of a run carries the host's meter for that run in its headers
-(`x-cove-run-fuel`, `-instructions`, `-yields`, `-yields-declined`,
-`-parks`, `-worker-us`, `-wall-us`), and a run a limit stopped carries
-`x-cove-stop` (`fuel`, `deadline`, `cancelled`, …):
+(`x-cove-run-instructions`, `-yields`, `-yields-declined`, `-parks`,
+`-worker-us`, `-wall-us`), and a run a limit stopped carries `x-cove-stop`
+(`deadline`, `cancelled`, `heap`, …):
 
 ```console
 $ curl -s -o /dev/null -D - 'http://127.0.0.1:8080/algo/matching?example=heavy&algorithm=augmenting&part=result' \
-    | grep -i -e '^HTTP' -e x-cove-stop -e x-cove-run-fuel
-HTTP/1.1 500 Internal Server Error
-x-cove-run-fuel: 400000479
-x-cove-stop: fuel
+    | grep -i -e '^HTTP' -e x-cove-stop -e x-cove-run-worker-us
+HTTP/1.1 504 Gateway Timeout
+x-cove-run-worker-us: 10000061
+x-cove-stop: deadline
 ```
 
 ## The page
@@ -57,12 +57,12 @@ three run-time features:
   counted as `errors.cancelled`). A heavy run can always be withdrawn.
 - **Why it stopped.** A run the host stopped is answered with its status, the
   runtime's diagnostic and `x-cove-stop`; the page says which limit it was
-  — *Stopped: fuel. The run used up its fuel budget (app.toml:
-  limits.fuel)…*, or the deadline, the heap, the queue — and shows the
+  — *Stopped: deadline. The run passed its wall-clock deadline (app.toml:
+  limits.deadline)…*, or a cancellation, the heap, the queue — and shows the
   diagnostic under it. A stop the app makes itself (an input it cannot read,
   or over its bounds) is answered in the result, with the line at fault.
 - **What it cost.** The "host meter" line is filled from the `x-cove-run-*`
-  headers: the fuel and instructions the runtime counted, how often the run
+  headers: the instructions the runtime counted, how often the run
   yielded and declined to, its time on a worker and from admission to
   answer. An app cannot read its own meter, which is why it comes from the
   headers rather than the page. The algorithms' own measures — their time on
@@ -97,7 +97,7 @@ the `left × right` possible ones (`l1…`, `r1…`), with the playground's own
 PRNG (below) — the same four numbers are the same graph on every machine
 and both backends.
 
-Bounds: at most **5,000 vertices a side and 50,000 edges** (the app's own,
+Bounds: at most **30,000 vertices a side and 300,000 edges** (the app's own,
 answered in the page); a graph is drawn up to 40 vertices a side, and the
 table view lists the first 500 pairs.
 
@@ -108,8 +108,9 @@ table view lists the first 500 pairs.
   searches that augment along vertex-disjoint shortest paths in the layers.
 - **Simple augmenting paths** (Kuhn's algorithm), O(V E): one search per left
   vertex, no greedy start. It is there to compare against, and it is the
-  heavy one: on `heavy` it runs out of fuel where Hopcroft–Karp needs a
-  fraction of it.
+  heavy one: on `heavy` it is still searching when the run's ten-second
+  deadline passes (about 32 s to finish, native tier, measured on a 2026
+  x86-64 Mac), where Hopcroft–Karp needs about a second.
 - **`both`** runs the two on the same graph and checks that they agree.
 
 Both searches are iterative with an explicit stack, so a long augmenting
@@ -147,7 +148,7 @@ and the cover.
 | `greedy` | `a x`, `a y`, `b x`: the greedy first choice has to be undone | 2 |
 | `random` | `random 14 14 34 7` (drawn) | 12 |
 | `large` | `random 2000 2000 12000 42` | 1,996 |
-| `heavy` | `random 5000 5000 50000 1`, with `both`: the simple algorithm runs out of fuel | — (stopped: fuel) |
+| `heavy` | `random 30000 30000 300000 1`, with `both`: the simple algorithm is stopped by the deadline | — (stopped: deadline; Hopcroft–Karp alone finds 30,000) |
 
 ## Satisfiability (SAT)
 
@@ -200,8 +201,11 @@ deepest decision level and the pure literals.
 
 A **decision budget** (the form's field, default 1,000,000) is the app's
 own stop: past it the answer is *Unknown: the search gave up*, said in the
-page. The host's fuel and deadline stop it otherwise — `heavy` (10 pigeons,
-9 holes) runs out of fuel, and the page says *Stopped: fuel*.
+page. `heavy` (10 pigeons, 9 holes) fills in a budget of 50,000 decisions
+and gives up at it — 8 pigeons took about 33,000, and 10 take far more — so
+the page says *Unknown: the search gave up after its budget of 50,000
+decisions*. A budget large enough to finish runs into the host's deadline
+instead, and the page says *Stopped: deadline*.
 
 **The check**: a satisfying assignment is evaluated against every clause
 (`sat.unsatisfied`) before the page says "Satisfiable". An unsatisfiable
@@ -228,7 +232,7 @@ first 200 clauses).
 | `random` | `random 3 60 256 1` | satisfiable | 17 decisions |
 | `sudoku` | the classic puzzle (30 givens) | satisfiable, one solution | 0 decisions: propagation alone solves it |
 | `hard` | 8 pigeons, 7 holes | unsatisfiable | 32,780 decisions, ~170 ms |
-| `heavy` | 10 pigeons, 9 holes | — | stopped: fuel |
+| `heavy` | 10 pigeons, 9 holes, budget 50,000 | unknown: gave up | 50,000 decisions, ~300 ms |
 
 ## Simulated annealing
 
@@ -243,7 +247,7 @@ from the same tour `0, 1, …, n−1`, each with its own:
 | field | what |
 | --- | --- |
 | `a_seed`, `b_seed` | the run's seed: every random move and acceptance comes from it |
-| `a_iterations`, `b_iterations` | 1 to 5,000,000 |
+| `a_iterations`, `b_iterations` | 1 to 50,000,000 (more than a deadline's work, on purpose: see `heavy`) |
 | `a_start`, `a_end` (and `b_…`) | the temperature at the first and the last iteration, above 0, at most 1000 |
 | `a_schedule`, `b_schedule` | `geometric` (the same factor each iteration) or `linear` (the same amount) |
 
@@ -287,8 +291,8 @@ of the 200 recorded points of both trajectories, with the temperature.
 | `schedules` | geometric | linear, the same temperatures | A shorter by 8.84% |
 | `seeds` | seed 1 | seed 2, the same settings | A shorter by 3.13% |
 | `circle` | 40 points on a circle | 20,000 iterations only | both find the known optimum |
-| `long` | 200 points, 200,000 iterations | seed 2 | ≈ 270 M fuel of 400 M |
-| `heavy` | 500 points, 5,000,000 iterations | the same | stopped: fuel |
+| `long` | 200 points, 200,000 iterations | seed 2 | ≈ 240 ms (1.5 s on the VM) |
+| `heavy` | 500 points, 50,000,000 iterations | the same | stopped: deadline (5,000,000 each finish in 7.5 s; ten times that cannot) |
 
 ## Limits
 
@@ -296,9 +300,8 @@ of the 200 recorded points of both trajectories, with the temperature.
 
 | limit | value | why |
 | --- | --- | --- |
-| `fuel` | 400,000,000 | `large` by the simple algorithm takes about 125 M (both algorithms and the check, native tier), SAT's `hard` about 160 M, annealing's `cooling` about 185 M and `long` 275 M; every `heavy` does not fit, on purpose |
-| `deadline` | 10 s | far above any run that fits its fuel, on the VM too; a run parked or queued past it is stopped |
-| `max_heap_words` | 2 Mi words (16 MiB) | a 5,000 × 5,000 graph with 50,000 edges, or a formula at its bounds, and their working arrays are well inside it |
+| `deadline` | 10 s | what bounds a run's work. Every example but the heavy ones takes at most a quarter of a second on the native tier and 1.5 s on the VM (annealing's `long`; SAT's `hard` 0.2 s and 0.9 s); matching's and annealing's `heavy` ask for several times the deadline's work on purpose, and are stopped by it. A run parked or queued past it is stopped too |
+| `max_heap_words` | 4 Mi words (32 MiB, the runtime's default) | a 30,000 × 30,000 graph with 300,000 edges and its working arrays need more than 2 Mi words; a formula at its bounds is well inside it |
 | `max_in_flight` | 4 | at most four runs of this app at once, on any number of workers: a burst of heavy runs cannot take every worker of a larger host |
 | `max_queued` | 32 | past it, 429 for this app only |
 | `max_request_bytes` | 256 KiB | a written graph at the edge bound fits; a DIMACS file larger than that is over the literal bound anyway |
@@ -348,15 +351,16 @@ $ cargo test --profile checked --test algo              # the app on a host
 - `rng_test.cove`: Marsaglia's sequence, seeds, ranges.
 - `crates/cove-host/tests/algo.rs`: the known answers through the page,
   for all three algorithm choices, with the proof; the meter headers; CSP,
-  the script, escaping of hostile vertex names, refusals; a run out of fuel
-  answered `x-cove-stop: fuel`, one past its deadline `deadline`; SAT's
+  the script, escaping of hostile vertex names, refusals; matching's and
+  annealing's `heavy` answered `x-cove-stop: deadline` (under a deadline
+  of a second, so the test does not wait ten); SAT's
   known answers through the page, its models re-checked in Rust against the
   formula as the page prints it, the sudoku's first row, the budget's
-  *Unknown*, SAT's `heavy` stopped by fuel; annealing's comparison (the
+  *Unknown*, SAT's `heavy` giving up at its own budget of 50,000
+  decisions; annealing's comparison (the
   hot start beats the cold one), reproduced exactly on a second request, a
   reseeded run changed and the other not, the chart's two series and
-  references, the circle's optimum found, every refusal, and `heavy`
-  stopped by fuel; a client
+  references, the circle's optimum found, and every refusal; a client
   that goes away cancels its heavy run (`errors.cancelled`, nothing in
   flight after); and **the responsiveness test** below, on the VM and on the
   native tier; and that every function of the app has machine code on the
@@ -540,7 +544,7 @@ For upstream (myuon/cove), besides the native-tier shapes above (now fixed):
 | criterion | where it is shown |
 | --- | --- |
 | results verified on small known problems | matching: `matching_test.cove` (known maxima, 60 graphs against exhaustive search, König's certificate checked edge by edge, non-maximum matchings refused) and `algo.rs::the_examples_have_their_known_maximum_and_a_proof`; SAT: `sat_test.cove` (80 formulas against all 2^n assignments, pigeonhole 1–5 holes, the sudoku's known solution, every model checked) and `algo.rs::sat_answers_known_formulas_and_checks_its_models`; annealing: `anneal_test.cove` (the circle's known optimum, 7-point problems against exhaustive search, the square) and `algo.rs::annealing_compares_two_runs_reproducibly` |
-| execution limits work, and say which stopped a run | `algo.rs::a_run_a_limit_stops_says_which_limit` (fuel, deadline), `::a_sat_run_out_of_fuel_says_so`, annealing's `heavy`; the app's own bounds and SAT's decision budget answered in the page; [The page](#the-page) (`x-cove-stop` shown as *Stopped: fuel* and so on) |
+| execution limits work, and say which stopped a run | `algo.rs::a_run_a_limit_stops_says_which_limit` (the deadline, on matching's and annealing's `heavy`), `::a_sat_example_too_hard_for_its_budget_gives_up_and_says_so` (the app's own decision budget); the app's own bounds answered in the page; [The page](#the-page) (`x-cove-stop` shown as *Stopped: deadline* and so on) |
 | cancellation works | `algo.rs::a_client_that_goes_away_cancels_its_run` (the connection closed mid-run: `errors.cancelled`, nothing in flight after); the page's Cancel button aborts the fetch, which is that |
 | the webhook lab and a light app answer while it computes | `algo.rs::the_other_apps_answer_while_algo_computes_on_the_vm` / `_on_the_native_tier` (two workers, four heavy clients of all three algorithms, twenty requests to `hello` and `webhooks` all answered, the heavy runs yielded); [Responsiveness](#responsiveness): `hello`'s p99 4.3–5.0 ms beside them on both tiers |
 | input examples and reproduction steps | every page's examples (seeded generators, so each is the same input everywhere); [Running it](#running-it), the input formats above, `bench/algo.sh`, `bench/repro/run.sh` |

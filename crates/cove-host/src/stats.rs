@@ -17,8 +17,6 @@ use serde_json::{json, Map, Value as Json};
 /// Why a request that reached its app was not answered by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// The run spent its fuel (500).
-    Fuel,
     /// The run passed its deadline, running or parked (504).
     Deadline,
     /// The run made more host calls than it may (500).
@@ -47,8 +45,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, in the order the stats list them.
-    pub const ALL: [ErrorKind; 12] = [
-        ErrorKind::Fuel,
+    pub const ALL: [ErrorKind; 11] = [
         ErrorKind::Deadline,
         ErrorKind::HostCalls,
         ErrorKind::CallDepth,
@@ -65,7 +62,6 @@ impl ErrorKind {
     /// The name the stats use.
     pub fn name(self) -> &'static str {
         match self {
-            ErrorKind::Fuel => "fuel",
             ErrorKind::Deadline => "deadline",
             ErrorKind::HostCalls => "host_calls",
             ErrorKind::CallDepth => "call_depth",
@@ -139,10 +135,8 @@ pub struct AppCounters {
     pub blocking_host_calls: AtomicU64,
     /// Instructions the encoded VM dispatched, summed over answered runs.
     /// Compiled code dispatches none, so on the native tier this undercounts
-    /// the work; `fuel` does not.
+    /// the work; `worker_ms` does not.
     pub instructions: AtomicU64,
-    /// Fuel spent, summed over answered runs.
-    pub fuel: AtomicU64,
     /// Nanoseconds workers spent running this app's code.
     pub worker_ns: AtomicU64,
     /// The largest heap a run had at a park, a yield or its answer, in words.
@@ -234,7 +228,6 @@ impl AppCounters {
             "overdue_yields": read(&self.overdue_yields),
             "blocking_host_calls": read(&self.blocking_host_calls),
             "instructions": read(&self.instructions),
-            "fuel": read(&self.fuel),
             "worker_ms": read(&self.worker_ns) as f64 / 1e6,
             "heap_peak_words": read(&self.heap_peak_words),
             "updates": read(&self.updates),

@@ -5,7 +5,6 @@
 //! grant = ["log", "timer"]        # capabilities; nothing by default
 //!
 //! [limits]
-//! fuel = 2000000                  # per request
 //! max_host_calls = 100            # per request
 //! deadline = "5s"                 # per request, parked time included ("ms" or "s")
 //! max_call_depth = 512            # per request
@@ -40,6 +39,14 @@
 //! Every key is optional and an unknown one is refused: a misspelt limit would
 //! otherwise be a limit silently not applied. A refusal is the app's alone —
 //! the host starts every other app.
+//!
+//! `limits.fuel` is a key that was removed: Cove's ADR 0091 took the fuel
+//! allowance out of the runtime, and a request is bounded by `deadline`
+//! instead. A file that still says it is refused with that reason where the
+//! file is being put forward — `cove-host check`, `test`, `deploy`,
+//! `update` — but an app already deployed with it is loaded at start with the
+//! key ignored and a warning ([`RemovedKeys`]), so that upgrading the host
+//! does not take down an app that has not been redeployed yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -594,8 +601,11 @@ impl FetchPolicy {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuel: Option<u64>,
+    /// `fuel`, which Cove's ADR 0091 removed: read only so that it can be
+    /// refused or ignored by name ([`RemovedKeys`]) rather than as an unknown
+    /// key, and never written.
+    #[serde(default, skip_serializing)]
+    pub fuel: Option<Removed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_host_calls: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -623,7 +633,6 @@ impl LimitsFile {
     /// `self`, with every key `over` sets replaced.
     fn overlaid(self, over: &LimitsFile) -> LimitsFile {
         LimitsFile {
-            fuel: over.fuel.or(self.fuel),
             max_host_calls: over.max_host_calls.or(self.max_host_calls),
             deadline: over.deadline.clone().or(self.deadline),
             max_call_depth: over.max_call_depth.or(self.max_call_depth),
@@ -632,6 +641,7 @@ impl LimitsFile {
             max_queued: over.max_queued.or(self.max_queued),
             max_request_bytes: over.max_request_bytes.or(self.max_request_bytes),
             max_response_bytes: over.max_response_bytes.or(self.max_response_bytes),
+            ..LimitsFile::default()
         }
     }
 }
@@ -710,7 +720,6 @@ impl AppOverride {
         let differs_usize =
             |mine: &Option<usize>, theirs: &Option<usize>| mine.filter(|_| mine != theirs);
         let limits = LimitsFile {
-            fuel: differs(&limits.fuel, &theirs.fuel),
             max_host_calls: differs(&limits.max_host_calls, &theirs.max_host_calls),
             deadline: limits.deadline.clone().filter(|mine| {
                 let parsed = |text: &Option<String>| {
@@ -727,6 +736,7 @@ impl AppOverride {
                 &limits.max_response_bytes,
                 &theirs.max_response_bytes,
             ),
+            ..LimitsFile::default()
         };
         AppOverride {
             enabled,
@@ -762,7 +772,7 @@ impl AppOverride {
 /// What bounds one app, with the defaults filled in.
 #[derive(Clone, Debug)]
 pub struct AppLimits {
-    /// Each request's run: fuel, deadline, host calls, call depth, tasks.
+    /// Each request's run: deadline, host calls, call depth, tasks.
     pub run: Limits,
     /// The capacity of each run's heap, in words: a run that needs more fails
     /// the allocation ("this run has no memory left", 500, `heap` in
@@ -785,7 +795,6 @@ impl Default for AppLimits {
     fn default() -> AppLimits {
         AppLimits {
             run: Limits {
-                fuel: Some(50_000_000),
                 deadline: Some(Duration::from_secs(10)),
                 max_host_calls: Some(1_000),
                 max_call_depth: None,
@@ -808,7 +817,6 @@ impl AppLimits {
     /// heap limit that is not.
     pub fn as_file(&self) -> LimitsFile {
         LimitsFile {
-            fuel: self.run.fuel,
             max_host_calls: self.run.max_host_calls,
             deadline: self
                 .run
@@ -820,6 +828,7 @@ impl AppLimits {
             max_queued: Some(self.max_queued),
             max_request_bytes: Some(self.max_request_bytes),
             max_response_bytes: Some(self.max_response_bytes),
+            ..LimitsFile::default()
         }
     }
 }
@@ -843,25 +852,68 @@ pub struct AppConfig {
     pub file_allow: Vec<String>,
     /// `[access]`, resolved.
     pub access: crate::access::Access,
+    /// What was read and ignored, one line each, for the host to log: a
+    /// removed key in a file loaded under [`RemovedKeys::Ignore`].
+    pub warnings: Vec<String>,
 }
+
+/// A key `app.toml` may no longer say, present: read as anything and kept as
+/// nothing but the fact that it was there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removed;
+
+impl<'de> Deserialize<'de> for Removed {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Removed, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Removed)
+    }
+}
+
+/// What reading an `app.toml` does with a key that was removed —
+/// `limits.fuel`, since Cove's ADR 0091.
+///
+/// A file being put forward (`cove-host check` and `test`, a deploy, an
+/// update) is refused, naming the key and what replaces it: the person who
+/// wrote it is there to fix it. A file that is already deployed and is being
+/// loaded again (the host's start, a rollback, an admin change, a secret
+/// reload, `cove-host check --deployed` as `install.sh` runs it before an
+/// upgrade) has the key ignored, with a warning: it was valid when it was
+/// deployed, and refusing it would take a working app down on the host's
+/// upgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovedKeys {
+    Refuse,
+    Ignore,
+}
+
+/// Why `limits.fuel` is refused.
+pub const FUEL_REMOVED: &str = "`limits.fuel` was removed (Cove ADR 0091 took the fuel allowance \
+     out of the runtime); bound a request with `limits.deadline` instead";
 
 /// Reads `dir/app.toml` for the app `name`.
 pub fn read_app(dir: &Path, name: &str) -> Result<AppConfig, String> {
-    read_app_with(dir, name, None, &SecretSource::default())
+    read_app_with(
+        dir,
+        name,
+        None,
+        &SecretSource::default(),
+        RemovedKeys::Refuse,
+    )
 }
 
-/// [`read_app`], with `over` applied to the file before it is validated and
-/// `store` secrets looked up in `source`.
+/// [`read_app`], with `over` applied to the file before it is validated,
+/// `store` secrets looked up in `source`, and a removed key treated as
+/// `removed` says.
 pub fn read_app_with(
     dir: &Path,
     name: &str,
     over: Option<&AppOverride>,
     source: &SecretSource,
+    removed: RemovedKeys,
 ) -> Result<AppConfig, String> {
     let path = dir.join("app.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
-    parse_app_with(&text, name, Some(dir), over, source).map_err(|e| match over {
+    parse_app_with(&text, name, Some(dir), over, source, removed).map_err(|e| match over {
         Some(over) if over.changes_config() => {
             format!("`{}` with the admin's changes: {e}", path.display())
         }
@@ -876,19 +928,39 @@ pub fn parse_app(text: &str, name: &str) -> Result<AppConfig, String> {
 
 /// [`parse_app`], with `file` secrets read relative to `dir`.
 pub fn parse_app_in(text: &str, name: &str, dir: Option<&Path>) -> Result<AppConfig, String> {
-    parse_app_with(text, name, dir, None, &SecretSource::default())
+    parse_app_with(
+        text,
+        name,
+        dir,
+        None,
+        &SecretSource::default(),
+        RemovedKeys::Refuse,
+    )
 }
 
 /// [`parse_app_in`], with `over` applied to the file before anything is
-/// validated, and `store` secrets looked up in `source`.
+/// validated, `store` secrets looked up in `source`, and a removed key
+/// treated as `removed` says.
 pub fn parse_app_with(
     text: &str,
     name: &str,
     dir: Option<&Path>,
     over: Option<&AppOverride>,
     source: &SecretSource,
+    removed: RemovedKeys,
 ) -> Result<AppConfig, String> {
-    let file: AppFile = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    let mut file: AppFile = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    let mut warnings = Vec::new();
+    if file.limits.fuel.take().is_some() {
+        match removed {
+            RemovedKeys::Refuse => return Err(FUEL_REMOVED.to_string()),
+            RemovedKeys::Ignore => warnings.push(format!(
+                "`limits.fuel` in app.toml is ignored: Cove ADR 0091 removed the fuel \
+                 allowance, and `{name}`'s requests are bounded by `limits.deadline`; drop the \
+                 key when the app is next deployed, which will refuse it"
+            )),
+        }
+    }
     // `[fetch.headers]` is held to the allowlist as the file writes it, not
     // as an override leaves it: an override can take an origin off the list
     // (its requests are then refused, header and all) but cannot give a
@@ -919,7 +991,6 @@ pub fn parse_app_with(
     };
     let limits = AppLimits {
         run: Limits {
-            fuel: l.fuel.or(defaults.run.fuel),
             deadline,
             max_host_calls: l.max_host_calls.or(defaults.run.max_host_calls),
             max_call_depth: l.max_call_depth.or(defaults.run.max_call_depth),
@@ -937,9 +1008,6 @@ pub fn parse_app_with(
         .is_some_and(|deadline| deadline.is_zero())
     {
         return Err("`limits.deadline` must be longer than 0 ms".to_string());
-    }
-    if limits.run.fuel == Some(0) {
-        return Err("`limits.fuel` must be at least 1".to_string());
     }
     for capability in &file.grant {
         if capability.is_empty()
@@ -1022,6 +1090,7 @@ pub fn parse_app_with(
         hosts,
         file_allow: file.fetch.allow,
         access,
+        warnings,
     })
 }
 
@@ -1071,18 +1140,18 @@ mod tests {
         let config = parse_app("", "hello").unwrap();
         assert_eq!(config.entry, "hello.handle");
         assert!(config.granted.is_empty());
-        assert_eq!(config.limits.run.fuel, Some(50_000_000));
+        assert_eq!(config.limits.run.deadline, Some(Duration::from_secs(10)));
         assert_eq!(config.limits.run.max_tasks, Some(0));
     }
 
     #[test]
     fn limits_are_read() {
         let config = parse_app(
-            "grant = [\"log\"]\n[limits]\nfuel = 10\ndeadline = \"300ms\"\nmax_queued = 0\n",
+            "grant = [\"log\"]\n[limits]\nmax_host_calls = 10\ndeadline = \"300ms\"\nmax_queued = 0\n",
             "a",
         )
         .unwrap();
-        assert_eq!(config.limits.run.fuel, Some(10));
+        assert_eq!(config.limits.run.max_host_calls, Some(10));
         assert_eq!(config.limits.run.deadline, Some(Duration::from_millis(300)));
         assert_eq!(config.limits.max_queued, 0);
         assert!(config.granted.contains("log"));
@@ -1090,8 +1159,59 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_refused() {
-        let error = parse_app("[limits]\nfuell = 10\n", "a").unwrap_err();
-        assert!(error.contains("fuell"), "{error}");
+        let error = parse_app("[limits]\ndeadlin = \"5s\"\n", "a").unwrap_err();
+        assert!(error.contains("deadlin"), "{error}");
+    }
+
+    #[test]
+    fn a_file_put_forward_with_the_removed_fuel_limit_is_refused_by_name() {
+        let error = parse_app("[limits]\nfuel = 2000000\n", "a").unwrap_err();
+        assert_eq!(error, FUEL_REMOVED);
+        assert!(error.contains("ADR 0091"), "{error}");
+        assert!(error.contains("limits.deadline"), "{error}");
+        // Not the generic refusal of a key nobody knows.
+        assert!(!error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn a_deployed_file_with_the_removed_fuel_limit_loads_with_a_warning() {
+        let config = parse_app_with(
+            "[limits]\nfuel = 400000000\ndeadline = \"7s\"\n",
+            "algo",
+            None,
+            None,
+            &SecretSource::default(),
+            RemovedKeys::Ignore,
+        )
+        .unwrap();
+        assert_eq!(config.limits.run.deadline, Some(Duration::from_secs(7)));
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        let warning = &config.warnings[0];
+        assert!(warning.contains("`limits.fuel`"), "{warning}");
+        assert!(warning.contains("ADR 0091"), "{warning}");
+        assert!(warning.contains("`algo`"), "{warning}");
+        // Without it, nothing to say.
+        let clean = parse_app_with(
+            "[limits]\ndeadline = \"7s\"\n",
+            "algo",
+            None,
+            None,
+            &SecretSource::default(),
+            RemovedKeys::Ignore,
+        )
+        .unwrap();
+        assert!(clean.warnings.is_empty());
+        // Whatever it said: an old file could only say a number, but the
+        // key is gone either way.
+        assert!(parse_app_with(
+            "[limits]\nfuel = \"lots\"\n",
+            "algo",
+            None,
+            None,
+            &SecretSource::default(),
+            RemovedKeys::Ignore,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1148,10 +1268,11 @@ mod tests {
         );
         let store = Arc::new(SecretStore::in_memory());
         let source = SecretSource::store(Arc::clone(&store));
-        let error = parse_app_with(toml, "x", None, None, &source).unwrap_err();
+        let error =
+            parse_app_with(toml, "x", None, None, &source, RemovedKeys::Refuse).unwrap_err();
         assert!(error.contains("has no `gemini-key`"), "{error}");
         store.set("gemini-key", "sk-from-the-store").unwrap();
-        let config = parse_app_with(toml, "x", None, None, &source).unwrap();
+        let config = parse_app_with(toml, "x", None, None, &source, RemovedKeys::Refuse).unwrap();
         assert_eq!(config.secrets.0["gemini"], "sk-from-the-store");
         assert!(config.placeholders.is_empty());
         // One source only, a name the store could hold, and secrets only.
@@ -1188,13 +1309,22 @@ mod tests {
             None,
             None,
             &source,
+            RemovedKeys::Refuse,
         )
         .unwrap();
         assert_eq!(config.placeholders, ["a", "b"]);
         assert_eq!(config.secrets.0["a"], placeholder("a"));
         assert_eq!(config.secrets.0["c"], "kept");
         // A malformed entry is still refused.
-        assert!(parse_app_with("[secrets]\na = {}\n", "x", None, None, &source).is_err());
+        assert!(parse_app_with(
+            "[secrets]\na = {}\n",
+            "x",
+            None,
+            None,
+            &source,
+            RemovedKeys::Refuse
+        )
+        .is_err());
     }
 
     const OPENAI: &str = "[secrets]\nopenai = { value = \"sk-not-a-real-key\" }\n\
@@ -1303,8 +1433,15 @@ mod tests {
             fetch_allow_add: vec!["https://api.example.com".to_string()],
             ..AppOverride::none()
         };
-        let config =
-            parse_app_with(&text, "x", None, Some(&removed), &SecretSource::default()).unwrap();
+        let config = parse_app_with(
+            &text,
+            "x",
+            None,
+            Some(&removed),
+            &SecretSource::default(),
+            RemovedKeys::Refuse,
+        )
+        .unwrap();
         assert!(!config.fetch.admits("https", "api.openai.com", 443));
         assert!(config.fetch.admits("https", "api.example.com", 443));
         assert!(config.fetch.headers.iter().all(|header| !header.applies_to(
@@ -1326,6 +1463,7 @@ mod tests {
             None,
             Some(&added),
             &SecretSource::default(),
+            RemovedKeys::Refuse,
         )
         .unwrap_err();
         assert!(
@@ -1344,13 +1482,13 @@ mod tests {
     #[test]
     fn an_override_is_kept_as_what_changed_from_the_file() {
         let file = parse_app(
-            "grant = [\"kv\", \"log\"]\n[limits]\nfuel = 10\n[fetch]\nallow = [\"https://a.example\"]\n",
+            "grant = [\"kv\", \"log\"]\n[limits]\nmax_host_calls = 10\n[fetch]\nallow = [\"https://a.example\"]\n",
             "notes",
         )
         .unwrap();
         let grant: BTreeSet<String> = ["log", "time"].iter().map(|s| s.to_string()).collect();
         let mut limits = file.limits.as_file();
-        limits.fuel = Some(20);
+        limits.max_host_calls = Some(20);
         let over = AppOverride::between(
             &file,
             &grant,
@@ -1366,7 +1504,7 @@ mod tests {
         assert_eq!(
             over.limits,
             LimitsFile {
-                fuel: Some(20),
+                max_host_calls: Some(20),
                 ..LimitsFile::default()
             }
         );
@@ -1378,11 +1516,12 @@ mod tests {
             None,
             Some(&over),
             &SecretSource::default(),
+            RemovedKeys::Refuse,
         )
         .unwrap();
         let granted: Vec<&str> = later.granted.iter().map(String::as_str).collect();
         assert_eq!(granted, ["log", "random", "time"]);
-        assert_eq!(later.limits.run.fuel, Some(20));
+        assert_eq!(later.limits.run.max_host_calls, Some(20));
         assert_eq!(later.file_allow, ["https://b.example"]);
         // Nothing changed is no override.
         let same = AppOverride::between(

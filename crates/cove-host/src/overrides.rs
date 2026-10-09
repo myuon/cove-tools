@@ -24,6 +24,12 @@
 //!
 //! Without a data directory (the tests' in-memory hosts) both live in memory
 //! only.
+//!
+//! An `overrides.json` written by a host from before Cove's ADR 0091 may set
+//! `limits.fuel`, which no longer exists. It is the operator's data, not a
+//! file being put forward, so it is not refused: the key is dropped when the
+//! file is read, with a warning naming the app, and the next change written
+//! leaves it out.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -94,7 +100,7 @@ pub struct Overrides {
 impl Overrides {
     fn open(dir: Option<&Path>) -> Result<Overrides, String> {
         let path = dir.map(|dir| dir.join("overrides.json"));
-        let apps = match &path {
+        let mut apps = match &path {
             Some(path) => match std::fs::read_to_string(path) {
                 Ok(text) => {
                     serde_json::from_str::<OverridesFile>(&text)
@@ -112,6 +118,9 @@ impl Overrides {
             },
             None => BTreeMap::new(),
         };
+        for warning in drop_removed_keys(&mut apps) {
+            eprintln!("cove-host: warning: {warning}");
+        }
         Ok(Overrides {
             path,
             apps: Mutex::new(apps),
@@ -145,6 +154,24 @@ impl Overrides {
         *apps = next;
         Ok(())
     }
+}
+
+/// Takes the keys Cove has removed out of every override read — the
+/// `limits.fuel` of ADR 0091 — and says what was taken, one line per app.
+/// An override left with nothing in it is dropped as well.
+fn drop_removed_keys(apps: &mut BTreeMap<String, AppOverride>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (name, over) in apps.iter_mut() {
+        if over.limits.fuel.take().is_some() {
+            warnings.push(format!(
+                "`overrides.json`: the admin's `limits.fuel` for `{name}` is dropped: Cove ADR \
+                 0091 removed the fuel allowance, and the app's requests are bounded by \
+                 `limits.deadline`"
+            ));
+        }
+    }
+    apps.retain(|_, over| !over.is_empty());
+    warnings
 }
 
 /// Writes `value` as pretty JSON to `path` through a temporary file and a
@@ -297,6 +324,52 @@ mod tests {
         let text = std::fs::read_to_string(data.join("_host/overrides.json")).unwrap();
         assert!(!text.contains("notes"), "{text}");
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_persisted_fuel_override_is_dropped_on_load_not_refused() {
+        let data = scratch("fuel");
+        std::fs::create_dir_all(data.join("_host")).unwrap();
+        // What a host from before ADR 0091 wrote: one app with fuel and
+        // another limit, one with fuel alone.
+        std::fs::write(
+            data.join("_host/overrides.json"),
+            r#"{
+  "apps": {
+    "algo": { "limits": { "fuel": 900000000, "deadline": "20000ms" } },
+    "ledger": { "limits": { "fuel": 500000000 } },
+    "notes": { "enabled": false }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let control = Control::open(Some(&data)).unwrap();
+        let algo = control.overrides.get("algo").unwrap();
+        assert_eq!(algo.limits.fuel, None);
+        assert_eq!(algo.limits.deadline.as_deref(), Some("20000ms"));
+        // Nothing left of it but the fuel: no override at all.
+        assert_eq!(control.overrides.get("ledger"), None);
+        assert!(!control.overrides.enabled("notes"));
+        // The next write leaves it out.
+        control
+            .overrides
+            .set("notes", control.overrides.get("notes").unwrap())
+            .unwrap();
+        let text = std::fs::read_to_string(data.join("_host/overrides.json")).unwrap();
+        assert!(!text.contains("fuel"), "{text}");
+        assert!(text.contains("20000ms"), "{text}");
+        let _ = std::fs::remove_dir_all(&data);
+
+        let mut apps = BTreeMap::new();
+        apps.insert(
+            "ledger".to_string(),
+            serde_json::from_str::<AppOverride>(r#"{ "limits": { "fuel": 1 } }"#).unwrap(),
+        );
+        let warnings = drop_removed_keys(&mut apps);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`ledger`"), "{}", warnings[0]);
+        assert!(warnings[0].contains("ADR 0091"), "{}", warnings[0]);
     }
 
     #[test]

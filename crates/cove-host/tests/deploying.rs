@@ -443,3 +443,67 @@ fn deploy_into_writes_an_apps_directory_without_a_host() {
     assert_eq!(rollback(&host, "versioned").status, 200);
     assert_eq!(get(host.addr, "/versioned/").body, "one 0\n");
 }
+
+/// What a host upgraded past Cove's ADR 0091 does with an app deployed under
+/// an earlier one, whose `app.toml` still says `limits.fuel`: the app keeps
+/// serving, with a warning, until it is put forward again — then the key is
+/// refused, by name. Putting the old version back is not putting it forward.
+#[test]
+fn an_app_deployed_with_the_removed_fuel_limit_serves_until_it_is_deployed_again() {
+    let fueled = "grant = [\"timer\"]\n[limits]\nfuel = 100000000\ndeadline = \"60s\"\n";
+    let apps = apps(&[AppSpec {
+        name: "versioned",
+        from: fixtures().join("versioned"),
+        config: Some(fueled),
+    }]);
+    let host = start(&apps, 1);
+    // Already on disk when the host started: served, with the key ignored.
+    let served = get(host.addr, "/versioned/");
+    assert_eq!(served.status, 200, "{}", served.body);
+    assert_eq!(served.body, "VERSION 0\n");
+    let log = get(host.addr, "/_host/apps/versioned/logs").body;
+    assert!(
+        log.contains("warning: `limits.fuel` in app.toml is ignored"),
+        "{log}"
+    );
+    assert!(log.contains("ADR 0091"), "{log}");
+
+    // A deploy that still says it is refused, and changes nothing.
+    let still = source("still", Some(fueled));
+    let refused = deploy(&host, "versioned", &still.dir);
+    assert_eq!(refused.status, 422, "{}", refused.body);
+    assert!(
+        refused
+            .body
+            .contains("`limits.fuel` was removed (Cove ADR 0091"),
+        "{}",
+        refused.body
+    );
+    assert!(refused.body.contains("limits.deadline"), "{}", refused.body);
+    assert_eq!(get(host.addr, "/versioned/").body, "VERSION 0\n");
+
+    // Without it, the deploy goes through.
+    let fixed = source(
+        "fixed",
+        Some("grant = [\"timer\"]\n[limits]\ndeadline = \"60s\"\n"),
+    );
+    let deployed = deploy(&host, "versioned", &fixed.dir);
+    assert_eq!(deployed.status, 200, "{}", deployed.body);
+    assert_eq!(get(host.addr, "/versioned/").body, "fixed 0\n");
+
+    // A rollback puts the version it replaced back, fuel and all: it was
+    // accepted once, and is not being put forward.
+    let back = rollback(&host, "versioned");
+    assert_eq!(back.status, 200, "{}", back.body);
+    assert_eq!(get(host.addr, "/versioned/").body, "VERSION 0\n");
+
+    // Updating it in place is putting it forward, and is refused.
+    let update = admin_post(&host, "/apps/versioned/update", b"", Some(ADMIN_TOKEN));
+    assert_eq!(update.status, 422, "{}", update.body);
+    assert!(
+        update.body.contains("`limits.fuel` was removed"),
+        "{}",
+        update.body
+    );
+    assert_eq!(get(host.addr, "/versioned/").body, "VERSION 0\n");
+}

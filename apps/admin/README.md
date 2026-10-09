@@ -20,7 +20,7 @@ in the main README, [Administering apps at run time](../../README.md#administeri
 | `GET /` | every app: state (`serving`, `disabled`, `refused`, `removed`) and why, version and tier, how it is reached, what its code requires and what it is granted (changes marked), its counters and store |
 | `GET /apps/<app>` | one app in full, its limits and recent errors, and the forms below |
 | `POST /apps/<app>/enable`, `/disable` | routes to the app again, or stops (503; its data stays) |
-| `POST /apps/<app>/configure` | the grant (`cap.<name>` checkboxes), the allowlist (`allow`, one per line) and every limit (`fuel`, `maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) |
+| `POST /apps/<app>/configure` | the grant (`cap.<name>` checkboxes), the allowlist (`allow`, one per line) and every limit (`maxHostCalls`, `deadlineMs`, `maxHeapWords`, `maxInFlight`, `maxQueued`, `maxRequestBytes`, `maxResponseBytes`) |
 | `POST /apps/<app>/reset` | drops the changes made here, back to `app.toml` |
 | `GET /history` | every change, made here or by `cove-host` on the machine, refused ones included |
 | `GET /secrets` | the host's secret store: each secret stored or used by an app — set or unset, when it was set, which apps use it — **never a value** |

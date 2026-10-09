@@ -150,9 +150,7 @@ fn appPage(
 
 /// The `[limits]` key a form field changes, as the host names it.
 fn limitKey(field: String) -> String {
-  if field == "fuel" {
-    "fuel"
-  } else if field == "maxHostCalls" {
+  if field == "maxHostCalls" {
     "max_host_calls"
   } else if field == "deadlineMs" {
     "deadline"
