@@ -109,7 +109,7 @@ If Cloudflare's *Bot Fight Mode* or a WAF rule challenges a sender (a
 deletes one; both need `Authorization: Bearer <LEDGER_TOKEN>` from the app
 itself. But under the same path `GET /ledger/api/runs` and
 `GET /ledger/api/runs/<id>` answer the run list and every stored run **with
-no secret** (`apps/ledger/README.md`), and Access matches paths, not methods.
+no secret** (`examples/ledger/README.md`), and Access matches paths, not methods.
 So:
 
 - **Preferred — a service token.** The poster is CI, which can send two more

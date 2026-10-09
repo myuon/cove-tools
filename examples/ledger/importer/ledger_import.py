@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Converts the existing Cove benchmark results into ledger runs, and posts runs.
 
-    python3 apps/ledger/importer/ledger_import.py convert \
-        --cove ../cove --tools . --out apps/ledger/samples
-    python3 apps/ledger/importer/ledger_import.py post \
-        --url http://127.0.0.1:8080/ledger apps/ledger/samples/*.json
+    python3 examples/ledger/importer/ledger_import.py convert \
+        --cove ../cove --tools . --out examples/ledger/samples
+    python3 examples/ledger/importer/ledger_import.py post \
+        --url http://127.0.0.1:8080/ledger examples/ledger/samples/*.json
 
 `convert` reads exactly the formats below and writes one JSON file per run in
-the ledger's schema (apps/ledger/README.md). It does not try to read every
+the ledger's schema (examples/ledger/README.md). It does not try to read every
 format there is: a new kind of result gets a converter here, or posts the
 schema itself.
 

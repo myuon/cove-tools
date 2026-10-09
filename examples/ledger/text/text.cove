@@ -1,6 +1,6 @@
 // Pure text helpers the ledger needs and the standard library does not have:
 // HTML escaping, form decoding, and calendar dates. A copy of the webhook
-// lab's (`apps/webhooks/text`), with ISO 8601 times read as well as written.
+// lab's (`examples/webhooks/text`), with ISO 8601 times read as well as written.
 
 /// `text` with `&`, `<`, `>`, `"` and `'` written as HTML entities, so that it
 /// reads as text inside an element or a quoted attribute, whatever it holds.

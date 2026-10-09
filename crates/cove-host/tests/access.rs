@@ -1,5 +1,5 @@
 //! Cloudflare Access (issue #23): `auth.identity` verifying the Access token
-//! for `apps/admin` and `apps/webhooks`, against a JWKS this test serves
+//! for `apps/admin` and `examples/webhooks`, against a JWKS this test serves
 //! itself, with RSA keys it generates itself.
 //!
 //! The mock JWKS is a plain TCP listener that answers every request with
@@ -190,7 +190,7 @@ fn past_the_rate_limit() {
 /// literally: the team is `team`, the AUD `aud`, the allowed emails
 /// `emails`, the fallback `fallback`.
 fn config(app: &str, team: &str, aud: &str, emails: &str, fallback: &str) -> String {
-    let shipped = std::fs::read_to_string(samples().join(app).join("app.toml")).unwrap();
+    let shipped = std::fs::read_to_string(sample_dir(app).join("app.toml")).unwrap();
     let (aud_env, secret_env, secret) = match app {
         "admin" => ("COVTOOLS_ADMIN_ACCESS_AUD", "ADMIN_UI_TOKEN", UI_SECRET),
         _ => ("COVTOOLS_ACCESS_AUD", "WEBHOOKS_ADMIN_TOKEN", LAB_SECRET),

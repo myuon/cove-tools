@@ -432,7 +432,7 @@ fn a_hostname_reaches_one_app() {
 
 /// `apps/admin`'s app.toml, its secret a literal.
 fn admin_app_toml() -> String {
-    std::fs::read_to_string(samples().join("admin/app.toml"))
+    std::fs::read_to_string(bundled().join("admin/app.toml"))
         .unwrap()
         .replace("{ env = \"ADMIN_UI_TOKEN\" }", "{ value = \"ui-secret\" }")
 }

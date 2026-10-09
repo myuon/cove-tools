@@ -20,7 +20,7 @@ fn an_apps_keys_are_its_own() {
         sample("notes"),
         AppSpec {
             name: "other",
-            from: samples().join("notes"),
+            from: examples().join("notes"),
             config: None,
         },
     ]);

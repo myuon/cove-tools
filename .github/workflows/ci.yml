@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The webhook lab's admin secret, the ledger's post secret and the admin
-  # UI's secret, which `cove-host check` resolves.
+  # The webhook lab's admin secret, the ledger's post secret (examples/) and
+  # the admin UI's secret (apps/admin), which `cove-host check` resolves.
   WEBHOOKS_ADMIN_TOKEN: ci
   LEDGER_TOKEN: ci
   ADMIN_UI_TOKEN: ci
@@ -40,10 +40,12 @@ jobs:
         run: cargo test --profile checked --tests
         env:
           COVE_HOST_TEST_BACKEND: vm
-      - name: check and test the sample apps
+      - name: check and test the bundled app and the examples
         run: |
           ./target/checked/cove-host check --apps apps
           ./target/checked/cove-host test --apps apps
+          ./target/checked/cove-host check --apps examples
+          ./target/checked/cove-host test --apps examples
       # cove#604's reproduction: 160 sliced native runs that copy arrays
       # into vectors, every answer 60000. Wrong answers at Cove 9272282.
       - name: native copy-under-slicing regression check

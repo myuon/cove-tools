@@ -1,5 +1,5 @@
 // What every picture the playground draws shares, so they read as one
-// system — the bench ledger's chart rules (`apps/ledger/chart`):
+// system — the bench ledger's chart rules (`examples/ledger/chart`):
 //
 // - categorical colours in a fixed order, given out by a series' (or a
 //   role's) place, never by its value;

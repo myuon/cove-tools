@@ -387,7 +387,7 @@ fn check_and_test_read_the_store_of_the_data_directory_they_are_given() {
 
 /// `apps/admin`'s app.toml, its own secret a literal.
 fn admin_app_toml() -> &'static str {
-    let toml = std::fs::read_to_string(samples().join("admin/app.toml"))
+    let toml = std::fs::read_to_string(bundled().join("admin/app.toml"))
         .unwrap()
         .replace("{ env = \"ADMIN_UI_TOKEN\" }", "{ value = \"ui-secret\" }");
     Box::leak(toml.into_boxed_str())

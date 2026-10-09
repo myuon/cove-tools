@@ -3,8 +3,9 @@
 #
 #   deploy/package.sh VERSION BINARY OUTDIR
 #
-# writes OUTDIR/cove-host-VERSION-x86_64-linux.tar.gz (the binary, apps/,
-# deploy/ and README.md under one directory of that name) and its .sha256.
+# writes OUTDIR/cove-host-VERSION-x86_64-linux.tar.gz (the binary, apps/ —
+# the one bundled app, admin; not examples/ — deploy/ and README.md under
+# one directory of that name) and its .sha256.
 # Run from the repository's root. The release workflow and CI both use it.
 set -euo pipefail
 
@@ -18,7 +19,9 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name" "$out"
 install -m755 "$binary" "$stage/$name/cove-host"
-cp -R apps deploy README.md "$stage/$name/"
+mkdir -p "$stage/$name/apps"
+cp -R apps/admin "$stage/$name/apps/"
+cp -R deploy README.md "$stage/$name/"
 tar -C "$stage" -czf "$out/$name.tar.gz" --owner=0 --group=0 "$name"
 (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 echo "$out/$name.tar.gz"

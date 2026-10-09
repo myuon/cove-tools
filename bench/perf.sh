@@ -25,7 +25,7 @@ if curl -s -o /dev/null "http://$ADDR/"; then
 fi
 # The sample apps, with proxy allowed to reach this port.
 APPS=$(mktemp -d)
-cp -R apps/* "$APPS"/
+cp -R apps/* examples/* "$APPS"/
 sed -i.bak "s|allow = \[.*\]|allow = [\"http://127.0.0.1:$PORT\"]|" "$APPS/proxy/app.toml"
 # Room for the load: the samples' per-app limits are sized for a demo, and
 # past them the host answers 429 (which is the limit working, not the

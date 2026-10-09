@@ -1,4 +1,4 @@
-//! The algorithm playground (`apps/algo`, issue #4) on a host started
+//! The algorithm playground (`examples/algo`, issue #4) on a host started
 //! in-process: known answers, the run's meter and stop reasons, cancellation,
 //! and the other apps answering while it computes.
 //!
@@ -434,7 +434,7 @@ fn a_run_a_limit_stops_says_which_limit() {
     // shipped ten seconds' work on any tier, so a shorter deadline stops
     // them at the same place, sooner. What is asserted is which limit
     // stopped them, never how long they took.
-    let shipped = std::fs::read_to_string(samples().join("algo/app.toml")).unwrap();
+    let shipped = std::fs::read_to_string(examples().join("algo/app.toml")).unwrap();
     assert!(
         shipped.contains("deadline = \"10s\""),
         "the shipped app.toml changed shape"
@@ -442,7 +442,7 @@ fn a_run_a_limit_stops_says_which_limit() {
     let short = shipped.replace("deadline = \"10s\"", "deadline = \"1s\"");
     let apps = apps(&[AppSpec {
         name: "algo",
-        from: samples().join("algo"),
+        from: examples().join("algo"),
         config: Some(&short),
     }]);
     let host = start(&apps, 2);
@@ -506,7 +506,7 @@ fn a_client_that_goes_away_cancels_its_run() {
 
 /// The webhook lab's shipped config with its admin secret given literally.
 fn webhooks_config() -> String {
-    let shipped = std::fs::read_to_string(samples().join("webhooks/app.toml")).unwrap();
+    let shipped = std::fs::read_to_string(examples().join("webhooks/app.toml")).unwrap();
     let config = shipped.replace(
         "admin = { env = \"WEBHOOKS_ADMIN_TOKEN\" }",
         &format!("admin = {{ value = \"{WEBHOOKS_SECRET}\" }}"),
@@ -529,7 +529,7 @@ fn the_other_apps_answer_while_algo_computes(backend: &str) {
         sample("hello"),
         AppSpec {
             name: "webhooks",
-            from: samples().join("webhooks"),
+            from: examples().join("webhooks"),
             config: Some(&config),
         },
     ]);
@@ -629,7 +629,7 @@ fn the_other_apps_answer_while_algo_computes(backend: &str) {
     assert_eq!(count(&host, "hello", "ok"), 10);
     assert_eq!(count(&host, "webhooks", "errors.runtime"), 0);
     // What the runtime could not yield: recorded, not asserted (see
-    // `apps/algo/README.md`, "Yields on the native tier").
+    // `examples/algo/README.md`, "Yields on the native tier").
     let stats = app_stats(&host, "algo");
     eprintln!(
         "algo on {backend}: {runs} heavy runs, yields {}, yield requests {}, declined {}, overdue {}",
@@ -652,7 +652,7 @@ fn the_other_apps_answer_while_algo_computes_on_the_native_tier() {
 /// clock: every function of the app has machine code. A function left on
 /// the encoded tier above an algorithm's loop puts the loop below an encoded
 /// frame, where a compiled run cannot yield (ADR 0085), and the host's other
-/// apps wait for the whole run (`apps/algo/README.md`, "Yields on the native
+/// apps wait for the whole run (`examples/algo/README.md`, "Yields on the native
 /// tier"). Since Cove 2ca1c94 host calls, closures and `String` comparisons
 /// are all compiled (cove#605), so the app is written plainly and nothing in
 /// it is refused; a refusal here is a regression of the code generator or a

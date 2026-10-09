@@ -24,10 +24,10 @@ put the host behind something that asks for a login if yours is not.
 $ export LEDGER_TOKEN=change-me            # the post secret; the app is refused without it
 $ ./target/checked/cove-host serve --apps apps
 $ curl -s -H "authorization: Bearer $LEDGER_TOKEN" -H 'content-type: application/json' \
-    --data @apps/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
+    --data @examples/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
 {"ok":true,"results":12,"run":"cove-593-capacity","stored":true,"url":"/ledger/runs/cove-593-capacity"}
 $ curl -s -H "authorization: Bearer $LEDGER_TOKEN" -H 'content-type: application/json' \
-    --data @apps/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
+    --data @examples/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
 {"duplicate":true,"ok":true,"run":"cove-593-capacity","stored":false}
 ```
 
@@ -36,15 +36,15 @@ the runs are still there, in `data/ledger/kv.sqlite3`.
 
 ### The sample data: the existing Cove results
 
-`apps/ledger/samples/` holds the existing measurements converted to runs —
+`examples/ledger/samples/` holds the existing measurements converted to runs —
 22 of them — and `importer/ledger_import.py` is what converted them and what
 posts them:
 
 ```console
-$ python3 apps/ledger/importer/ledger_import.py post --url http://127.0.0.1:8080/ledger apps/ledger/samples/*.json
-201 apps/ledger/samples/cove-589-capacity.json: {"ok":true,"results":20,…}
+$ python3 examples/ledger/importer/ledger_import.py post --url http://127.0.0.1:8080/ledger examples/ledger/samples/*.json
+201 examples/ledger/samples/cove-589-capacity.json: {"ok":true,"results":20,…}
 …
-$ python3 apps/ledger/importer/ledger_import.py convert --cove ../cove --tools . --out apps/ledger/samples   # to convert again
+$ python3 examples/ledger/importer/ledger_import.py convert --cove ../cove --tools . --out examples/ledger/samples   # to convert again
 ```
 
 | runs | from | commit |
