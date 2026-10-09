@@ -5,7 +5,7 @@
 #
 # writes OUTDIR/minicloud-VERSION-x86_64-linux.tar.gz (the binary, a
 # `cove-host` symbolic link to it, apps/ — the one bundled app, admin; not
-# examples/ — deploy/ and README.md under one directory of that name) and its
+# examples/ — deploy/, docs/ and README.md under one directory of that name) and its
 # .sha256.
 # Run from the repository's root. The release workflow and CI both use it.
 set -euo pipefail
@@ -25,7 +25,7 @@ install -m755 "$binary" "$stage/$name/minicloud"
 ln -s minicloud "$stage/$name/cove-host"
 mkdir -p "$stage/$name/apps"
 cp -R apps/admin "$stage/$name/apps/"
-cp -R deploy README.md "$stage/$name/"
+cp -R deploy docs README.md "$stage/$name/"
 tar -C "$stage" -czf "$out/$name.tar.gz" --owner=0 --group=0 "$name"
 (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 echo "$out/$name.tar.gz"
