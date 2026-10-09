@@ -312,7 +312,7 @@ source = "git+https://github.com/myuon/cove?rev=2af2d11c5fe02ea3f8f4a057e24cb4f2
 
 [[package]]
 name = "cove-host"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "brotli 8.0.4",
