@@ -13,7 +13,7 @@ and `/_host/stats` say so like any other grant:
 ```
 
 The host side — what a change means, what is refused, where it is kept — is
-in the main README, [Administering apps at run time](../../README.md#administering-apps-at-run-time).
+in [docs/design.md, Administering apps at run time](../../docs/design.md#administering-apps-at-run-time).
 
 | request | does |
 | --- | --- |
@@ -27,8 +27,8 @@ in the main README, [Administering apps at run time](../../README.md#administeri
 | `POST /secrets/set` | `name` and `value` (a password field, never filled back in): stores it and reloads the apps that use it; the page says what each reload came to |
 | `POST /secrets/delete` | `name`, `confirm` (a required checkbox: there is no script for a dialog), and `force` for a secret an app uses, which leaves those apps refused |
 
-The secret store and what a change to it does are in the main README,
-[Secrets set at run time](../../README.md#secrets-set-at-run-time).
+The secret store and what a change to it does are in
+[docs/design.md, Secrets set at run time](../../docs/design.md#secrets-set-at-run-time).
 
 A change that went through redirects back to the app's page (`?done=`); one
 that did not answers 422 with the reasons — the form's own (a field that is

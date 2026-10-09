@@ -127,8 +127,8 @@ pub struct AppCounters {
     /// `OwnedVm::yields_declined`), summed over every answered run.
     pub yields_declined: AtomicU64,
     /// Runs still holding their worker well after being asked to yield: a
-    /// run that cannot yield where it is (see the README's runtime
-    /// constraints). Its deadline still bounds it.
+    /// run that cannot yield where it is (see `docs/design.md`, "Runtime
+    /// constraints, made explicit"). Its deadline still bounds it.
     pub overdue_yields: AtomicU64,
     /// Host calls answered by blocking the worker because the run could not
     /// park where the call was made.
