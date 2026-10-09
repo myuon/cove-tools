@@ -35,6 +35,17 @@ that did not answers 422 with the reasons — the form's own (a field that is
 not a whole number, below its least value, an allowlist line that is not
 `http(s)://…`), or the host's (the reload's) — and the form as posted.
 
+## On a screen of any width
+
+The pages are one stylesheet, inline in each of them ([`pages.cove`](pages.cove),
+`css`), and no script at all: what they do on a phone, they do in CSS. Nothing
+scrolls sideways under about 760 px — each row of a wide table (the apps, the
+history, the secrets, an app's recent errors) becomes a card, its cells
+labelled by the column headings they lose, and the forms' fields go one to a
+line. The colours are custom properties with a `prefers-color-scheme: dark`
+set beside them, and `color-scheme` tells the browser to draw its own parts —
+the checkboxes, the scrollbars, the login prompt — to match.
+
 ## Getting in
 
 - **Only by hostname**: `[route] hosts = ["covtools-admin.ramda.io",

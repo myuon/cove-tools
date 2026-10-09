@@ -5,7 +5,8 @@ use text
 // The pages. Every value that came from the host — an app's name, a reason,
 // an error message, a history entry — and every value echoed from a form
 // goes through `h` before it is part of a page; the page's own markup is
-// the only markup in it. There is no script at all.
+// the only markup in it. There is no script at all: what the pages do on a
+// narrow screen, they do in CSS.
 
 /// `value`, escaped for HTML.
 fn h(value: String) -> String {
@@ -48,13 +49,159 @@ fn redirect(location: String) -> web.Response {
   )
 }
 
-fn css() -> String {
-  "body\{font:14px/1.45 system-ui,sans-serif;margin:0;color:#1d1d1f;background:#fafafa\}header\{background:#3b2d4f;padding:.6em 1.2em;display:flex;gap:1.4em;align-items:baseline\}header a\{color:#fff;text-decoration:none\}header a.home\{font-weight:600\}main\{padding:1em 1.2em;max-width:80em\}table\{border-collapse:collapse;margin:.4em 0 1.2em;background:#fff\}td,th\{border:1px solid #d0d7de;padding:.25em .6em;text-align:left;vertical-align:top\}th\{background:#f3f4f6\}code,pre,textarea\{font:12px/1.4 ui-monospace,monospace\}pre\{background:#fff;border:1px solid #d0d7de;padding:.6em;white-space:pre-wrap;word-break:break-word;max-height:24em;overflow:auto\}button\{font:inherit;padding:.2em .8em\}input\{font:inherit\}input[type=number]\{width:12em\}.muted\{color:#6e7781\}.state\{display:inline-block;padding:0 .5em;border-radius:.6em;font-size:12px;font-weight:600;color:#fff\}.serving\{background:#1a7f37\}.disabled\{background:#6e7781\}.refused\{background:#b42318\}.removed\{background:#9a6700\}.added\{color:#1a7f37\}.taken\{color:#b42318;text-decoration:line-through\}.notice\{border:1px solid #1a7f37;background:#dafbe1;padding:.5em .8em;margin:.6em 0\}.problem\{border:1px solid #b42318;background:#ffebe9;padding:.5em .8em;margin:.6em 0\}.problem pre\{margin:.4em 0 0\}fieldset\{border:1px solid #d0d7de;background:#fff;margin:.6em 0;padding:.5em .9em\}legend\{font-weight:600\}label.cap\{display:inline-block;min-width:9em;margin:.15em 0\}"
+/// The colours, the type and the spacing, as custom properties: one set for
+/// a light screen and one for a dark one, which the whole sheet is written
+/// against. `color-scheme` tells the browser to draw its own parts — the
+/// scrollbars, the checkboxes, the login prompt — to match.
+fn cssTokens() -> String {
+  ":root\{color-scheme:light dark;--bg:#f4f6f8;--card:#fff;--line:#e1e5ea;--soft:#eef1f4;--text:#191c21;--muted:#67707c;--brand:#342a4d;--brand-2:#4b3d6e;--link:#3a4bb0;--ok:#0f7a38;--ok-bg:#e7f6ec;--bad:#b32318;--bad-bg:#fdeceb;--warn:#8a5a00;--warn-bg:#fbf1de;--off:#58606c;--off-bg:#eaedf1;--focus:#7c6bc4\}
+@media (prefers-color-scheme:dark)\{:root\{--bg:#111418;--card:#191d23;--line:#2b313a;--soft:#222730;--text:#e7e9ec;--muted:#98a1ad;--brand:#1e1a2c;--brand-2:#473a68;--link:#a3b2ff;--ok:#52cc84;--ok-bg:#13301f;--bad:#ff8f82;--bad-bg:#3a1c19;--warn:#eec272;--warn-bg:#352a12;--off:#aab3bf;--off-bg:#262b33;--focus:#9d8cf0\}\}"
 }
 
-/// The page around `content`.
-fn layout(base: String, title: String, content: String) -> String {
-  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · minicloud admin</title><style>{css()}</style></head><body><header><a class=home href=\"{h(base)}/\">minicloud admin</a><a href=\"{h(base)}/\">apps</a><a href=\"{h(base)}/secrets\">secrets</a><a href=\"{h(base)}/history\">history</a></header><main>{content}</main></body></html>"
+/// The page itself: the type, the header and its navigation, the headings.
+fn cssPage() -> String {
+  "*\{box-sizing:border-box\}
+html\{-webkit-text-size-adjust:100%\}
+body\{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",sans-serif\}
+a\{color:var(--link)\}
+a:hover\{text-decoration:none\}
+:focus-visible\{outline:2px solid var(--focus);outline-offset:2px;border-radius:4px\}
+header\{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;align-items:center;gap:.3em .8em;background:var(--brand);padding:.6em 1rem\}
+header .brand\{display:flex;align-items:center;gap:.5em;margin-right:.3em;color:#fff;font-weight:650;text-decoration:none\}
+header .brand::before\{content:\"\";width:.55em;height:.55em;border-radius:50%;background:#9d8cf0\}
+header nav\{display:flex;flex-wrap:wrap;gap:.15em\}
+header nav a\{padding:.3em .7em;border-radius:999px;color:#cdc6e3;font-size:14px;text-decoration:none\}
+header nav a:hover\{background:rgba(255,255,255,.14);color:#fff\}
+header nav a[aria-current]\{background:rgba(255,255,255,.18);color:#fff;font-weight:600\}
+main\{max-width:78rem;margin:0 auto;padding:1.5rem 1rem 4rem\}
+h1\{display:flex;flex-wrap:wrap;align-items:center;gap:.5em;margin:.1em 0 .3em;font-size:1.7rem;line-height:1.2;letter-spacing:-.01em\}
+h2\{margin:2em 0 .7em;font-size:.8rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)\}
+p\{margin:.6em 0\}
+.lead\{max-width:62em;margin:.1em 0 1.3em;color:var(--muted)\}
+.muted\{color:var(--muted)\}
+.added\{color:var(--ok)\}
+.taken\{color:var(--bad);text-decoration:line-through\}
+code,pre,textarea,input\{font-family:ui-monospace,SFMono-Regular,Menlo,monospace\}
+code\{padding:.05em .35em;border-radius:.3em;background:var(--soft);font-size:.86em\}
+pre\{margin:.4em 0;padding:.7em .8em;border:1px solid var(--line);border-radius:10px;background:var(--card);font-size:12.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word;max-height:24em;overflow:auto\}
+.state\{display:inline-flex;align-items:center;gap:.42em;padding:.18em .65em;border-radius:999px;font-family:inherit;font-size:12px;font-weight:650;white-space:nowrap\}
+.state::before\{content:\"\";width:.45em;height:.45em;border-radius:50%;background:currentColor\}
+.serving\{color:var(--ok);background:var(--ok-bg)\}
+.disabled\{color:var(--off);background:var(--off-bg)\}
+.refused\{color:var(--bad);background:var(--bad-bg)\}
+.removed\{color:var(--warn);background:var(--warn-bg)\}
+.notice,.problem\{margin:1em 0;padding:.75em .95em;border:1px solid var(--line);border-left:4px solid var(--ok);border-radius:10px;background:var(--ok-bg)\}
+.problem\{border-left-color:var(--bad);background:var(--bad-bg)\}
+.problem ul\{margin:.4em 0 0;padding-left:1.2em\}
+.problem pre,.notice pre\{margin:.5em 0 0;background:var(--card)\}"
+}
+
+/// The tables: a card on a wide screen, one card a row on a narrow one.
+/// `table.cards` rows carry a `data-label` per cell, which is the column's
+/// heading said again beside the value once the heading row is gone.
+fn cssTable() -> String {
+  ".scroll\{margin:.2em 0 1.5em;border:1px solid var(--line);border-radius:12px;background:var(--card);overflow-x:auto\}
+table\{width:100%;border-collapse:collapse;font-size:14px\}
+th,td\{padding:.58em .8em;border-bottom:1px solid var(--soft);text-align:left;vertical-align:top\}
+tr:last-child td\{border-bottom:0\}
+tr.head th\{position:relative;border-bottom:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:11.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase\}
+tbody tr:hover td,table.cards tr:hover td\{background:var(--soft)\}
+table.cards tr.head:hover th\{background:var(--soft)\}
+.scroll.narrow\{max-width:52rem\}
+table.facts th\{width:34%;background:transparent;color:var(--muted);font-weight:600;white-space:nowrap\}
+td .state\{margin-right:.3em\}
+.nums\{white-space:nowrap;font-variant-numeric:tabular-nums\}
+@media (min-width:761px)\{td.nowrap\{white-space:nowrap\}\}
+.when\{white-space:nowrap;color:var(--muted);font-size:13px\}"
+}
+
+/// The forms: panels, capability chips, the limits as a grid of fields.
+fn cssForm() -> String {
+  ".panel\{margin:.2em 0 1.2em;padding:1em 1.1em;border:1px solid var(--line);border-radius:12px;background:var(--card)\}
+.panel>p:first-child\{margin-top:0\}
+fieldset\{margin:0 0 1.2em;padding:0;border:0\}
+fieldset:last-of-type\{margin-bottom:.8em\}
+legend\{margin-bottom:.5em;padding:0;font-size:14px;font-weight:650\}
+.caps\{display:grid;grid-template-columns:repeat(auto-fill,minmax(13em,1fr));gap:.45em\}
+label.cap\{display:flex;align-items:center;gap:.55em;min-height:2.6em;padding:.4em .7em;border:1px solid var(--line);border-radius:9px;background:var(--bg);line-height:1.25\}
+label.cap:hover\{border-color:var(--focus)\}
+label.cap .note\{color:var(--muted);font-size:12px\}
+.fields\{display:grid;grid-template-columns:repeat(auto-fit,minmax(15em,23rem));gap:.8em\}
+.field\{display:flex;flex-direction:column;justify-content:flex-end;gap:.3em\}
+.field label\{color:var(--muted);font-size:13px\}
+input,textarea\{width:100%;padding:.5em .65em;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--text);font-size:15px\}
+input[type=checkbox]\{width:auto;min-width:1.05em;height:1.05em;margin:0;accent-color:var(--brand-2)\}
+textarea\{max-width:52rem;min-height:7em;line-height:1.5;resize:vertical\}
+button\{min-height:2.6em;padding:.5em 1.1em;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--text);font:inherit;font-size:14px;font-weight:600;cursor:pointer\}
+button:hover\{border-color:var(--muted)\}
+button.primary\{border-color:var(--brand-2);background:var(--brand-2);color:#fff\}
+button.primary:hover\{background:var(--brand);border-color:var(--brand)\}
+button.danger\{color:var(--bad);border-color:var(--line)\}
+button.danger:hover\{border-color:var(--bad);background:var(--bad-bg)\}
+.actions\{display:flex;flex-wrap:wrap;align-items:center;gap:.6em .9em;margin:.9em 0 0\}
+.actions p,.actions .muted\{margin:0;font-size:13px\}
+.inline\{display:flex;flex-wrap:wrap;align-items:center;gap:.4em\}
+.inline input[type=password]\{width:11em\}
+.inline label\{display:flex;align-items:center;gap:.35em;font-size:13px\}"
+}
+
+/// A narrow screen: nothing scrolls sideways. Each row of a `cards` table
+/// becomes a card — its first cell the card's title, every other cell its
+/// column's name and the value, a line each.
+fn cssNarrow() -> String {
+  "@media (max-width:760px)\{
+main\{padding:1.1rem .75rem 3rem\}
+h1\{font-size:1.4rem\}
+.scroll.cardwrap\{margin:.2em 0 1.2em;border:0;border-radius:0;background:transparent;overflow:visible\}
+table.cards,table.cards tr,table.cards td\{display:block;width:auto\}
+table.cards tr.head\{display:none\}
+table.cards tr\{margin:0 0 .7em;padding:.2em .9em .6em;border:1px solid var(--line);border-radius:12px;background:var(--card)\}
+table.cards tr:hover td\{background:transparent\}
+table.cards td\{display:block;overflow:hidden;padding:.42em 0;border-bottom:1px solid var(--soft);text-align:right\}
+table.cards td:last-child\{border-bottom:0\}
+table.cards td::before\{content:attr(data-label);float:left;max-width:55%;margin-right:1.2em;color:var(--muted);font-size:11.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;text-align:left\}
+table.cards td.title\{padding:.6em 0 .5em;border-bottom:1px solid var(--line);font-size:16px;text-align:left\}
+table.cards td.title::before\{content:none\}
+table.cards td.block\{text-align:left\}
+table.cards td.block::before\{float:none;display:block;max-width:none;margin:0 0 .3em\}
+table.facts th\{width:40%\}
+.fields\{grid-template-columns:1fr\}
+.caps\{grid-template-columns:repeat(auto-fill,minmax(10em,1fr))\}
+.inline input[type=password]\{width:100%\}
+\}
+@media (max-width:420px)\{
+table.facts,table.facts tr,table.facts th,table.facts td\{display:block;width:auto\}
+table.facts th\{width:auto;padding-bottom:0;border-bottom:0;font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:normal\}
+table.facts td\{padding-top:.2em\}
+\}"
+}
+
+fn css() -> String {
+  "{cssTokens()}
+{cssPage()}
+{cssTable()}
+{cssForm()}
+{cssNarrow()}"
+}
+
+/// The navigation, with the page one is on marked.
+fn nav(base: String, here: String) -> String {
+  var out = Vector.of()
+  for item in Vector.of(
+    MapEntry(key: "apps", value: "/"),
+    MapEntry(key: "secrets", value: "/secrets"),
+    MapEntry(key: "history", value: "/history"),
+  )
+    .freeze() {
+    let mark = if item.key == here { " aria-current=page" } else { "" }
+    out.push("<a href=\"{h(base)}{h(item.value)}\"{mark}>{h(item.key)}</a>")
+  }
+  "<nav>{"".join(out.freeze())}</nav>"
+}
+
+/// The page around `content`. `here` is the navigation entry it belongs to.
+fn layout(base: String, here: String, title: String, content: String) -> String {
+  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{h(title)} · minicloud admin</title><style>{css()}</style></head><body><header><a class=brand href=\"{h(base)}/\">minicloud admin</a>{nav(base, here)}</header><main>{content}</main></body></html>"
 }
 
 fn badge(state: String) -> String {
@@ -97,6 +244,30 @@ fn firstLine(reason: String) -> String {
   reason.split("\n").get(0).unwrapOr("")
 }
 
+/// What the overview says above the table: how many apps there are, how
+/// they are, and what they have served between them.
+fn overviewLead(apps: Array<host.App>) -> String {
+  var serving = 0
+  var served = 0
+  var errors = 0
+  var away = Vector.of()
+  for app in apps {
+    served = served + app.served
+    errors = errors + app.errors
+    if app.state == "serving" {
+      serving = serving + 1
+    } else {
+      away.push("{app.name} {app.state}")
+    }
+  }
+  let rest = if away.length() == 0 {
+    "all serving"
+  } else {
+    "{serving} serving, {", ".join(away.freeze())}"
+  }
+  "<p class=lead>{apps.length()} apps — {h(rest)} — {served} requests served, {errors} errors. A change to an app is a re-check: the host loads the app again with it and serves the new version only if it loads. Taking away a capability the code needs leaves that app refused — and no other. Changes are kept in the host's data directory and survive restarts and releases.</p>"
+}
+
 /// Every app, one row each.
 fn overviewPage(base: String, apps: Array<host.App>) -> String {
   var rows = Vector.of()
@@ -112,14 +283,13 @@ fn overviewPage(base: String, apps: Array<host.App>) -> String {
       "<code>/{h(app.name)}/</code>"
     }
     let required = if app.requiredOpen { "{names(app.required)} <span class=muted>(at least)</span>" } else { names(app.required) }
-    let store = if app.kvKeys < 0 { "–" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
+    let store = if app.kvKeys < 0 { "<span class=muted>–</span>" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
     rows.push(
-      "<tr><td><a href=\"{h(base)}/apps/{h(app.name)}\"><b>{h(app.name)}</b></a>{if app.isAdmin { " <span class=muted>(this app)</span>" } else { "" }}</td><td>{badge(app.state)}{reason}</td><td><code>{h(app.version)}</code> <span class=muted>{h(app.tier)}</span></td><td>{reached}</td><td>{required}</td><td>{grantList(app)}</td><td>{app.served} / {app.ok} / {app.errors} / {app.rejected}</td><td>{app.inFlight} / {app.queued}</td><td>{store}</td></tr>",
+      "<tr><td class=title data-label=app><a href=\"{h(base)}/apps/{h(app.name)}\"><b>{h(app.name)}</b></a>{if app.isAdmin { " <span class=muted>(this app)</span>" } else { "" }}</td><td data-label=state>{badge(app.state)}{reason}</td><td data-label=version><code>{h(app.version)}</code> <span class=muted>{h(app.tier)}</span></td><td data-label=reached>{reached}</td><td data-label=\"code requires\">{required}</td><td data-label=granted>{grantList(app)}</td><td class=nums data-label=\"served / ok / errors / rejected\">{app.served} / {app.ok} / {app.errors} / {app.rejected}</td><td class=nums data-label=\"in flight / queued\">{app.inFlight} / {app.queued}</td><td data-label=store>{store}</td></tr>",
     )
   }
-  let table = "<table><tr><th>app</th><th>state</th><th>version</th><th>reached</th><th>code requires</th><th>granted</th><th>served / ok / errors / rejected</th><th>in flight / queued</th><th>store</th></tr>{"".join(rows.freeze())}</table>"
-  let about = "<p class=muted>A change to an app is a re-check: the host loads the app again with it and serves the new version only if it loads. Taking away a capability the code needs leaves that app refused — and no other. Changes are kept in the host's data directory and survive restarts and releases.</p>"
-  layout(base, "apps", "<h1>Apps</h1>{table}{about}")
+  let table = "<div class=\"scroll cardwrap\"><table class=cards><tr class=head><th>app</th><th>state</th><th>version</th><th>reached</th><th>code requires</th><th>granted</th><th>served / ok / errors / rejected</th><th>in flight / queued</th><th>store</th></tr>{"".join(rows.freeze())}</table></div>"
+  layout(base, "apps", "apps", "<h1>Apps</h1>{overviewLead(apps)}{table}")
 }
 
 /// One app: what it is, the forms that change it, its recent errors.
@@ -137,12 +307,13 @@ fn appPage(
   var limitRows = Vector.of()
   for field in limitFields() {
     let changed = if app.limitsChanged.contains(limitKey(field.name)) { " <span class=added title=\"set here, not in app.toml\">(changed)</span>" } else { "" }
-    limitRows.push("<tr><th>{h(field.label)}</th><td>{limitValue(app.limits, field.name)}{changed}</td></tr>")
+    limitRows.push("<tr><th>{h(field.label)}</th><td class=nums>{limitValue(app.limits, field.name)}{changed}</td></tr>")
   }
-  let store = if app.kvKeys < 0 { "–" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
-  let facts = "<table><tr><th>state</th><td>{badge(app.state)}</td></tr><tr><th>version</th><td><code>{h(app.version)}</code> {h(app.tier)}</td></tr><tr><th>entry</th><td><code>{h(app.entry)}</code></td></tr><tr><th>reached</th><td>{if app.hosts.length() > 0 { "by hostname {names(app.hosts)} only" } else { "<code>/{h(app.name)}/</code>" }}</td></tr><tr><th>code requires</th><td>{names(app.required)}{if app.requiredOpen { " <span class=muted>(at least: it makes a call the checker cannot follow)</span>" } else { "" }}</td></tr><tr><th>granted</th><td>{grantList(app)}</td></tr><tr><th>fetch allowlist</th><td>{names(app.fetchAllow)}</td></tr><tr><th>requests</th><td>{app.served} served, {app.ok} ok, {app.errors} errors, {app.rejected} rejected; {app.inFlight} in flight, {app.queued} queued</td></tr><tr><th>store</th><td>{store}</td></tr></table><h2>Limits</h2><table>{"".join(limitRows.freeze())}</table>"
+  let store = if app.kvKeys < 0 { "<span class=muted>–</span>" } else { "{app.kvKeys} keys, {text.bytes(app.kvBytes)}" }
+  let facts = "<div class=\"scroll narrow\"><table class=facts><tr><th>state</th><td>{badge(app.state)}</td></tr><tr><th>version</th><td><code>{h(app.version)}</code> <span class=muted>{h(app.tier)}</span></td></tr><tr><th>entry</th><td><code>{h(app.entry)}</code></td></tr><tr><th>reached</th><td>{if app.hosts.length() > 0 { "by hostname {names(app.hosts)} only" } else { "<code>/{h(app.name)}/</code>" }}</td></tr><tr><th>code requires</th><td>{names(app.required)}{if app.requiredOpen { " <span class=muted>(at least: it makes a call the checker cannot follow)</span>" } else { "" }}</td></tr><tr><th>granted</th><td>{grantList(app)}</td></tr><tr><th>fetch allowlist</th><td>{names(app.fetchAllow)}</td></tr><tr><th>requests</th><td>{app.served} served, {app.ok} ok, {app.errors} errors, {app.rejected} rejected; {app.inFlight} in flight, {app.queued} queued</td></tr><tr><th>store</th><td>{store}</td></tr></table></div><h2>Limits</h2><div class=\"scroll narrow\"><table class=facts>{"".join(limitRows.freeze())}</table></div>"
   layout(
     base,
+    "apps",
     app.name,
     "<h1>{h(app.name)} {badge(app.state)}</h1>{notice}{reason}{facts}{enableForm(at, app)}{configureForm(at, app, capabilities, posted)}{resetForm(at)}{errorsTable(app.recentErrors)}",
   )
@@ -169,15 +340,15 @@ fn limitKey(field: String) -> String {
 
 fn enableForm(at: String, app: host.App) -> String {
   if app.isAdmin {
-    return "<h2>Routing</h2><p class=muted>The admin app cannot disable itself. On the machine, <code>minicloud disable admin</code> can.</p>"
+    return "<h2>Routing</h2><div class=panel><p class=muted>The admin app cannot disable itself. On the machine, <code>minicloud disable admin</code> can.</p></div>"
   }
   if app.state == "disabled" {
-    return "<h2>Routing</h2><form method=post action=\"{h(at)}/enable\"><p>Disabled: requests are answered 503, and its data is kept. <button>Enable</button></p></form>"
+    return "<h2>Routing</h2><div class=panel><form method=post action=\"{h(at)}/enable\"><p>Disabled: requests are answered 503, and its data is kept.</p><div class=actions><button class=primary>Enable</button></div></form></div>"
   }
   if app.state == "removed" {
     return ""
   }
-  "<h2>Routing</h2><form method=post action=\"{h(at)}/disable\"><p>Disabling stops routing to it — requests are answered 503 — and keeps its data; requests in flight finish. <button>Disable</button></p></form>"
+  "<h2>Routing</h2><div class=panel><form method=post action=\"{h(at)}/disable\"><p>Disabling stops routing to it — requests are answered 503 — and keeps its data; requests in flight finish.</p><div class=actions><button class=danger>Disable</button></div></form></div>"
 }
 
 /// The grant, the allowlist and the limits, as a form: the app's current
@@ -197,17 +368,17 @@ fn configureForm(
       Some(form) => form.contains("cap.{capability}")
       None => app.granted.contains(capability)
     }
-    let needed = if app.required.contains(capability) { " <span class=muted>(the code uses it)</span>" } else { "" }
+    let needed = if app.required.contains(capability) { " <span class=note>the code uses it</span>" } else { "" }
     if !app.isAdmin && capability == "admin" {
       // Only the admin app may hold it; the host refuses it to any other.
       continue
     }
     if app.isAdmin && capability == "admin" {
       // Not the admin app's to give up: sent whatever the box says.
-      boxes.push("<label class=cap><input type=hidden name=\"cap.admin\" value=on><input type=checkbox checked disabled> <code>admin</code></label>{needed}<br>")
+      boxes.push("<label class=cap><input type=hidden name=\"cap.admin\" value=on><input type=checkbox checked disabled> <code>admin</code>{needed}</label>")
     } else {
       boxes.push(
-        "<label class=cap><input type=checkbox name=\"cap.{h(capability)}\"{if checked { " checked" } else { "" }}> <code>{h(capability)}</code></label>{needed}<br>",
+        "<label class=cap><input type=checkbox name=\"cap.{h(capability)}\"{if checked { " checked" } else { "" }}> <code>{h(capability)}</code>{needed}</label>",
       )
     }
   }
@@ -222,14 +393,14 @@ fn configureForm(
       None => "{limitValue(app.limits, field.name)}"
     }
     inputs.push(
-      "<tr><th><label for=\"{h(field.name)}\">{h(field.label)}</label></th><td><input id=\"{h(field.name)}\" name=\"{h(field.name)}\" value=\"{h(value)}\" inputmode=numeric required></td></tr>",
+      "<div class=field><label for=\"{h(field.name)}\">{h(field.label)}</label><input id=\"{h(field.name)}\" name=\"{h(field.name)}\" value=\"{h(value)}\" inputmode=numeric required></div>",
     )
   }
-  "<h2>Configuration</h2><form method=post action=\"{h(at)}/configure\"><fieldset><legend>Grant</legend>{"".join(boxes.freeze())}</fieldset><fieldset><legend>Fetch allowlist</legend><p class=muted>One per line: <code>https://host</code>, <code>http://host:port</code> or <code>http://host:*</code>.</p><textarea name=allow rows=5 cols=60>{h(allow)}</textarea></fieldset><fieldset><legend>Limits</legend><table>{"".join(inputs.freeze())}</table></fieldset><p><button>Check and apply</button> <span class=muted>The host reloads the app with these settings; a change that does not work is not kept.</span></p></form>"
+  "<h2>Configuration</h2><div class=panel><form method=post action=\"{h(at)}/configure\"><fieldset><legend>Grant</legend><div class=caps>{"".join(boxes.freeze())}</div></fieldset><fieldset><legend>Fetch allowlist</legend><p class=muted>One per line: <code>https://host</code>, <code>http://host:port</code> or <code>http://host:*</code>.</p><textarea name=allow rows=5>{h(allow)}</textarea></fieldset><fieldset><legend>Limits</legend><div class=fields>{"".join(inputs.freeze())}</div></fieldset><div class=actions><button class=primary>Check and apply</button><span class=muted>The host reloads the app with these settings; a change that does not work is not kept.</span></div></form></div>"
 }
 
 fn resetForm(at: String) -> String {
-  "<form method=post action=\"{h(at)}/reset\"><p><button>Reset to app.toml</button> <span class=muted>Drops every change made here to the grant, the allowlist and the limits.</span></p></form>"
+  "<form method=post action=\"{h(at)}/reset\"><div class=actions><button>Reset to app.toml</button><span class=muted>Drops every change made here to the grant, the allowlist and the limits.</span></div></form>"
 }
 
 fn errorsTable(errors: Array<host.Failure>) -> String {
@@ -239,10 +410,10 @@ fn errorsTable(errors: Array<host.Failure>) -> String {
   var rows = Vector.of()
   for error in errors {
     rows.push(
-      "<tr><td>{text.isoTime(error.atMs)}</td><td><code>{h(error.kind)}</code></td><td>{error.status}</td><td><code>{h(error.version)}</code></td><td><pre>{h(error.message)}</pre></td></tr>",
+      "<tr><td class=\"title when\" data-label=\"at (UTC)\">{text.isoTime(error.atMs)}</td><td data-label=kind><code>{h(error.kind)}</code></td><td data-label=status>{error.status}</td><td data-label=version><code>{h(error.version)}</code></td><td class=block data-label=message><pre>{h(error.message)}</pre></td></tr>",
     )
   }
-  "<h2>Recent errors</h2><table><tr><th>at (UTC)</th><th>kind</th><th>status</th><th>version</th><th>message</th></tr>{"".join(rows.freeze())}</table>"
+  "<h2>Recent errors</h2><div class=\"scroll cardwrap\"><table class=cards><tr class=head><th>at (UTC)</th><th>kind</th><th>status</th><th>version</th><th>message</th></tr>{"".join(rows.freeze())}</table></div>"
 }
 
 /// What a `?done=` says after a change went through.
@@ -301,19 +472,19 @@ fn secretsPage(base: String, secrets: Array<host.Secret>, notice: String, name: 
       users.push("<a href=\"{h(base)}/apps/{h(app)}\"><code>{h(app)}</code></a>")
     }
     let used = if users.length() == 0 { "<span class=muted>none</span>" } else { " ".join(users.freeze()) }
-    let replace = "<form method=post action=\"{h(base)}/secrets/set\"><input type=hidden name=name value=\"{h(secret.name)}\"><input type=password name=value autocomplete=new-password required placeholder=\"new value\"> <button>{if secret.set { "Replace" } else { "Set" }}</button></form>"
-    let force = if secret.apps.length() > 0 { " <label><input type=checkbox name=force> even though apps use it (they are refused)</label>" } else { "" }
-    let delete = if secret.set { "<form method=post action=\"{h(base)}/secrets/delete\"><input type=hidden name=name value=\"{h(secret.name)}\"><label><input type=checkbox name=confirm required> confirm</label>{force} <button>Delete</button></form>" } else { "" }
-    rows.push("<tr><td><code>{h(secret.name)}</code></td><td>{state}</td><td>{updated}</td><td>{used}</td><td>{replace}</td><td>{delete}</td></tr>")
+    let replace = "<form class=inline method=post action=\"{h(base)}/secrets/set\"><input type=hidden name=name value=\"{h(secret.name)}\"><input type=password name=value autocomplete=new-password required placeholder=\"new value\"><button class=primary>{if secret.set { "Replace" } else { "Set" }}</button></form>"
+    let force = if secret.apps.length() > 0 { "<label><input type=checkbox name=force> even though apps use it (they are refused)</label>" } else { "" }
+    let delete = if secret.set { "<form class=inline method=post action=\"{h(base)}/secrets/delete\"><input type=hidden name=name value=\"{h(secret.name)}\"><label><input type=checkbox name=confirm required> confirm</label>{force}<button class=danger>Delete</button></form>" } else { "<span class=muted>–</span>" }
+    rows.push("<tr><td class=title data-label=name><code>{h(secret.name)}</code></td><td data-label=state>{state}</td><td class=when data-label=\"set at (UTC)\">{updated}</td><td data-label=\"used by\">{used}</td><td class=block data-label=\"set or replace\">{replace}</td><td class=block data-label=delete>{delete}</td></tr>")
   }
   let table = if rows.length() == 0 {
     "<p class=muted>No secret is stored or used.</p>"
   } else {
-    "<table><tr><th>name</th><th>state</th><th>set at (UTC)</th><th>used by</th><th>set or replace</th><th>delete</th></tr>{"".join(rows.freeze())}</table>"
+    "<div class=\"scroll cardwrap\"><table class=cards><tr class=head><th>name</th><th>state</th><th>set at (UTC)</th><th>used by</th><th>set or replace</th><th>delete</th></tr>{"".join(rows.freeze())}</table></div>"
   }
-  let add = "<h2>Set a secret</h2><form method=post action=\"{h(base)}/secrets/set\"><table><tr><th><label for=secret-name>name</label></th><td><input id=secret-name name=name value=\"{h(name)}\" required pattern=\"[A-Za-z0-9][A-Za-z0-9_.\\-]*\" maxlength=64></td></tr><tr><th><label for=secret-value>value</label></th><td><input id=secret-value type=password name=value autocomplete=new-password required></td></tr></table><p><button>Set</button> <span class=muted>Stored by the host (<code>&lt;data&gt;/_host/secrets</code>, mode 0600); the apps that use it are reloaded with it.</span></p></form>"
+  let add = "<h2>Set a secret</h2><div class=panel><form method=post action=\"{h(base)}/secrets/set\"><div class=fields><div class=field><label for=secret-name>name</label><input id=secret-name name=name value=\"{h(name)}\" required pattern=\"[A-Za-z0-9][A-Za-z0-9_.\\-]*\" maxlength=64></div><div class=field><label for=secret-value>value</label><input id=secret-value type=password name=value autocomplete=new-password required></div></div><div class=actions><button class=primary>Set</button><span class=muted>Stored by the host (<code>&lt;data&gt;/_host/secrets</code>, mode 0600); the apps that use it are reloaded with it.</span></div></form></div>"
   let about = "<p class=muted>An app takes a stored secret with <code>[secrets] key = \{ store = \"name\" \}</code> in its app.toml, for <code>auth.check</code> or a <code>[fetch.headers]</code> header. A value is write-only: no page, log or history shows it.</p>"
-  layout(base, "secrets", "<h1>Secrets</h1>{notice}{table}{add}{about}")
+  layout(base, "secrets", "secrets", "<h1>Secrets</h1>{notice}{table}{add}{about}")
 }
 
 /// The change history.
@@ -321,13 +492,13 @@ fn historyPage(base: String, changes: Array<host.Change>) -> String {
   var rows = Vector.of()
   for change in changes {
     rows.push(
-      "<tr><td>{text.isoTime(change.atMs)}</td><td>{h(change.who)}</td><td>{historyApp(base, change.app)}</td><td><code>{h(change.action)}</code></td><td>{h(change.detail)}</td><td>{h(change.outcome)}</td></tr>",
+      "<tr><td class=\"title when\" data-label=\"at (UTC)\">{text.isoTime(change.atMs)}</td><td class=nowrap data-label=who>{h(change.who)}</td><td data-label=app>{historyApp(base, change.app)}</td><td class=nowrap data-label=action><code>{h(change.action)}</code></td><td class=block data-label=\"asked for\">{h(change.detail)}</td><td class=block data-label=outcome>{h(change.outcome)}</td></tr>",
     )
   }
   let table = if rows.length() == 0 {
     "<p class=muted>No changes yet.</p>"
   } else {
-    "<table><tr><th>at (UTC)</th><th>who</th><th>app</th><th>action</th><th>asked for</th><th>outcome</th></tr>{"".join(rows.freeze())}</table>"
+    "<div class=\"scroll cardwrap\"><table class=cards><tr class=head><th>at (UTC)</th><th>who</th><th>app</th><th>action</th><th>asked for</th><th>outcome</th></tr>{"".join(rows.freeze())}</table></div>"
   }
-  layout(base, "history", "<h1>History</h1><p class=muted>Every change, made here or with <code>minicloud update|remove|enable|disable|reset</code> on the machine, refused ones included; newest first.</p>{table}")
+  layout(base, "history", "history", "<h1>History</h1><p class=lead>Every change, made here or with <code>minicloud update|remove|enable|disable|reset</code> on the machine, refused ones included; newest first.</p>{table}")
 }
