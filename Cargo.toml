@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/cove-host"]
+members = ["crates/minicloud"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/myuon/cove-tools"
+repository = "https://github.com/myuon/minicloud"
 
 # Cove, pinned to one commit. Every crate comes from the same revision; a
 # change the host needs from the compiler or the runtime goes to myuon/cove

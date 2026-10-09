@@ -172,7 +172,7 @@ fn refused(why: String) -> web.Response {
   }
   web.Response(
     status: 401,
-    headers: pageHeaders("text/plain; charset=utf-8").inserted("www-authenticate", "Basic realm=\"cove-tools admin\""),
+    headers: pageHeaders("text/plain; charset=utf-8").inserted("www-authenticate", "Basic realm=\"minicloud admin\""),
     body: "the admin pages need the admin secret: {why}\n",
   )
 }

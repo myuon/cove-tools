@@ -1,6 +1,6 @@
 # The algorithm playground
 
-A Cove app on cove-host (issue #4). Each page takes an input — written, or
+A Cove app on minicloud (issue #4). Each page takes an input — written, or
 one of the examples, some generated from a seed — runs an algorithm on it in
 the request's own isolate, and shows the answer, an independent check of
 it, what the run cost and, when a limit stopped it, which limit. The
@@ -26,7 +26,7 @@ keep answering.
 
 ```console
 $ cargo build --profile checked
-$ ./target/checked/cove-host serve --apps apps
+$ ./target/checked/minicloud serve --apps examples
 $ open http://127.0.0.1:8080/algo/matching?example=seminars
 $ curl -s 'http://127.0.0.1:8080/algo/matching?example=large&algorithm=both&part=result' \
     | grep -o 'Maximum: [0-9,]* pairs'
@@ -324,7 +324,7 @@ cannot be replayed.
 ## Tests
 
 ```console
-$ ./target/checked/cove-host test --apps apps algo     # the Cove test fns
+$ ./target/checked/minicloud test --apps examples algo     # the Cove test fns
 $ cargo test --profile checked --test algo              # the app on a host
 ```
 
@@ -349,7 +349,7 @@ $ cargo test --profile checked --test algo              # the app on a host
   four random 7-point problems it finds the optimum an exhaustive search
   finds; four corners of a square, the perimeter; the greedy tour is a tour.
 - `rng_test.cove`: Marsaglia's sequence, seeds, ranges.
-- `crates/cove-host/tests/algo.rs`: the known answers through the page,
+- `crates/minicloud/tests/algo.rs`: the known answers through the page,
   for all three algorithm choices, with the proof; the meter headers; CSP,
   the script, escaping of hostile vertex names, refusals; matching's and
   annealing's `heavy` answered `x-cove-stop: deadline` (under a deadline
@@ -530,7 +530,7 @@ For upstream (myuon/cove), besides the native-tier shapes above (now fixed):
   workaround everywhere in this app.
 - **An element type inferred only from later use can pass `check` and fail
   lowering** with an empty diagnostic: `var levels = Vector.of()` used by
-  `pop()` before any `push` checked, then `cove-host check` reported "does
+  `pop()` before any `push` checked, then `minicloud check` reported "does
   not lower:" and nothing else (the test runner said "the type of this
   expression was never settled `_`" without a location). Writing
   `Vector<Int>` on the binding fixes it.

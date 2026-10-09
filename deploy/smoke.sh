@@ -4,7 +4,8 @@
 #
 #   deploy/smoke.sh TARBALL
 #
-# It runs install.sh as on the server (the bundled admin app; it refuses an
+# It runs install.sh as on the server, over a current that points at a
+# release from before the rename (the bundled admin app; it refuses an
 # example asked for as a bundled app), deploys the examples the deployment
 # runs (webhooks, ledger, algo, hello) from the repository's examples/ as any
 # app is, checks a reinstall leaves an app that is not the release's alone,
@@ -41,8 +42,21 @@ if tar -tzf "$tarball" | grep -v '/apps/admin/\|/apps/$' | grep -q '/apps/.'; th
   fail "the release packages an app that is not admin"
 fi
 
+# The server's layout before the rename: current at a cove-host release.
+mkdir -p "$root/releases/0.4.0/deploy"
+printf '#!/bin/sh\necho "cove-host 0.4.0"\n' > "$root/releases/0.4.0/cove-host"
+chmod 755 "$root/releases/0.4.0/cove-host"
+cp "$here/cove-tools.service" "$root/releases/0.4.0/deploy/"
+ln -sfn releases/0.4.0 "$root/current"
+
 bash "$here/install.sh" "$tarball"
 [ -L "$root/current" ] || fail "no current link"
+[ "$(readlink "$root/current")" != releases/0.4.0 ] || fail "install.sh did not switch from the old cove-host release"
+[ -x "$root/current/minicloud" ] && [ ! -L "$root/current/minicloud" ] || fail "the release has no minicloud binary"
+[ "$(readlink "$root/current/cove-host")" = minicloud ] || fail "the release has no cove-host link to minicloud"
+"$root/current/cove-host" --version | grep -q '^minicloud ' || fail "current/cove-host does not run minicloud"
+grep -q '^ExecStart=/home/ioijoi/cove-tools/current/cove-host serve' "$root/current/deploy/cove-tools.service" \
+  || fail "the unit no longer runs current/cove-host, which the installed unit does"
 [ "$(stat -c %a "$root/env")" = 600 ] || fail "env is not mode 0600"
 [ -f "$root/apps/admin/app.toml" ] || fail "the admin app is not installed by default"
 for app in webhooks ledger algo hello; do
@@ -59,8 +73,8 @@ for app in $deployed_examples; do
     # shellcheck source=/dev/null
     . "$root/env"
     set +a
-    "$root/current/cove-host" deploy "$examples/$app" --into "$root/apps" --data "$root/data" > /dev/null
-  ) || fail "cove-host deploy --into refused the example $app"
+    "$root/current/minicloud" deploy "$examples/$app" --into "$root/apps" --data "$root/data" > /dev/null
+  ) || fail "minicloud deploy --into refused the example $app"
 done
 bash "$here/install.sh" --with-bundled-apps "" "$tarball" > /dev/null
 for app in $deployed_examples; do
@@ -163,30 +177,30 @@ header -H "$admin_host" http://127.0.0.1:8790/ | grep -qi '^www-authenticate' \
 # archive on stdin, checked, written and updated to.
 [ "$(status http://127.0.0.1:8790/hello/)" = 200 ] || fail "the deployed hello app is not served"
 deployed="$(tar -C "$examples/hello" -c . \
-  | "$root/current/cove-host" deploy - --name hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token")" \
-  || fail "cove-host deploy - failed"
+  | "$root/current/minicloud" deploy - --name hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token")" \
+  || fail "minicloud deploy - failed"
 case "$deployed" in
   *'"version": "v2-'*) ;;
-  *) fail "cove-host deploy - did not update the running host: $deployed" ;;
+  *) fail "minicloud deploy - did not update the running host: $deployed" ;;
 esac
 [ -d "$root/apps/.previous/hello" ] || fail "the deploy kept no previous version"
-"$root/current/cove-host" rollback hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token" > /dev/null \
-  || fail "cove-host rollback failed"
+"$root/current/minicloud" rollback hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token" > /dev/null \
+  || fail "minicloud rollback failed"
 [ "$(status http://127.0.0.1:8790/hello/)" = 200 ] || fail "hello is not served after the rollback"
 # A secret set on the running host: kept in the data directory, mode 0600,
 # listed by name and never by value, and deleted.
 admin_flags=(--admin 127.0.0.1:8791 --token-file "$root/data/admin.token")
-printf 'smoke-secret-value\n' | "$root/current/cove-host" secret set smoke "${admin_flags[@]}" > /dev/null \
-  || fail "cove-host secret set failed"
+printf 'smoke-secret-value\n' | "$root/current/minicloud" secret set smoke "${admin_flags[@]}" > /dev/null \
+  || fail "minicloud secret set failed"
 [ "$(stat -c %a "$root/data/_host/secrets")" = 600 ] || fail "the secret store is not mode 0600"
-listed="$("$root/current/cove-host" secret list "${admin_flags[@]}")" || fail "cove-host secret list failed"
+listed="$("$root/current/minicloud" secret list "${admin_flags[@]}")" || fail "minicloud secret list failed"
 case "$listed" in
-  *smoke-secret-value*) fail "cove-host secret list printed a value" ;;
+  *smoke-secret-value*) fail "minicloud secret list printed a value" ;;
   *'"name": "smoke"'*) ;;
-  *) fail "cove-host secret list does not list the secret: $listed" ;;
+  *) fail "minicloud secret list does not list the secret: $listed" ;;
 esac
-"$root/current/cove-host" secret delete smoke "${admin_flags[@]}" > /dev/null \
-  || fail "cove-host secret delete failed"
+"$root/current/minicloud" secret delete smoke "${admin_flags[@]}" > /dev/null \
+  || fail "minicloud secret delete failed"
 stop_host
 
 # 2. Access off (no team): the apps' tokens are the way in, as before.

@@ -1,6 +1,6 @@
 # The bench ledger
 
-A Cove app on cove-host (issue #3). Benchmark runs are **posted as JSON**,
+A Cove app on minicloud (issue #3). Benchmark runs are **posted as JSON**,
 checked, kept in the app's key-value store, and shown as pages: the run list
 and each run in full. Validation, unit conversion, the stored layout and the
 HTML are Cove; the host supplies the store, the log and the credential check.
@@ -22,7 +22,7 @@ put the host behind something that asks for a login if yours is not.
 
 ```console
 $ export LEDGER_TOKEN=change-me            # the post secret; the app is refused without it
-$ ./target/checked/cove-host serve --apps apps
+$ ./target/checked/minicloud serve --apps examples
 $ curl -s -H "authorization: Bearer $LEDGER_TOKEN" -H 'content-type: application/json' \
     --data @examples/ledger/samples/cove-593-capacity.json http://127.0.0.1:8080/ledger/api/runs
 {"ok":true,"results":12,"run":"cove-593-capacity","stored":true,"url":"/ledger/runs/cove-593-capacity"}
@@ -52,7 +52,7 @@ $ python3 examples/ledger/importer/ledger_import.py convert --cove ../cove --too
 | `cove-589-capacity`, `-sweep`, `-connections`, `-waiting` | cove `examples/edge/compare/results/*.jsonl`: #589, the edge server against the same service in Go (VM and Go) | `fcf64a9` |
 | `cove-593-capacity`, `cove-593-sweep` | `results/native/*.jsonl`: #593, the native tier re-measured against the VM and Go | `11ce12f` |
 | `cove-595-ab-<experiment>-<build>` (13), `cove-595-idle-cost` | `results/ab-*.jsonl`, `idle-cost.jsonl`: #595's A/B rounds of scratch builds, one run per build (`base` is `fcf64a9`; `sock`, `wake` and `kqueue2` are the branches later merged as #597, #598 and #599) | per build |
-| `cove-host-perf-2026-10-05`, `-noslice` | this repository's `bench/results/perf-*.txt` (`bench/perf.sh`, cove-host under the same kinds of load) | `00b397e` |
+| `cove-host-perf-2026-10-05`, `-noslice` | this repository's `bench/results/perf-*.txt` (`bench/perf.sh`, minicloud under the same kinds of load) | `00b397e` |
 
 The converter reads exactly those formats; it is not a general importer. A
 new kind of result gets a converter there, or its script writes the schema
@@ -310,13 +310,13 @@ with a `Content-Security-Policy` that allows no script.
 | `importer/ledger_import.py` | converts the existing results, and posts runs |
 | `samples/` | the converted runs |
 
-`cove-host test ledger` runs the Cove tests in `schema/`, `stats/`,
-`compare/`, `chart/`, `json/` and `text/`. The Rust tests in `crates/cove-host/tests/ledger.rs` drive the
+`minicloud test --apps examples ledger` runs the Cove tests in `schema/`, `stats/`,
+`compare/`, `chart/`, `json/` and `text/`. The Rust tests in `crates/minicloud/tests/ledger.rs` drive the
 app over HTTP.
 
 ## Issue #3's completion criteria
 
-| criterion | test (`crates/cove-host/tests/ledger.rs`) | README |
+| criterion | test (`crates/minicloud/tests/ledger.rs`) | README |
 | --- | --- | --- |
 | at least two real Cove measurement results registered | `real_runs_survive_a_restart` posts three converted real runs (`cove-589-capacity`, `cove-593-capacity`, `cove-host-perf-2026-10-05`); `samples/` holds 22 | [The sample data](#the-sample-data-the-existing-cove-results) |
 | after a restart, comparisons and graphs still work | `real_runs_survive_a_restart`: a new host over the same data lists the runs, compares #589 with #593 and draws `crunch c=16`'s trend | [Posting a run](#posting-a-run) |

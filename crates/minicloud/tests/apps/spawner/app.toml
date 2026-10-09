@@ -1,0 +1,2 @@
+# Spawns a task, which minicloud refuses at load.
+grant = []

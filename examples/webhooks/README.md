@@ -1,6 +1,6 @@
 # The webhook lab
 
-A Cove app on cove-host (issue #2). It hands out **receive URLs** that keep
+A Cove app on minicloud (issue #2). It hands out **receive URLs** that keep
 every request sent to them, and **admin pages** to read what was received.
 Handling and HTML are Cove. Persistence, the clock, randomness and who is
 asking are the host's typed modules.
@@ -20,7 +20,7 @@ asking are the host's typed modules.
 
 ```console
 $ export WEBHOOKS_ADMIN_TOKEN=change-me      # the admin secret; the app is refused without it
-$ ./target/checked/cove-host serve --apps apps
+$ ./target/checked/minicloud serve --apps examples
 $ curl -s -u admin:change-me -H 'accept: application/json' -d 'name=github' \
     http://127.0.0.1:8080/webhooks/admin/endpoints
 {"id":"fd9f7a5017d31e7e","name":"github","url":"http://127.0.0.1:8080/webhooks/in/fd9f7a5017d31e7e"}
@@ -228,7 +228,7 @@ accepted 202 0.302223s
 
 ## Issue #2's completion criteria
 
-| criterion | test (`crates/cove-host/tests/webhooks.rs`) | README |
+| criterion | test (`crates/minicloud/tests/webhooks.rs`) | README |
 | --- | --- | --- |
 | curl receive → restart → history still visible → resend to another endpoint | `receive_restart_and_resend_to_another_endpoint`; also `a_request_is_stored_whole_and_survives_a_restart` | [Running it](#running-it) |
 | a delayed endpoint waiting doesn't stop other apps answering | `a_delayed_endpoint_parks_while_other_apps_answer` (one worker; `hello` and the lab's pages answer during a 3 s delay; one park, no blocking call) | [Simulating responses](#simulating-responses) |
@@ -259,5 +259,5 @@ those places.
 | `json/` | a JSON parser and renderer, adapted from the Cove repository's `examples/cq/json` (with `\u` escapes and an indented renderer) |
 | `text/` | HTML escaping, form decoding (`+`, `%XX`, UTF-8), ISO 8601 times, byte sizes, truncation at a character boundary |
 
-`cove-host test webhooks` runs the Cove tests in `json/` and `text/`. The Rust
-tests in `crates/cove-host/tests/webhooks.rs` drive the app over HTTP.
+`minicloud test --apps examples webhooks` runs the Cove tests in `json/` and `text/`. The Rust
+tests in `crates/minicloud/tests/webhooks.rs` drive the app over HTTP.

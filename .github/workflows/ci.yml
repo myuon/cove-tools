@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # The webhook lab's admin secret, the ledger's post secret (examples/) and
-  # the admin UI's secret (apps/admin), which `cove-host check` resolves.
+  # the admin UI's secret (apps/admin), which `minicloud check` resolves.
   WEBHOOKS_ADMIN_TOKEN: ci
   LEDGER_TOKEN: ci
   ADMIN_UI_TOKEN: ci
@@ -42,10 +42,10 @@ jobs:
           COVE_HOST_TEST_BACKEND: vm
       - name: check and test the bundled app and the examples
         run: |
-          ./target/checked/cove-host check --apps apps
-          ./target/checked/cove-host test --apps apps
-          ./target/checked/cove-host check --apps examples
-          ./target/checked/cove-host test --apps examples
+          ./target/checked/minicloud check --apps apps
+          ./target/checked/minicloud test --apps apps
+          ./target/checked/minicloud check --apps examples
+          ./target/checked/minicloud test --apps examples
       # cove#604's reproduction: 160 sliced native runs that copy arrays
       # into vectors, every answer 60000. Wrong answers at Cove 9272282.
       - name: native copy-under-slicing regression check
@@ -57,5 +57,5 @@ jobs:
       - name: package, install and run as deployed
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          tarball="$(deploy/package.sh "$version" target/checked/cove-host "$RUNNER_TEMP/dist")"
+          tarball="$(deploy/package.sh "$version" target/checked/minicloud "$RUNNER_TEMP/dist")"
           deploy/smoke.sh "$tarball"

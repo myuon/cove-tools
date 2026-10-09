@@ -54,7 +54,7 @@ fn css() -> String {
 
 /// The page around `content`.
 fn layout(base: String, title: String, content: String) -> String {
-  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · cove-tools admin</title><style>{css()}</style></head><body><header><a class=home href=\"{h(base)}/\">cove-tools admin</a><a href=\"{h(base)}/\">apps</a><a href=\"{h(base)}/secrets\">secrets</a><a href=\"{h(base)}/history\">history</a></header><main>{content}</main></body></html>"
+  "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{h(title)} · minicloud admin</title><style>{css()}</style></head><body><header><a class=home href=\"{h(base)}/\">minicloud admin</a><a href=\"{h(base)}/\">apps</a><a href=\"{h(base)}/secrets\">secrets</a><a href=\"{h(base)}/history\">history</a></header><main>{content}</main></body></html>"
 }
 
 fn badge(state: String) -> String {
@@ -169,7 +169,7 @@ fn limitKey(field: String) -> String {
 
 fn enableForm(at: String, app: host.App) -> String {
   if app.isAdmin {
-    return "<h2>Routing</h2><p class=muted>The admin app cannot disable itself. On the machine, <code>cove-host disable admin</code> can.</p>"
+    return "<h2>Routing</h2><p class=muted>The admin app cannot disable itself. On the machine, <code>minicloud disable admin</code> can.</p>"
   }
   if app.state == "disabled" {
     return "<h2>Routing</h2><form method=post action=\"{h(at)}/enable\"><p>Disabled: requests are answered 503, and its data is kept. <button>Enable</button></p></form>"
@@ -329,5 +329,5 @@ fn historyPage(base: String, changes: Array<host.Change>) -> String {
   } else {
     "<table><tr><th>at (UTC)</th><th>who</th><th>app</th><th>action</th><th>asked for</th><th>outcome</th></tr>{"".join(rows.freeze())}</table>"
   }
-  layout(base, "history", "<h1>History</h1><p class=muted>Every change, made here or with <code>cove-host update|remove|enable|disable|reset</code> on the machine, refused ones included; newest first.</p>{table}")
+  layout(base, "history", "<h1>History</h1><p class=muted>Every change, made here or with <code>minicloud update|remove|enable|disable|reset</code> on the machine, refused ones included; newest first.</p>{table}")
 }

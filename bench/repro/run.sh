@@ -20,7 +20,7 @@ SLICE=${2:-2}
 BIN=${BIN:-./target/checked}
 ADDR=127.0.0.1:18197
 DATA=$(mktemp -d)
-"$BIN/cove-host" serve --apps bench/repro --data "$DATA" --addr "$ADDR" --workers 2 \
+"$BIN/minicloud" serve --apps bench/repro --data "$DATA" --addr "$ADDR" --workers 2 \
   --backend "$BACKEND" --slice "$SLICE" --no-admin --quiet 2> "$DATA/host.err" &
 HOST=$!
 trap 'kill $HOST 2>/dev/null; rm -rf "$DATA"' EXIT

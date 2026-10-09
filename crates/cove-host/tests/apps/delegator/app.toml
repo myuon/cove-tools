@@ -1,2 +1,0 @@
-# Spawns a task in a module of its own, which cove-host refuses at load.
-grant = []
