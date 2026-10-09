@@ -12,9 +12,22 @@ use std::time::{Duration, Instant};
 use cove_host::{Host, ServeOptions};
 use serde_json::Value as Json;
 
-/// The sample apps, at the repository's root.
-pub fn samples() -> PathBuf {
+/// The bundled apps, at the repository's root: only `admin`.
+pub fn bundled() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps")
+}
+
+/// The example apps, at the repository's root.
+pub fn examples() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples")
+}
+
+/// A shipped app's directory: the bundled `admin`, or an example.
+pub fn sample_dir(name: &str) -> PathBuf {
+    match name {
+        "admin" => bundled().join(name),
+        _ => examples().join(name),
+    }
 }
 
 /// The apps only the tests use.
@@ -55,7 +68,7 @@ pub struct AppSpec<'a> {
 pub fn sample(name: &str) -> AppSpec<'_> {
     AppSpec {
         name,
-        from: samples().join(name),
+        from: sample_dir(name),
         config: None,
     }
 }
@@ -64,7 +77,7 @@ pub fn sample(name: &str) -> AppSpec<'_> {
 pub fn sample_with<'a>(name: &'a str, config: &'a str) -> AppSpec<'a> {
     AppSpec {
         name,
-        from: samples().join(name),
+        from: sample_dir(name),
         config: Some(config),
     }
 }

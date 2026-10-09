@@ -32,7 +32,7 @@ if curl -s -o /dev/null "http://$ADDR/"; then
   exit 1
 fi
 APPS=$(mktemp -d)
-cp -R apps/hello apps/algo "$APPS"/
+cp -R examples/hello examples/algo "$APPS"/
 "$BIN/cove-host" serve --apps "$APPS" --data "$DATA" --addr "$ADDR" --workers 4 \
   --backend "$BACKEND" --no-admin --quiet 2> "$DATA/host.err" &
 HOST=$!

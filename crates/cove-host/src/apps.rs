@@ -871,7 +871,7 @@ mod tests {
     use super::*;
 
     fn hello() -> Compiled {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/hello");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello");
         compile(&dir, "hello", &HostModules::standard()).expect("hello compiles")
     }
 
@@ -900,7 +900,7 @@ mod tests {
     /// relative to the apps directory, beside the standard library.
     #[test]
     fn an_app_loads_with_its_modules_and_the_standard_library() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/ledger");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ledger");
         let (sources, package) = load_package(&dir, "ledger").unwrap();
         for module in ["ledger", "json", "stats"] {
             assert!(package.modules.contains_key(module), "{module}");

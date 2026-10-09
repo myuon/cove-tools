@@ -1,30 +1,66 @@
 # cove-tools
 
-Small web apps written in [Cove](https://github.com/myuon/cove), and the host
-that runs them on one machine.
+A small platform for web apps written in [Cove](https://github.com/myuon/cove)
+on one machine: the host that runs them, its admin app, and its deployment.
+Apps are deployed onto it from wherever they live.
 
-- **`crates/cove-host`** — a self-hosted function host: loads `apps/<name>/`,
-  checks, prepares and compiles each app once, and runs every request in its
-  own Cove isolate on a shared worker pool (issue #1).
-- **`apps/`** — the sample apps: `hello` (pure), `crunch` (CPU-heavy),
-  `slow` (waits on a timer that parks the run), `notes` (the persistent
-  key-value store) and `proxy` (allowlisted outbound HTTP); and the real
-  apps: [**`webhooks`**](apps/webhooks/README.md), the webhook lab (#2),
-  [**`ledger`**](apps/ledger/README.md), the bench ledger (#3), and
-  [**`algo`**](apps/algo/README.md), the algorithm playground (#4); and
-  [**`admin`**](apps/admin/README.md), the admin UI (#17), the one app that
-  may change the others' configuration.
+- **`crates/cove-host`** — the host: loads `<apps>/<name>/`, checks, prepares
+  and compiles each app once, and runs every request in its own Cove isolate
+  on a shared worker pool (issue #1); it updates, deploys and rolls back apps
+  on the running host, keeps their secrets, routes by hostname and verifies
+  Cloudflare Access.
+- **`apps/admin`** — [the admin UI](apps/admin/README.md) (#17), the one app
+  the platform bundles and the one app that may change the others'
+  configuration.
+- **`deploy/`** — the release's install script, systemd unit and backups that
+  run the host on the owner's server ([Deploying](#deploying)).
+- **`examples/`** — apps deployed on it like any other
+  ([Examples](#examples)): not part of a release, checked and tested by CI,
+  and the workloads of the host's own tests.
 
 The host is Rust; the apps are Cove. Cove is a git dependency pinned to one
 commit (`rev` in the workspace `Cargo.toml`), and a change the compiler or
 the runtime needs goes to [myuon/cove](https://github.com/myuon/cove) first.
 
+## Examples
+
+[`examples/`](examples) holds apps written for the host. They are not
+bundled into a release: each is deployed with `cove-host deploy` as an app
+from any other repository is ([myuon/ai-daily](https://github.com/myuon/ai-daily)
+is one). They live in this repository rather than in Cove's `examples/`
+because they are checked against the host's modules — `web`, `kv`, `fetch`,
+`host` — which only this repository has.
+
+- the sample apps: `hello` (pure), `crunch` (CPU-heavy), `slow` (waits on a
+  timer that parks the run), `notes` (the persistent key-value store) and
+  `proxy` (allowlisted outbound HTTP);
+- the real apps: [**`webhooks`**](examples/webhooks/README.md), the webhook
+  lab (#2), [**`ledger`**](examples/ledger/README.md), the bench ledger (#3),
+  and [**`algo`**](examples/algo/README.md), the algorithm playground (#4).
+
+**Deploying an example** onto the server is [deploying an
+app](#deploying-an-app) from a checkout of this repository — over ssh, so
+the admin token never leaves the server:
+
+```console
+$ tar -C examples/algo -c . | ssh whisky \
+    '~/cove-tools/current/cove-host deploy - --name algo --admin 127.0.0.1:8791 --token-file ~/cove-tools/data/admin.token'
+```
+
+An example that takes a secret needs it on the host first: the webhook lab's
+`WEBHOOKS_ADMIN_TOKEN` and the ledger's `LEDGER_TOKEN` are in
+`~/cove-tools/env` (`install.sh` writes them from
+[`deploy/env.example`](deploy/env.example)), and the webhook lab's
+`[access]` reads the Cloudflare Access settings from there too. A deploy
+that cannot resolve one is refused and says which. `cove-host rollback
+<app>` puts the previous version back.
+
 ## Building and running
 
 ```console
 $ cargo build --profile checked
-$ ./target/checked/cove-host serve --apps apps
-cove-host: loading apps from apps
+$ ./target/checked/cove-host serve --apps examples
+cove-host: loading apps from examples
   crunch     v1-397ddca0  requires [-]  granted [-]  ok: 227 fn on native, checked in 19.3 ms, prepared in 1.9 ms
   hello      v1-05b655c0  requires [-]  granted [-]  ok: 234 fn on native, checked in 11.6 ms, prepared in 2.4 ms
   notes      v1-cf6980a0  requires [kv, log]  granted [kv, log]  ok: 226 fn on native, checked in 3.7 ms, prepared in 2.5 ms
@@ -54,7 +90,7 @@ a reverse proxy), and `--shutdown-grace SECONDS` (default 10). Those last
 four are for [deploying](#deploying). `cove-host --version` names the Cove
 commit the binary was built against.
 
-### The sample apps
+### Trying the examples
 
 ```console
 $ curl -i 'http://127.0.0.1:8080/hello/?name=Cove'
@@ -199,7 +235,7 @@ rebinding its own name to 127.0.0.1. Reach them over SSH:
 any app would be refused:
 
 ```console
-$ ./target/checked/cove-host check --apps apps
+$ ./target/checked/cove-host check --apps examples
 crunch     requires [-]  granted [-]  ok
 hello      requires [-]  granted [-]  ok
 slow       requires [log, timer]  granted [log, timer]  ok
@@ -225,7 +261,7 @@ and the host's modules. A lowering that refuses an entry, in `check`, at load
 or for a test, is printed with each refusal's location:
 
 ```console
-$ ./target/checked/cove-host test --apps apps
+$ ./target/checked/cove-host test --apps examples
 ok    crunch     crunch.aSizeOutOfRangeIsRefused
 ok    crunch     crunch.countsThePrimesUpToN
 ok    hello      hello.answersABodyOfTheSizeAsked
@@ -257,7 +293,7 @@ ran 1 test(s), 1 passed
 ## Updating an app
 
 ```console
-$ $EDITOR apps/hello/hello.cove                 # Hello → Hi
+$ $EDITOR examples/hello/hello.cove                 # Hello → Hi
 $ ./target/checked/cove-host update hello
 {
   "app": "hello",
@@ -267,7 +303,7 @@ $ ./target/checked/cove-host update hello
 $ curl -si http://127.0.0.1:8080/hello/ | grep -i -e x-cove -e hi
 x-cove-app-version: v2-11744df1
 Hi, world! (GET /)
-$ echo 'fn broken( {' >> apps/hello/hello.cove
+$ echo 'fn broken( {' >> examples/hello/hello.cove
 $ ./target/checked/cove-host update hello; echo "exit $?"
 cove-host: 422 Unprocessable Entity
 update of `hello` refused; still serving v2-11744df1:
@@ -418,7 +454,7 @@ works from the laptop too.
 `cove-host deploy <dir> --into <apps>` does the same with no running host,
 checking as `cove-host check` does with the current environment (and, with
 `--data <data>`, that data directory's secret store); the host loads it at
-its next start. `deploy/install.sh` installs the bundled apps this way, and
+its next start. `deploy/install.sh` installs the bundled admin app this way, and
 checks every installed app with `--data` before it switches.
 
 ## Administering apps at run time
@@ -613,15 +649,15 @@ Access in front:
 | --- | --- |
 | [`deploy/cove-tools.service`](deploy/cove-tools.service) | the system unit: `User=ioijoi`, public listener `127.0.0.1:8790`, admin `127.0.0.1:8791`, two workers, CPU and memory caps, hardening (no `MemoryDenyWriteExecute`: the native tier maps machine code; writable: `data/`, and `apps/` for `cove-host deploy`) |
 | [`deploy/env.example`](deploy/env.example) | the apps' secrets (`WEBHOOKS_ADMIN_TOKEN`, `LEDGER_TOKEN`, `ADMIN_UI_TOKEN`) and the Cloudflare Access settings (`ACCESS_TEAM_DOMAIN`, `COVTOOLS_ACCESS_AUD`, `COVTOOLS_ADMIN_ACCESS_AUD`, `ACCESS_ALLOWED_EMAILS`), as `~/cove-tools/env`; `install.sh` appends a key a release adds — a secret fresh, a setting as written there — and leaves the others |
-| [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks every app installed in `~/cove-tools/apps` with the new binary (and refuses to switch if one would be refused), deploys the bundled apps it is asked for (`--with-bundled-apps`), points `~/cove-tools/current` at it, and prints the one `sudo` command. It never removes or replaces an app it was not asked to |
+| [`deploy/install.sh`](deploy/install.sh) | as the service's user, no sudo: downloads a release, verifies its sha256, unpacks it into `~/cove-tools/releases/<version>/`, checks every app installed in `~/cove-tools/apps` with the new binary (and refuses to switch if one would be refused), deploys the bundled admin app (`--with-bundled-apps "admin"`, the default; `""` for none), points `~/cove-tools/current` at it, and prints the one `sudo` command. It never removes or replaces any other app |
 | [`deploy/backup.sh`](deploy/backup.sh) | SQLite online backups of every app's `kv.sqlite3`, kept 14 days; a user crontab line is in the file |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | the tunnel's public hostname and the Access applications, with the paths left open to outside callers |
 
 A release is a tag: pushing `v<version>` (the workspace's version) runs
 [`release.yml`](.github/workflows/release.yml), which builds `cove-host` on
 Ubuntu 24.04 with the native tier, and publishes
-`cove-host-<version>-x86_64-linux.tar.gz` (the binary, `apps/`, `deploy/`,
-this README), its `.sha256`, and `install.sh`. CI installs the same tarball
+`cove-host-<version>-x86_64-linux.tar.gz` (the binary, `apps/admin`,
+`deploy/`, this README — not `examples/`), its `.sha256`, and `install.sh`. CI installs the same tarball
 into a scratch home and runs the unit's own command line against it
 (`deploy/smoke.sh`).
 
@@ -629,7 +665,7 @@ On the server, as the service's user:
 
 ```console
 $ curl -fsSLO https://github.com/myuon/cove-tools/releases/download/v0.4.0/install.sh
-$ bash install.sh --with-bundled-apps "webhooks ledger algo admin" v0.4.0
+$ bash install.sh --with-bundled-apps admin v0.4.0
 ...
 first time: install the unit and start the service (needs sudo, once):
 
@@ -647,12 +683,14 @@ new binary against `~/cove-tools/env`, and if one would be refused it stops
 and switches nothing (`cove-host check --deployed`: a key an installed
 `app.toml` may no longer say, such as `limits.fuel`, is a warning there, as it
 is when the host starts — see
-[Migrating from fuel](#migrating-from-fuel-cove-adr-0091)). This repository's apps — the webhook lab, the ledger,
-the algorithm playground and the admin UI — are deployed only when asked:
-`--with-bundled-apps "webhooks ledger algo admin"` deploys those of the
-release, each checked and its previous version kept, exactly as `cove-host
-deploy` would; a first install wants it, and an upgrade that should also
-update them passes it again. The sample apps are never installed. The
+[Migrating from fuel](#migrating-from-fuel-cove-adr-0091)). The one app
+the release bundles, the admin UI, is deployed by every install
+(`--with-bundled-apps admin`, the default; `--with-bundled-apps ""` leaves
+the installed one alone), checked and its previous version kept, exactly as
+`cove-host deploy` would. The examples — the webhook lab, the ledger, the
+algorithm playground and the sample apps — are not in the release; asking
+for one as a bundled app is refused with a pointer to `examples/`, and they
+are deployed from a checkout like any app ([Examples](#examples)). The
 service stops on SIGTERM by answering new requests 503 and waiting up to
 `--shutdown-grace` for those in flight.
 
@@ -691,7 +729,8 @@ What the deployment relies on from the host:
 
 ## Writing an app
 
-An app is a directory under `apps/` holding an `app.toml`. The `.cove` files
+An app is a directory under the host's apps directory (`--apps`, default
+`apps`) holding an `app.toml`. The `.cove` files
 directly in it are the module named after the directory; each subdirectory
 holding `.cove` files is a module of that name, which the app's files may
 `use`. Nothing outside the directory is visible: every app is a package of
@@ -1041,7 +1080,7 @@ none, so on the native tier it undercounts — `x-cove-run-worker-us` does not),
 says which**: `x-cove-stop` is the error kind's name — `deadline`,
 `host_calls`, `call_depth`, `heap`, `queue_timeout`, `response_too_large`,
 `cancelled`, `runtime`, … — so a page that runs a request with `fetch` can
-say why without reading the diagnostic (`apps/algo` does). An app cannot
+say why without reading the diagnostic (`examples/algo` does). An app cannot
 read its own meter during a run, which is why this is a header and not a
 host call.
 
@@ -1127,7 +1166,7 @@ never by trusting it:
   left on the encoded tier, with the instruction and the source line: a
   function that makes a host call, or writes a lambda, is one — and an
   algorithm called from such a function, by compiled code, cannot yield at
-  all. The algorithm playground met exactly that ([its README](apps/algo/README.md#yields-on-the-native-tier)).
+  all. The algorithm playground met exactly that ([its README](examples/algo/README.md#yields-on-the-native-tier)).
 - **A host call that cannot park blocks, and is counted.** In the same
   places a call cannot park; `timer.sleep` then sleeps on the worker
   (`blocking_host_calls`), bounded by its 60 s maximum. None of the sample
@@ -1207,7 +1246,7 @@ without one.
 Beside a real CPU-heavy app — the algorithm playground's matching runs
 holding all four workers — `hello`'s p99 is 4.7 ms on the native tier and
 4.7 ms on the VM, against 2.0 ms alone (`bench/algo.sh`,
-[`apps/algo/README.md`](apps/algo/README.md#responsiveness)).
+[`examples/algo/README.md`](examples/algo/README.md#responsiveness)).
 
 ```console
 $ cargo build --profile checked
@@ -1301,8 +1340,11 @@ so, and what it asserts is counted.
   the env lacks is refused with its reason and changes no file; rollback
   restores the kept version and a second undoes it; both need the token;
   `cove-host deploy` from a directory and from stdin, and `--into`;
-  `deploy/smoke.sh` (CI, Linux) checks `install.sh` leaves an app that is
-  not the release's alone and refuses to switch while one does not check;
+  `deploy/smoke.sh` (CI, Linux) checks the release packages `admin` alone,
+  `install.sh` deploys it by default and refuses an example asked for as a
+  bundled app, pointing at `examples/`, leaves an app that is not the
+  release's alone (the examples, deployed from `examples/`) and refuses to
+  switch while one does not check;
 - through the `host` module: the list shows every app's state, grant and
   limits; a disabled app answers 503 while one of its requests in flight
   finishes, and enabled again has its store; taking a needed capability

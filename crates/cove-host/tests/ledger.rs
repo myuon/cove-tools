@@ -1,4 +1,4 @@
-//! The bench ledger (`apps/ledger`, issue #3) on a host started in-process:
+//! The bench ledger (`examples/ledger`, issue #3) on a host started in-process:
 //! posting, validation, units, duplicates, persistence and escaping.
 
 mod common;
@@ -12,7 +12,7 @@ const SECRET: &str = "test-ledger-secret";
 
 /// The sample's `app.toml` with the post secret given literally.
 fn config() -> String {
-    let shipped = std::fs::read_to_string(samples().join("ledger/app.toml")).unwrap();
+    let shipped = std::fs::read_to_string(examples().join("ledger/app.toml")).unwrap();
     let config = shipped.replace(
         "post = { env = \"LEDGER_TOKEN\" }",
         &format!("post = {{ value = \"{SECRET}\" }}"),
@@ -28,14 +28,14 @@ fn ledger() -> Apps {
     let config = config();
     apps(&[AppSpec {
         name: "ledger",
-        from: samples().join("ledger"),
+        from: examples().join("ledger"),
         config: Some(Box::leak(config.into_boxed_str())),
     }])
 }
 
-/// One of the converted real runs in `apps/ledger/samples`.
+/// One of the converted real runs in `examples/ledger/samples`.
 fn sample_run(id: &str) -> String {
-    std::fs::read_to_string(samples().join(format!("ledger/samples/{id}.json"))).unwrap()
+    std::fs::read_to_string(examples().join(format!("ledger/samples/{id}.json"))).unwrap()
 }
 
 fn request(addr: SocketAddr, method: &str, path: &str, headers: &[&str], body: &str) -> Answer {

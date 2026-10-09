@@ -1,4 +1,4 @@
-//! The webhook lab (`apps/webhooks`, issue #2) on a host started in-process:
+//! The webhook lab (`examples/webhooks`, issue #2) on a host started in-process:
 //! receiving, storing, showing, limits, access control and escaping.
 
 mod common;
@@ -13,7 +13,7 @@ const SECRET: &str = "test-admin-secret";
 /// The sample's `app.toml` with the admin secret given literally, and
 /// `extra` appended.
 fn config(extra: &str) -> String {
-    let shipped = std::fs::read_to_string(samples().join("webhooks/app.toml")).unwrap();
+    let shipped = std::fs::read_to_string(examples().join("webhooks/app.toml")).unwrap();
     let mut config = shipped.replace(
         "admin = { env = \"WEBHOOKS_ADMIN_TOKEN\" }",
         &format!("admin = {{ value = \"{SECRET}\" }}"),
@@ -37,7 +37,7 @@ fn lab(extra: &str) -> Apps {
     apps(&[
         AppSpec {
             name: "webhooks",
-            from: samples().join("webhooks"),
+            from: examples().join("webhooks"),
             config: Some(Box::leak(config.into_boxed_str())),
         },
         sample("hello"),

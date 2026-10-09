@@ -285,7 +285,7 @@ fn an_app_flooding_its_queue_does_not_starve_another() {
         sample("hello"),
         AppSpec {
             name: "flood",
-            from: samples().join("crunch"),
+            from: examples().join("crunch"),
             config: Some("[limits]\nmax_in_flight = 1\nmax_queued = 64\n"),
         },
     ]);
@@ -384,17 +384,25 @@ fn on_x86_64_unix_the_apps_run_on_the_native_tier_and_still_yield() {
 }
 
 #[test]
-fn the_sample_apps_check_and_their_tests_pass() {
+fn the_bundled_and_example_apps_check_and_their_tests_pass() {
     // The webhook lab's admin secret, the ledger's post secret and the
     // admin UI's secret come from the environment.
     std::env::set_var("WEBHOOKS_ADMIN_TOKEN", "test");
     std::env::set_var("LEDGER_TOKEN", "test");
     std::env::set_var("ADMIN_UI_TOKEN", "test");
     let modules = cove_host::HostModules::standard();
-    let checked = cove_host::toolchain::check(&samples(), &[], &modules).unwrap();
-    assert!(checked.ok, "{}{}", checked.out, checked.err);
-    let tested = cove_host::toolchain::test(&samples(), &[], None, &modules).unwrap();
-    assert!(tested.ok, "{}{}", tested.out, tested.err);
+    for dir in [bundled(), examples()] {
+        let checked = cove_host::toolchain::check(&dir, &[], &modules).unwrap();
+        assert!(
+            checked.ok,
+            "{}: {}{}",
+            dir.display(),
+            checked.out,
+            checked.err
+        );
+        let tested = cove_host::toolchain::test(&dir, &[], None, &modules).unwrap();
+        assert!(tested.ok, "{}: {}{}", dir.display(), tested.out, tested.err);
+    }
 }
 
 /// What a park costs end to end, printed, against which `kv`'s

@@ -268,7 +268,7 @@ fn an_update_can_add_an_app_and_the_admin_can_remove_one() {
     let dir = apps.root.join("hello");
     std::fs::create_dir_all(&dir).unwrap();
     for file in ["hello.cove", "app.toml"] {
-        std::fs::copy(samples().join("hello").join(file), dir.join(file)).unwrap();
+        std::fs::copy(examples().join("hello").join(file), dir.join(file)).unwrap();
     }
     let added = update(&host, "hello");
     assert_eq!(added.status, 200, "{}", added.body);

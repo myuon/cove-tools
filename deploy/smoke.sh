@@ -4,9 +4,11 @@
 #
 #   deploy/smoke.sh TARBALL
 #
-# It runs install.sh as on the server (with the bundled apps; then checks a
-# reinstall leaves an app that is not the release's alone, and refuses to
-# switch while an installed app does not check), takes ExecStart from
+# It runs install.sh as on the server (the bundled admin app; it refuses an
+# example asked for as a bundled app), deploys the examples the deployment
+# runs (webhooks, ledger, algo, hello) from the repository's examples/ as any
+# app is, checks a reinstall leaves an app that is not the release's alone,
+# and refuses to switch while an installed app does not check, takes ExecStart from
 # cove-tools.service with /home/ioijoi moved to the scratch home, starts
 # it, checks the public and admin listeners answer as deployed (apps on
 # 8790, /_host/ only on 8791, Cloudflare Access on), deploys an app onto it
@@ -17,6 +19,7 @@ set -euo pipefail
 
 tarball="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 here="$(cd "$(dirname "$0")" && pwd)"
+examples="$(cd "$here/../examples" && pwd)"
 scratch="$(mktemp -d)"
 trap 'kill "$pid" 2>/dev/null || true; rm -rf "$scratch"' EXIT
 pid=""
@@ -26,26 +29,45 @@ root="$HOME/cove-tools"
 
 fail() { echo "smoke.sh: $*" >&2; exit 1; }
 
-bundled="webhooks ledger algo admin"
-bash "$here/install.sh" --with-bundled-apps "$bundled" "$tarball"
+# The release bundles the admin app alone; an example is not one of its apps.
+if bash "$here/install.sh" --with-bundled-apps "admin webhooks" "$tarball" > "$scratch/example.log" 2>&1; then
+  fail "install.sh took an example app as a bundled one"
+fi
+grep -q 'examples/webhooks' "$scratch/example.log" \
+  || fail "install.sh did not point at examples/ for a no-longer-bundled app: $(cat "$scratch/example.log")"
+[ ! -e "$root/current" ] || fail "install.sh switched although it refused a bundled app"
+[ ! -e "$root/env" ] || fail "install.sh wrote the env although it refused a bundled app"
+if tar -tzf "$tarball" | grep -v '/apps/admin/\|/apps/$' | grep -q '/apps/.'; then
+  fail "the release packages an app that is not admin"
+fi
+
+bash "$here/install.sh" "$tarball"
 [ -L "$root/current" ] || fail "no current link"
 [ "$(stat -c %a "$root/env")" = 600 ] || fail "env is not mode 0600"
-for app in $bundled; do
-  [ -f "$root/apps/$app/app.toml" ] || fail "app $app not installed"
+[ -f "$root/apps/admin/app.toml" ] || fail "the admin app is not installed by default"
+for app in webhooks ledger algo hello; do
+  [ ! -e "$root/apps/$app" ] || fail "the example $app was installed unasked"
 done
-[ ! -e "$root/apps/hello" ] || fail "a sample app was installed unasked"
 
-# An app that is not the release's, deployed into the apps directory: a
-# release must not remove it, and must refuse to switch while it would not
-# load.
-"$root/current/cove-host" deploy "$root/current/apps/hello" --into "$root/apps" > /dev/null \
-  || fail "cove-host deploy --into refused the hello app"
-bash "$here/install.sh" "$tarball" > /dev/null
-[ -f "$root/apps/hello/hello.cove" ] || fail "a reinstall removed an app that is not the release's"
-for app in $bundled; do
-  [ -f "$root/apps/$app/app.toml" ] || fail "a reinstall without --with-bundled-apps removed $app"
-  [ ! -e "$root/apps/.previous/$app" ] || fail "a reinstall without --with-bundled-apps redeployed $app"
+# The examples the deployment runs, deployed into the apps directory as any
+# app is (with the env, for their secrets): a release must not remove them,
+# and must refuse to switch while one would not load.
+deployed_examples="webhooks ledger algo hello"
+for app in $deployed_examples; do
+  (
+    set -a
+    # shellcheck source=/dev/null
+    . "$root/env"
+    set +a
+    "$root/current/cove-host" deploy "$examples/$app" --into "$root/apps" --data "$root/data" > /dev/null
+  ) || fail "cove-host deploy --into refused the example $app"
 done
+bash "$here/install.sh" --with-bundled-apps "" "$tarball" > /dev/null
+for app in $deployed_examples; do
+  [ -f "$root/apps/$app/app.toml" ] || fail "a reinstall removed $app, which is not the release's"
+  [ ! -e "$root/apps/.previous/$app" ] || fail "a reinstall redeployed $app, which is not the release's"
+done
+[ ! -e "$root/apps/.previous/admin" ] || fail "a reinstall with --with-bundled-apps \"\" redeployed admin"
 echo 'fn broken( {' >> "$root/apps/hello/hello.cove"
 ln -sfn releases/before "$root/current"
 if bash "$here/install.sh" "$tarball" > "$scratch/refused.log" 2>&1; then
@@ -55,10 +77,11 @@ grep -q 'nothing switched' "$scratch/refused.log" || fail "install.sh did not sa
 [ "$(readlink "$root/current")" = releases/before ] || fail "install.sh switched current although an app does not check"
 grep -q 'fn broken' "$root/apps/hello/hello.cove" || fail "install.sh touched the app it refused"
 sed -i '/^fn broken( {$/d' "$root/apps/hello/hello.cove"
-# Redeploying the bundled apps keeps the versions they replace.
-bash "$here/install.sh" --with-bundled-apps "$bundled" "$tarball" > /dev/null
-[ -f "$root/apps/.previous/webhooks/app.toml" ] || fail "a redeploy did not keep the webhook lab's previous version"
-[ -f "$root/apps/hello/hello.cove" ] || fail "a redeploy of the bundled apps removed hello"
+# Redeploying the bundled app (the default) keeps the version it replaces.
+bash "$here/install.sh" "$tarball" > /dev/null
+[ -f "$root/apps/.previous/admin/app.toml" ] || fail "a redeploy did not keep the admin app's previous version"
+[ -f "$root/apps/hello/hello.cove" ] || fail "a redeploy of the bundled app removed hello"
+[ ! -e "$root/apps/.previous/webhooks" ] || fail "a redeploy of the bundled app redeployed webhooks"
 # Installing the same release again is allowed (a reinstall). A secret the
 # env lacks is appended fresh, and the others are left as they were.
 webhooks_before="$(sed -n 's/^WEBHOOKS_ADMIN_TOKEN=//p' "$root/env")"
@@ -139,7 +162,7 @@ header -H "$admin_host" http://127.0.0.1:8790/ | grep -qi '^www-authenticate' \
 # Deploying onto the running host, as from another repository over ssh: an
 # archive on stdin, checked, written and updated to.
 [ "$(status http://127.0.0.1:8790/hello/)" = 200 ] || fail "the deployed hello app is not served"
-deployed="$(tar -C "$root/current/apps/hello" -c . \
+deployed="$(tar -C "$examples/hello" -c . \
   | "$root/current/cove-host" deploy - --name hello --admin 127.0.0.1:8791 --token-file "$root/data/admin.token")" \
   || fail "cove-host deploy - failed"
 case "$deployed" in

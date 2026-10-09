@@ -3,7 +3,7 @@
 # ~/cove-tools, as the user that runs it. No sudo: the one root step (the
 # systemd unit) is printed, not run.
 #
-#   install.sh [--with-bundled-apps "webhooks ledger algo admin"] [--root DIR] VERSION|TARBALL
+#   install.sh [--with-bundled-apps "admin"] [--root DIR] VERSION|TARBALL
 #
 #   VERSION   a release tag (v0.1.0 or 0.1.0): downloaded from GitHub
 #   TARBALL   a local cove-host-<version>-x86_64-linux.tar.gz, with its
@@ -11,7 +11,11 @@
 #
 # The apps are not the release's: they are whatever was deployed into
 # <root>/apps (`cove-host deploy`, from any repository; README "Deploying an
-# app"). Installing a release never removes or replaces one of them.
+# app"). Installing a release never removes or replaces one of them, but for
+# the one app the release bundles, the admin app, which it deploys by default
+# (`--with-bundled-apps ""` deploys none). The example apps (webhooks, ledger,
+# algo, ...) are not in the release: deploy them from the repository's
+# examples/ with `cove-host deploy` (README "Examples").
 #
 # What it does:
 #   1. downloads (or takes) the tarball and verifies its sha256;
@@ -29,15 +33,15 @@
 #      warning, as it is when the host starts, not a refusal);
 #   5. deploys the bundled apps --with-bundled-apps names, from the release,
 #      with `cove-host deploy --into <root>/apps` (each checked again; the
-#      version it replaces is kept in <root>/apps/.previous/<app>); none by
-#      default. A first install wants them: pass the flag;
+#      version it replaces is kept in <root>/apps/.previous/<app>); `admin`,
+#      the only one, by default;
 #   6. points <root>/current at the release; <root>/data is never touched;
 #   7. keeps the three newest releases, and prints what to run with sudo.
 set -euo pipefail
 
 REPO=myuon/cove-tools
 ROOT="${COVE_TOOLS_ROOT:-$HOME/cove-tools}"
-BUNDLED=""
+BUNDLED="admin"
 SOURCE=""
 
 die() { echo "install.sh: $*" >&2; exit 1; }
@@ -47,12 +51,12 @@ while [ $# -gt 0 ]; do
     --with-bundled-apps) BUNDLED="$2"; shift 2 ;;
     --apps) die "--apps is gone: a release no longer replaces the apps; --with-bundled-apps \"${2:-}\" deploys those of the release" ;;
     --root) ROOT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     -*) die "unknown option $1" ;;
     *) [ -z "$SOURCE" ] || die "one VERSION or TARBALL"; SOURCE="$1"; shift ;;
   esac
 done
-[ -n "$SOURCE" ] || die "usage: install.sh [--with-bundled-apps \"a b\"] [--root DIR] VERSION|TARBALL"
+[ -n "$SOURCE" ] || die "usage: install.sh [--with-bundled-apps \"admin\"] [--root DIR] VERSION|TARBALL"
 [ "$(id -u)" -ne 0 ] || die "run it as the user the service runs as, not root"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) ;;
@@ -98,6 +102,14 @@ mv "$top" "$release.tmp"
 rm -rf "$release"
 mv "$release.tmp" "$release"
 "$release/cove-host" --version || die "the binary does not run on this machine"
+
+# The bundled apps asked for are the release's, before anything is changed.
+for app in $BUNDLED; do
+  if [ ! -f "$release/apps/$app/app.toml" ]; then
+    bundled="$(for dir in "$release"/apps/*/; do if [ -f "$dir/app.toml" ]; then basename "$dir"; fi; done | tr '\n' ' ')"
+    die "the release bundles only: ${bundled% }; \`$app\` is not one of them. The example apps (webhooks, ledger, algo, ...) live in the repository's examples/ and are deployed like any app: cove-host deploy examples/$app --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token (README \"Examples\"); nothing switched"
+  fi
+done
 
 # 3. The secrets.
 fresh_secret() {
@@ -166,7 +178,6 @@ for dir in "$ROOT"/apps/*/; do
   cp -R "${dir%/}" "$check/$app"
 done
 for app in $BUNDLED; do
-  [ -f "$release/apps/$app/app.toml" ] || die "the release has no app \`$app\`"
   cp -R "$release/apps/$app" "$check/$app"
 done
 with_env "$release/cove-host" check --deployed --apps "$check" --data "$ROOT/data" \
@@ -197,7 +208,7 @@ installed="$(for dir in "$ROOT"/apps/*/; do if [ -f "$dir/app.toml" ]; then base
 installed="${installed% }"
 echo "installed cove-tools $version in $ROOT (apps: ${installed:-none})"
 if [ -z "$installed" ]; then
-  echo "no apps are installed: run again with --with-bundled-apps \"webhooks ledger algo admin\","
+  echo "no apps are installed: run again without --with-bundled-apps \"\" for the admin app,"
   echo "or deploy one with: $ROOT/current/cove-host deploy <app-dir> --admin 127.0.0.1:8791 --token-file $ROOT/data/admin.token"
 fi
 if [ ! -f "$unit" ]; then

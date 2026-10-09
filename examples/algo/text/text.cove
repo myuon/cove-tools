@@ -1,6 +1,6 @@
 // Pure text helpers the playground needs and the standard library does not
 // have: HTML escaping and form decoding. A copy of the bench ledger's
-// (`apps/ledger/text`), less the calendar.
+// (`examples/ledger/text`), less the calendar.
 
 /// `text` with `&`, `<`, `>`, `"` and `'` written as HTML entities, so that it
 /// reads as text inside an element or a quoted attribute, whatever it holds.

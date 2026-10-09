@@ -131,7 +131,7 @@ the cover with squares.
 
 ### The picture
 
-The ledger's chart rules (`apps/ledger/chart`): fixed colours (the first
+The ledger's chart rules (`examples/ledger/chart`): fixed colours (the first
 categorical colour for the matching, the second for the cover), text in
 neutral ink, a legend, and nothing said by colour alone — matched edges are
 thick and blue against thin grey edges, matched vertices are filled and
